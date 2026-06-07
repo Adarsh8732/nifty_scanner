@@ -1,0 +1,53 @@
+name: Nifty Zone Scanner (Live)
+
+on:
+  schedule:
+    # Run every 10 min during NSE market hours, Mon-Fri.
+    # NSE trades 9:15 AM - 3:30 PM IST = 3:45 - 10:00 UTC.
+    # We cover 4:00 - 10:50 UTC (9:30 AM - 4:20 PM IST) to catch open and close.
+    # NOTE: GitHub Actions cron has 5-15 min latency under load.
+    # NOTE: PUBLIC repo gives unlimited compute minutes (free).
+    - cron: '*/10 4-10 * * 1-5'
+  workflow_dispatch:   # manual "Run workflow" button
+
+permissions:
+  contents: write      # needed to commit updated state.json back to repo
+
+# Cancel an in-progress run if a new one is queued (avoids overlap)
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9   # safety net; should never exceed the 10-min window
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TG_TOKEN:        ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
+          TIMEFRAMES:      '1d,1wk'    # both Daily and Weekly zones
+          ALERT_ENTRY_PCT: '1.0'        # entry line = proximal +/- 1%
+          ALERT_MIN_SCORE: '7.0'
+        run: python scanner.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state_*.json
+          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git push || echo "nothing to push"

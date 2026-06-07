@@ -1,0 +1,2006 @@
+//@version=5
+// =============================================================================
+// IDEAL Demand & Supply Zones — Phase 6
+// Phase 1: single-TF detection (DBR/RBR/RBD/DBD), zero-base path,
+//   small-body override, freshness/tested tracking.
+// Phase 2: MTF overlay — Weekly/Monthly zones on current chart.
+// Phase 3: Trade setup lines — entry/SL/target, configurable R:R.
+// Phase 4: Trade score — freshness + strength + time-at-base (0-7).
+// Phase 5: Exceptional marking — deferred.
+// Phase 6: Trend panel & info table — Daily/Weekly/Monthly trends,
+//   volume info, EMA values, sector. Configurable position.
+// =============================================================================
+indicator("IDEAL Zones - Phase 6", shorttitle = "IDEAL Zones", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// --- Zone Detection ---
+grpDetect = "Zone Detection"
+basePct        = input.float(0.50, "Base candle body % (max)",      minval = 0.1, maxval = 0.9, step = 0.05, group = grpDetect, tooltip = "A candle is a BASE if its body is less than this fraction of total range.")
+smallBodyOverride = input.bool(true, "Small body override",                                                  group = grpDetect, tooltip = "Also treat a candle as a base if its body is very small compared to the legin and legout bodies, even if its body% exceeds the base threshold. Catches small candles in spike-top reversals.")
+smallBodyVsLegout = input.float(0.30, "Small body: max % of legout body", minval = 0.05, maxval = 0.6, step = 0.05, group = grpDetect, tooltip = "A candle qualifies as a base via override if its body is less than this fraction of the legout body. Default 30%.")
+smallBodyVsLegin  = input.float(0.30, "Small body: max % of legin body",  minval = 0.05, maxval = 0.6, step = 0.05, group = grpDetect, tooltip = "AND its body must also be less than this fraction of the legin body. Default 30%.")
+excitePct      = input.float(0.50, "Exciting candle body % (min)",  minval = 0.1, maxval = 0.9, step = 0.05, group = grpDetect, tooltip = "A candle is EXCITING if its body is at least this fraction of total range. Used for legin only.")
+legoutMinRatio = input.float(0.8,  "Legout min ratio vs legin",     minval = 0.5, maxval = 1.0, step = 0.05, group = grpDetect, tooltip = "Legout body must be at least this fraction of the legin body. Below this = zone rejected.")
+maxBaseDW      = input.int(3,      "Max base candles (D / W / intraday)", minval = 1, maxval = 10,           group = grpDetect, tooltip = "Maximum base candles in a zone on Daily, Weekly, and intraday charts (75min, 125min, etc).")
+maxBaseMonthly = input.int(5,      "Max base candles (Monthly+)",         minval = 1, maxval = 10,           group = grpDetect, tooltip = "Maximum base candles in a zone on Monthly and higher (1M, 3M, 6M, 12M). Auto-applied based on chart timeframe.")
+allowZeroBase  = input.bool(true,  "Allow zero-base zones",                                                  group = grpDetect, tooltip = "Detect zones with NO base candles between legin and legout (engulfing-style spike reversals). When OFF: only standard zones with at least 1 base candle.")
+fillGap        = input.bool(true,  "Fill gap (legout)",                                                       group = grpDetect, tooltip = "If the legout candle gapped beyond the proximal, fills the gap area between the legout open and the proximal with the legout candle color, aligned exactly under the legout candle.")
+
+// --- Marking Method ---
+grpMark = "Zone Marking"
+markMethod = input.string("Body to Wick", "Marking method", options = ["Body to Wick", "Body to Body", "Wick to Wick"], group = grpMark, tooltip = "Body to Wick (default IDEAL): proximal=body edge, distal=wick edge.")
+
+// --- Visual ---
+grpVis = "Visuals"
+demandColor    = input.color(color.new(color.green, 70), "Demand zone color",      group = grpVis)
+supplyColor    = input.color(color.new(color.red,   70), "Supply zone color",      group = grpVis)
+testedFade     = input.int(85,                            "Tested zone fade %",     minval = 50, maxval = 95, group = grpVis)
+showProxDist   = input.bool(true,                         "Show proximal/distal lines", group = grpVis)
+extendRight    = input.bool(true,                         "Extend zones to the right",  group = grpVis)
+
+// --- Debug ---
+grpDebug = "Debug (diagnostic)"
+debugMode      = input.bool(false, "Debug mode: mark supply+demand candles", group = grpDebug, tooltip = "Plots labels above red candles (supply) and below green candles (demand) showing why a zone was or was not detected. ZONE ✓ = detected (green label). Blue label = rejected with reason. Turn off in normal use.")
+debugMinBody   = input.float(0.5, "Debug: only mark candles where body% > this", minval = 0.1, maxval = 0.9, step = 0.05, group = grpDebug, tooltip = "Only plot debug labels on candles with bodies bigger than this fraction (filters noise).")
+
+// --- Multi-Timeframe Overlay (Phase 2) ---
+grpMTF = "Multi-Timeframe Overlay"
+mtfShowWeekly  = input.bool(true,  "Show Weekly zones on current chart",  group = grpMTF, tooltip = "Detect and overlay Weekly-TF zones on the current chart. Useful when trading on Daily/intraday and you want HTF context.")
+mtfShowMonthly = input.bool(true,  "Show Monthly zones on current chart", group = grpMTF, tooltip = "Detect and overlay Monthly-TF zones on the current chart.")
+mtfWeeklyTF    = input.timeframe("W", "Weekly timeframe",                 group = grpMTF, tooltip = "TradingView timeframe code for the Weekly chart. Default 'W' (1 week).")
+mtfMonthlyTF   = input.timeframe("M", "Monthly timeframe",                group = grpMTF, tooltip = "TradingView timeframe code for the Monthly chart. Default 'M' (1 month).")
+mtfWeeklyDemandColor  = input.color(color.new(color.lime, 80),  "Weekly demand color",  group = grpMTF)
+mtfWeeklySupplyColor  = input.color(color.new(color.fuchsia, 80), "Weekly supply color",  group = grpMTF)
+mtfMonthlyDemandColor = input.color(color.new(color.aqua, 80),  "Monthly demand color", group = grpMTF)
+mtfMonthlySupplyColor = input.color(color.new(color.maroon, 70), "Monthly supply color", group = grpMTF)
+mtfShowTfTag          = input.bool(true, "Show TF tag on MTF zones (W / M / 3M / 6M)",  group = grpMTF, tooltip = "Display a small TF tag label at the left edge of each MTF zone.")
+mtfShow3M             = input.bool(true,  "Show 3M zones on weekly chart",               group = grpMTF)
+mtf3MTF               = input.timeframe("3M", "3M timeframe",                            group = grpMTF)
+mtf3MDemandColor      = input.color(color.new(color.orange, 78), "3M demand color",      group = grpMTF)
+mtf3MSupplyColor      = input.color(color.new(color.purple, 78), "3M supply color",      group = grpMTF)
+mtfShow6M             = input.bool(true,  "Show 6M zones on monthly chart",              group = grpMTF)
+mtf6MTF               = input.timeframe("6M", "6M timeframe",                            group = grpMTF)
+mtf6MDemandColor      = input.color(color.new(color.yellow, 78), "6M demand color",      group = grpMTF)
+mtf6MSupplyColor      = input.color(color.new(color.maroon, 78), "6M supply color",      group = grpMTF)
+mtfMinScore           = input.float(5.5, "MTF zone minimum score", minval = 5.5, maxval = 7.0, step = 0.5, group = grpMTF, tooltip = "Hide MTF overlay zones below this score. On 5-min/15-min charts forced to 7. Score = freshness + strength + time-at-base (max 7).")
+
+// --- Trade Setup (Phase 3) ---
+grpSetup = "Trade Setup"
+showSetup       = input.bool(false, "Show trade setup lines",          group = grpSetup, tooltip = "Plot entry / stop loss / target lines on the nearest fresh demand zone below price and nearest fresh supply zone above price.")
+setupRR         = input.float(2.0,  "Risk:Reward ratio",  minval = 0.5, maxval = 10.0, step = 0.25, group = grpSetup, tooltip = "Target distance = this multiplier x (entry - stop loss). Default 2.0 = 2:1 reward to risk.")
+setupBufferPct  = input.float(0.5,  "Entry/SL buffer %",  minval = 0.0, maxval = 5.0,  step = 0.1,  group = grpSetup, tooltip = "Entry sits this percent past the proximal and SL this percent past the distal. Default 0.5%.")
+setupEntryColor = input.color(color.yellow, "Entry line color",  group = grpSetup)
+setupSlColor    = input.color(color.red,    "Stop Loss color",   group = grpSetup)
+setupTgtColor   = input.color(color.green,  "Target color",      group = grpSetup)
+setupShowLabels = input.bool(true,  "Show price + R:R labels on setup lines", group = grpSetup)
+
+// --- Trade Score (Phase 4) ---
+grpScore = "Trade Score"
+showScore       = input.bool(true,  "Show trade score on zones",            group = grpScore, tooltip = "Display the IDEAL trade score (0-7) inside each zone box. Score = freshness + strength + time-at-base.")
+minScoreShow    = input.float(5.5,  "Current TF zone minimum score", minval = 0.0, maxval = 7.0, step = 0.5, group = grpScore, tooltip = "Hide current TF zones with score below this value. On 5/15/75/125-min charts forced to 7 automatically. Set 0 to show all.")
+scoreLabelColor = input.color(color.new(color.black, 30), "Score label background", group = grpScore)
+
+// On 5/15/75/125-min charts force minimum score to 7; elsewhere use user setting
+effectiveMinScore    = (timeframe.period == "5" or timeframe.period == "15" or timeframe.period == "75" or timeframe.period == "125") ? 7.0 : minScoreShow
+effectiveMtfMinScore = (timeframe.period == "5" or timeframe.period == "15") ? 7.0 : mtfMinScore
+
+// --- Trend Panel & Info Table (Phase 6) ---
+grpPanel = "Trend Panel & Info Table"
+showPanel        = input.bool(true,  "Show trend panel",                    group = grpPanel)
+panelPosition    = input.string("Bottom Right", "Panel position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"], group = grpPanel)
+showVolTable     = input.bool(true,  "Show volume info in panel",            group = grpPanel, tooltip = "Shows highest volume in last 10 bars and current bar vs 10-bar average.")
+volLookback      = input.int(10,     "Volume lookback bars",  minval = 2, maxval = 50, group = grpPanel)
+showEmaTable     = input.bool(true,  "Show EMA values in panel",             group = grpPanel, tooltip = "Shows EMA 20 and EMA 50 values for current, weekly, and monthly timeframes.")
+showSectorTable  = input.bool(true,  "Show sector in panel",                 group = grpPanel)
+panelTextSize    = input.string("small", "Panel text size", options = ["tiny", "small", "normal"], group = grpPanel)
+panelBgColor     = input.color(color.new(color.black, 20), "Panel background", group = grpPanel)
+panelTextColor   = input.color(color.white,                "Panel text color",  group = grpPanel)
+
+// --- Trend ---
+grpTrend = "Trend"
+trendMode      = input.string("Normal", "Trend mode", options = ["Normal", "Advanced"], group = grpTrend)
+showTrendLabel = input.bool(false,       "Show trend label", group = grpTrend)
+
+// --- EMAs ---
+grpEMA = "Moving Averages"
+showEma5   = input.bool(true,         "Show EMA 5",  group = grpEMA)
+showEma20  = input.bool(true,         "Show EMA 20", group = grpEMA)
+showEma50  = input.bool(false,        "Show EMA 50", group = grpEMA)
+showSma50  = input.bool(true,         "Show SMA 50", group = grpEMA)
+ema5Color  = input.color(color.teal,   "EMA 5 color",  group = grpEMA)
+ema20Color = input.color(color.blue,   "EMA 20 color", group = grpEMA)
+ema50Color = input.color(color.orange, "EMA 50 color", group = grpEMA)
+sma50Color = input.color(color.yellow, "SMA 50 color", group = grpEMA)
+
+// =============================================================================
+// CANDLE HELPERS
+// =============================================================================
+candleRange(idx) => high[idx] - low[idx]
+candleBody(idx)  => math.abs(close[idx] - open[idx])
+bodyPct(idx)     => candleRange(idx) > 0 ? candleBody(idx) / candleRange(idx) : 0.0
+isBase(idx)      => bodyPct(idx) < basePct
+isExciting(idx)  => bodyPct(idx) >= excitePct
+isGreen(idx)     => close[idx] > open[idx]
+isRed(idx)       => close[idx] < open[idx]
+bodyHigh(idx)    => math.max(open[idx], close[idx])
+bodyLow(idx)     => math.min(open[idx], close[idx])
+
+f_isMonthlyOrHigher() => timeframe.in_seconds(timeframe.period) >= 2592000
+// Auto-apply max base candles based on chart timeframe:
+//   Monthly and above -> maxBaseMonthly (default 5)
+//   Daily / Weekly / intraday -> maxBaseDW (default 3)
+f_maxBase() => f_isMonthlyOrHigher() ? maxBaseMonthly : maxBaseDW
+
+// =============================================================================
+// ZONE STORAGE
+// =============================================================================
+var array<int>    zType   = array.new<int>()
+var array<float>  zProx   = array.new<float>()
+var array<float>  zDist   = array.new<float>()
+var array<int>    zLeft   = array.new<int>()
+var array<int>    zState  = array.new<int>()    // 0 fresh, 1 tested, 2 invalid (legacy view)
+var array<box>    zBoxArr = array.new<box>()
+var array<box>    zGapBox = array.new<box>()    // gap-fill visual box at legout bar (na if no gap)
+var array<line>   zProxLn = array.new<line>()
+var array<line>   zDistLn = array.new<line>()
+
+// --- Phase 4: Trade Score components ---
+var array<int>    zTestCount   = array.new<int>()    // distinct test events (0,1,2+)
+var array<bool>   zWasInZone   = array.new<bool>()   // is price currently inside zone (gate for counting tests)
+var array<int>    zBaseCount   = array.new<int>()    // bases at zone formation (for time-at-base scoring)
+var array<int>    zStrength    = array.new<int>()    // 2 = gap or 2 exciting, 1 = single exciting, 0 = none
+var array<label>  zScoreLbl    = array.new<label>()  // score label drawn on the box
+var array<float>  zCurrentScore = array.new<float>() // cached current score
+var array<int>    zBornBar      = array.new<int>()   // bar_index when zone was created (skip test on birth bar)
+
+// =============================================================================
+// PENDING CANDIDATES (legout did not close beyond legin -> wait one bar)
+// =============================================================================
+//   pType:        1 = Demand, -1 = Supply
+//   pLeginAbs:    absolute bar_index of the legin candle
+//   pBaseProx:    proximal price already computed from base
+//   pBaseDist:    distal price already computed from base
+//   pLeginBody:   legin's body extreme (high for demand, low for supply)
+//   pBornBar:     absolute bar_index of the legout (confirmation = pBornBar + 1)
+var array<int>   pType      = array.new<int>()
+var array<int>   pLeginAbs  = array.new<int>()
+var array<float> pBaseProx  = array.new<float>()
+var array<float> pBaseDist  = array.new<float>()
+var array<float> pLeginBody = array.new<float>()
+var array<int>   pBornBar   = array.new<int>()
+var array<int>   pBaseCount = array.new<int>()
+var array<float> pLegoutO     = array.new<float>()  // legout open (for gap-fill on confirmation)
+var array<int>   pBornTime    = array.new<int>()    // legout bar open timestamp
+var array<int>   pBornEndTime = array.new<int>()    // detection bar open timestamp (= legout right edge timestamp)
+
+// =============================================================================
+// PHASE 4: Strength scoring helper
+// Strength is scored at zone creation:
+//   2 = legout gapped from base (open beyond base body range)
+//       OR legout AND the candle immediately after legout are both exciting
+//   1 = only legout was exciting (>= excitePct), no gap, next candle not exciting
+//   0 = neither (zone shouldn't be created in this case but we return 0 anyway)
+// =============================================================================
+f_computeStrength(zoneType, legoutOpen, legoutHigh, legoutLow, legoutClose, nextOpen, nextHigh, nextLow, nextClose, baseHighBody, baseLowBody) =>
+    legoutBody    = math.abs(legoutClose - legoutOpen)
+    legoutRng     = legoutHigh - legoutLow
+    legoutBodyPct = legoutRng > 0 ? legoutBody / legoutRng : 0.0
+    bool isGap = false
+    if zoneType == 1
+        isGap := legoutOpen > baseHighBody
+    else
+        isGap := legoutOpen < baseLowBody
+
+    nextBody    = math.abs(nextClose - nextOpen)
+    nextRng     = nextHigh - nextLow
+    nextBodyPct = nextRng > 0 ? nextBody / nextRng : 0.0
+
+    int s = 0
+    if isGap
+        s := 2
+    else if legoutBodyPct >= excitePct
+        s := nextBodyPct >= excitePct ? 2 : 1
+    s
+
+// =============================================================================
+// HELPER: draw the box + lines from finalized values
+// strength: 2 = gap from base OR 2 exciting candles leaving the level
+//           1 = single exciting candle leaving (no gap)
+//           0 = neither (rare for valid zones)
+// baseCt: number of base candles in the zone formation (for time-at-base score)
+// =============================================================================
+f_drawZone(zoneType, prox, dist, leftBar, strength, baseCt, legoutO, legoutStartTime, legoutEndTime) =>
+    bx_color = zoneType == 1 ? demandColor : supplyColor
+    border_c = zoneType == 1 ? color.new(color.green, 50) : color.new(color.red, 50)
+    line_c   = zoneType == 1 ? color.new(color.green, 0)  : color.new(color.red, 0)
+    line_d   = zoneType == 1 ? color.new(color.green, 30) : color.new(color.red, 30)
+    top_v = math.max(prox, dist)
+    bot_v = math.min(prox, dist)
+    bx = box.new(leftBar, top_v, bar_index + (extendRight ? 50 : 0), bot_v, border_color = border_c, bgcolor = bx_color, extend = extendRight ? extend.right : extend.none)
+    pl = showProxDist ? line.new(leftBar, prox, bar_index, prox, color = line_c, width = 1, extend = extendRight ? extend.right : extend.none) : na
+    dl = showProxDist ? line.new(leftBar, dist, bar_index, dist, color = line_d, width = 1, style = line.style_dashed, extend = extendRight ? extend.right : extend.none) : na
+    // Gap-fill box: aligned exactly under the legout candle.
+    // legoutStartTime = open time of legout, legoutEndTime = open time of next bar.
+    // In xloc.bar_time, TradingView anchors at bar centers, so shift left by half
+    // the ACTUAL bar spacing (handles NSE weekends/holidays correctly).
+    box gapBx = na
+    if fillGap and not na(legoutO) and not na(legoutStartTime) and not na(legoutEndTime)
+        gapClr     = zoneType == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
+        halfActual = (legoutEndTime - legoutStartTime) / 2
+        gapLeft    = legoutStartTime - halfActual
+        gapRight   = legoutStartTime + halfActual
+        if zoneType == 1 and legoutO > prox
+            gapBx := box.new(gapLeft, legoutO, gapRight, prox, bgcolor = gapClr, border_color = na, xloc = xloc.bar_time)
+        else if zoneType == -1 and legoutO < prox
+            gapBx := box.new(gapLeft, prox, gapRight, legoutO, bgcolor = gapClr, border_color = na, xloc = xloc.bar_time)
+    array.push(zType,   zoneType)
+    array.push(zProx,   prox)
+    array.push(zDist,   dist)
+    array.push(zLeft,   leftBar)
+    array.push(zState,  0)
+    array.push(zBoxArr, bx)
+    array.push(zProxLn, pl)
+    array.push(zDistLn, dl)
+    array.push(zGapBox, gapBx)
+    array.push(zTestCount,  0)
+    array.push(zWasInZone,  false)
+    array.push(zBaseCount,  baseCt)
+    array.push(zStrength,   strength)
+    array.push(zScoreLbl,   na)
+    array.push(zCurrentScore, 0.0)
+    array.push(zBornBar,    bar_index)  // record birth bar to skip test on creation bar
+
+// =============================================================================
+// PRIMARY DETECTION (run on every confirmed bar)
+// =============================================================================
+// bar[1] = candidate legout. Walk back through base candles to find legin.
+// Test:
+//   (a) legout body >= 0.8 x legin body
+//   (b) legout closes beyond legin body? -> immediate zone
+//       else -> store as pending; next bar will be confirmation candle.
+// =============================================================================
+if barstate.isconfirmed and bar_index > 30
+    legoutBody    = candleBody(1)
+    legoutIsGreen = isGreen(1)
+    legoutIsRed   = isRed(1)
+
+    if legoutBody > 0 and (legoutIsGreen or legoutIsRed)
+        baseCount       = 0
+        i               = 2
+        float baseHighBody = na
+        float baseLowBody  = na
+        float baseHighWick = na
+        float baseLowWick  = na
+
+        // Walk back through base candles. At each step, the candle qualifies
+        // as a base if EITHER:
+        //   (1) Standard rule: bodyPct < basePct, OR
+        //   (2) Small-body override: its body is very small relative to BOTH
+        //       the legout body AND the body of the candle that would be the
+        //       legin if we stopped here (the next candle back).
+        // The override catches small candles in spike-top reversals where
+        // a candle's body% is technically high but its absolute body is tiny.
+        bool keepWalking = true
+        while keepWalking and baseCount < f_maxBase()
+            bool qualifiesStandard = isBase(i)
+            bool qualifiesOverride = false
+
+            if not qualifiesStandard and smallBodyOverride
+                // Peek at the next candle back as the candidate legin
+                candidateLeginBody = candleBody(i + 1)
+                if candidateLeginBody > 0 and legoutBody > 0
+                    thisBody = candleBody(i)
+                    if thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candidateLeginBody
+                        qualifiesOverride := true
+
+            if qualifiesStandard or qualifiesOverride
+                bH = bodyHigh(i)
+                bL = bodyLow(i)
+                wH = high[i]
+                wL = low[i]
+                baseHighBody := na(baseHighBody) ? bH : math.max(baseHighBody, bH)
+                baseLowBody  := na(baseLowBody)  ? bL : math.min(baseLowBody,  bL)
+                baseHighWick := na(baseHighWick) ? wH : math.max(baseHighWick, wH)
+                baseLowWick  := na(baseLowWick)  ? wL : math.min(baseLowWick,  wL)
+                baseCount += 1
+                i += 1
+            else
+                keepWalking := false
+
+        if baseCount >= 1 and baseCount <= f_maxBase() and isExciting(i)
+            leginIdx     = i
+            leginBody    = candleBody(leginIdx)
+            leginAbsBar  = bar_index - leginIdx
+            legoutAbsBar = bar_index - 1
+
+            // Determine legin direction once — used for both distal calc and ratio check.
+            leginIsRed   = close[leginIdx] < open[leginIdx]
+            leginIsGreen = close[leginIdx] > open[leginIdx]
+
+            // legoutMinRatio only applies to REVERSAL patterns (DBR / RBD).
+            // For continuation patterns (RBR / DBD), legin and legout move the same
+            // direction; the initial impulse (legin) is naturally larger, so the
+            // ratio check would filter out many valid continuation zones. The
+            // exciting-candle check (isExciting) already enforces legout quality.
+            isReversal = (legoutIsGreen and leginIsRed) or (legoutIsRed and leginIsGreen)
+            ratioOk    = isReversal ? legoutBody >= legoutMinRatio * leginBody : true
+
+            if leginBody > 0 and isExciting(1) and ratioOk
+                float prox = na
+                float dist = na
+
+                if legoutIsGreen
+                    // DBR (red legin)   → distal = min(base, legin, legout) wicks
+                    // RBR (green legin) → distal = min(base, legout) wicks
+                    extDist = leginIsRed ? math.min(baseLowWick, math.min(low[leginIdx], low[1])) : math.min(baseLowWick, low[1])
+                    if markMethod == "Body to Wick"
+                        prox := baseHighBody
+                        dist := extDist
+                    else if markMethod == "Body to Body"
+                        prox := baseHighBody
+                        dist := baseLowBody
+                    else
+                        prox := baseHighWick
+                        dist := extDist
+
+                    // CLOSING RULE: legout must close beyond the body-based
+                    // proximal (= highest body of base). This is the edge of
+                    // the consolidation; closing past it confirms breakout.
+                    if close[1] > baseHighBody
+                        s = f_computeStrength(1, open[1], high[1], low[1], close[1], open[0], high[0], low[0], close[0], baseHighBody, baseLowBody)
+                        f_drawZone(1, prox, dist, leginAbsBar, s, baseCount, open[1], time[1], time)
+                    else
+                        array.push(pType,      1)
+                        array.push(pLeginAbs,  leginAbsBar)
+                        array.push(pBaseProx,  prox)
+                        array.push(pBaseDist,  dist)
+                        array.push(pLeginBody, baseHighBody)
+                        array.push(pBornBar,   legoutAbsBar)
+                        array.push(pBaseCount, baseCount)
+                        array.push(pLegoutO,     open[1])
+                        array.push(pBornTime,    time[1])
+                        array.push(pBornEndTime, time)
+
+                else if legoutIsRed
+                    // RBD (green legin) → distal = max(base, legin, legout) wicks
+                    // DBD (red legin)   → distal = max(base, legout) wicks
+                    extDist = leginIsGreen ? math.max(baseHighWick, math.max(high[leginIdx], high[1])) : math.max(baseHighWick, high[1])
+                    if markMethod == "Body to Wick"
+                        prox := baseLowBody
+                        dist := extDist
+                    else if markMethod == "Body to Body"
+                        prox := baseLowBody
+                        dist := baseHighBody
+                    else
+                        prox := baseLowWick
+                        dist := extDist
+
+                    // CLOSING RULE: legout must close beyond the body-based
+                    // proximal (= lowest body of base). This is the edge of
+                    // the consolidation; closing past it confirms breakout.
+                    if close[1] < baseLowBody
+                        s = f_computeStrength(-1, open[1], high[1], low[1], close[1], open[0], high[0], low[0], close[0], baseHighBody, baseLowBody)
+                        f_drawZone(-1, prox, dist, leginAbsBar, s, baseCount, open[1], time[1], time)
+                    else
+                        array.push(pType,      -1)
+                        array.push(pLeginAbs,  leginAbsBar)
+                        array.push(pBaseProx,  prox)
+                        array.push(pBaseDist,  dist)
+                        array.push(pLeginBody, baseLowBody)
+                        array.push(pBornBar,   legoutAbsBar)
+                        array.push(pBaseCount, baseCount)
+                        array.push(pLegoutO,     open[1])
+                        array.push(pBornTime,    time[1])
+                        array.push(pBornEndTime, time)
+
+        // -------------------------------------------------------------------
+        // ZERO-BASE PATH (engulfing-style spike reversal)
+        // -------------------------------------------------------------------
+        // If no base candles were found but bar[2] is itself exciting AND
+        // opposite color to legout, treat bar[2] as the legin and create a
+        // zero-base zone. Same size + closing + confirmation rules apply,
+        // but proximal/distal come from the legin candle itself.
+        else if allowZeroBase and baseCount == 0 and isExciting(2)
+            // Need legin (bar[2]) to be opposite direction of legout (bar[1])
+            zeroBaseIsDemand = isRed(2)  and legoutIsGreen   // red legin -> green legout
+            zeroBaseIsSupply = isGreen(2) and legoutIsRed    // green legin -> red legout
+
+            if zeroBaseIsDemand or zeroBaseIsSupply
+                leginIdx     = 2
+                leginBody    = candleBody(leginIdx)
+                leginAbsBar  = bar_index - leginIdx
+                legoutAbsBar = bar_index - 1
+
+                if leginBody > 0 and isExciting(1) and legoutBody >= legoutMinRatio * leginBody
+                    float prox = na
+                    float dist = na
+
+                    if zeroBaseIsDemand
+                        // Demand: distal = lowest wick of legin and legout (no base)
+                        extDist = math.min(low[leginIdx], low[1])
+                        if markMethod == "Wick to Wick"
+                            prox := low[leginIdx]
+                            dist := extDist
+                        else
+                            prox := math.max(bodyLow(leginIdx), open[1])
+                            dist := extDist
+
+                        leginBdyHigh = bodyHigh(leginIdx)
+                        if close[1] > leginBdyHigh
+                            s = f_computeStrength(1, open[1], high[1], low[1], close[1], open[0], high[0], low[0], close[0], leginBdyHigh, bodyLow(leginIdx))
+                            f_drawZone(1, prox, dist, leginAbsBar, s, 0, float(na), int(na), int(na))
+                        else
+                            array.push(pType,      1)
+                            array.push(pLeginAbs,  leginAbsBar)
+                            array.push(pBaseProx,  prox)
+                            array.push(pBaseDist,  dist)
+                            array.push(pLeginBody, leginBdyHigh)
+                            array.push(pBornBar,   legoutAbsBar)
+                            array.push(pBaseCount, 0)
+                            array.push(pLegoutO,     float(na))
+                            array.push(pBornTime,    int(na))
+                            array.push(pBornEndTime, int(na))
+
+                    else
+                        // Supply: distal = highest wick of legin and legout (no base)
+                        extDist = math.max(high[leginIdx], high[1])
+                        if markMethod == "Wick to Wick"
+                            prox := high[leginIdx]
+                            dist := extDist
+                        else
+                            prox := math.min(bodyHigh(leginIdx), open[1])
+                            dist := extDist
+
+                        leginBdyLow = bodyLow(leginIdx)
+                        if close[1] < leginBdyLow
+                            s = f_computeStrength(-1, open[1], high[1], low[1], close[1], open[0], high[0], low[0], close[0], bodyHigh(leginIdx), leginBdyLow)
+                            f_drawZone(-1, prox, dist, leginAbsBar, s, 0, float(na), int(na), int(na))
+                        else
+                            array.push(pType,      -1)
+                            array.push(pLeginAbs,  leginAbsBar)
+                            array.push(pBaseProx,  prox)
+                            array.push(pBaseDist,  dist)
+                            array.push(pLeginBody, leginBdyLow)
+                            array.push(pBornBar,   legoutAbsBar)
+                            array.push(pBaseCount, 0)
+                            array.push(pLegoutO,     float(na))
+                            array.push(pBornTime,    int(na))
+                            array.push(pBornEndTime, int(na))
+
+// =============================================================================
+// DEBUG PASS — diagnose why supply zones get rejected
+// =============================================================================
+// For every red candle (bar[1]) where body% exceeds debugMinBody, plot a
+// label showing the rejection reason. Helps identify which rule is filtering
+// out a zone we expected to see.
+// =============================================================================
+if debugMode and barstate.isconfirmed and bar_index > 30
+    dbgLegoutBody    = candleBody(1)
+    dbgLegoutIsRed   = isRed(1)
+    dbgLegoutBodyPct = bodyPct(1)
+
+    if dbgLegoutIsRed and dbgLegoutBodyPct >= debugMinBody
+        // Walk back to find the legin (same logic as main detection)
+        dbgBaseCount = 0
+        dbgI         = 2
+        bool dbgKeepWalking = true
+        while dbgKeepWalking and dbgBaseCount < f_maxBase()
+            bool dbgQualStd = isBase(dbgI)
+            bool dbgQualOvr = false
+            if not dbgQualStd and smallBodyOverride
+                candLegBody = candleBody(dbgI + 1)
+                if candLegBody > 0 and dbgLegoutBody > 0
+                    thisBody = candleBody(dbgI)
+                    if thisBody < smallBodyVsLegout * dbgLegoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        dbgQualOvr := true
+            if dbgQualStd or dbgQualOvr
+                dbgBaseCount += 1
+                dbgI += 1
+            else
+                dbgKeepWalking := false
+
+        // Build diagnostic message
+        string reason = ""
+        if dbgBaseCount == 0
+            reason := "0 bases"
+        else if dbgBaseCount > f_maxBase()
+            reason := "too many bases (" + str.tostring(dbgBaseCount) + ")"
+        else if not isExciting(dbgI)
+            reason := str.tostring(dbgBaseCount) + " bases ok, but legin not exciting (body% " + str.tostring(math.round(bodyPct(dbgI) * 100)) + ")"
+        else
+            dbgLeginBody    = candleBody(dbgI)
+            dbgLeginBdyHigh = bodyHigh(dbgI)
+            dbgLeginBdyLow  = bodyLow(dbgI)
+            // Compute baseLowBody on the fly
+            float dbgBaseLowBody = na
+            for k = 2 to dbgI - 1
+                bL = bodyLow(k)
+                dbgBaseLowBody := na(dbgBaseLowBody) ? bL : math.min(dbgBaseLowBody, bL)
+            if dbgLeginBody <= 0
+                reason := "legin body 0"
+            else if dbgLegoutBody < legoutMinRatio * dbgLeginBody
+                ratio = dbgLegoutBody / dbgLeginBody
+                reason := str.tostring(dbgBaseCount) + " bases ok, but legout/legin = " + str.tostring(math.round(ratio * 100) / 100) + " < " + str.tostring(legoutMinRatio)
+            else if not na(dbgBaseLowBody) and close[1] >= dbgBaseLowBody
+                reason := str.tostring(dbgBaseCount) + " bases ok, size ok, but legout close (" + str.tostring(math.round(close[1])) + ") >= proximal (" + str.tostring(math.round(dbgBaseLowBody)) + ")"
+            else
+                reason := "ZONE DETECTED with " + str.tostring(dbgBaseCount) + " bases"
+
+        labelTxt = reason
+        labelColor = str.contains(reason, "ZONE DETECTED") ? color.new(color.green, 20) : color.new(color.orange, 30)
+        label.new(bar_index - 1, high[1] + (high[1] - low[1]) * 0.3, labelTxt, style = label.style_label_down, color = labelColor, textcolor = color.white, size = size.tiny)
+
+// DEBUG PASS — demand zones (green candles)
+if debugMode and barstate.isconfirmed and bar_index > 30
+    dbgDLegoutBody    = candleBody(1)
+    dbgDLegoutIsGreen = isGreen(1)
+    dbgDLegoutBodyPct = bodyPct(1)
+
+    if dbgDLegoutIsGreen and dbgDLegoutBodyPct >= debugMinBody
+        dbgDBaseCount = 0
+        dbgDI         = 2
+        float dbgDBHB = na
+        bool dbgDWalking = true
+        while dbgDWalking and dbgDBaseCount < f_maxBase()
+            bool dbgDQualStd = isBase(dbgDI)
+            bool dbgDQualOvr = false
+            if not dbgDQualStd and smallBodyOverride
+                candLegBody = candleBody(dbgDI + 1)
+                if candLegBody > 0 and dbgDLegoutBody > 0
+                    thisBody = candleBody(dbgDI)
+                    if thisBody < smallBodyVsLegout * dbgDLegoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        dbgDQualOvr := true
+            if dbgDQualStd or dbgDQualOvr
+                bH = bodyHigh(dbgDI)
+                dbgDBHB := na(dbgDBHB) ? bH : math.max(dbgDBHB, bH)
+                dbgDBaseCount += 1
+                dbgDI += 1
+            else
+                dbgDWalking := false
+
+        string dreason = ""
+        if dbgDBaseCount == 0
+            // bar[2] is not a base — check zero-base engulfing path
+            b2pct = math.round(bodyPct(2) * 100)
+            if allowZeroBase and isExciting(2) and isRed(2)
+                zb_leginBdy    = candleBody(2)
+                zb_leginBdyHi  = bodyHigh(2)
+                if zb_leginBdy > 0 and dbgDLegoutBody >= legoutMinRatio * zb_leginBdy
+                    if close[1] > zb_leginBdyHi
+                        dreason := "D: 0b engulf ZONE ✓ (bar[2] red " + str.tostring(b2pct) + "%)"
+                    else
+                        dreason := "D: 0b engulf PENDING (close " + str.tostring(math.round(close[1]*100)/100) + " <= leginHi " + str.tostring(math.round(zb_leginBdyHi*100)/100) + ")"
+                else
+                    zb_ratio = zb_leginBdy > 0 ? math.round(dbgDLegoutBody / zb_leginBdy * 100) / 100 : 0.0
+                    dreason := "D: 0b engulf ratio fail " + str.tostring(zb_ratio) + " < " + str.tostring(legoutMinRatio) + " (bar[2] " + str.tostring(b2pct) + "%)"
+            else
+                dreason := "D: 0 bases — bar[2] body% " + str.tostring(b2pct) + "% (need <" + str.tostring(math.round(basePct * 100)) + "% for base, or red+" + str.tostring(math.round(excitePct * 100)) + "%+ for engulf)"
+        else if not isExciting(dbgDI)
+            dreason := "D: " + str.tostring(dbgDBaseCount) + "b, legin[" + str.tostring(dbgDI) + "] body% " + str.tostring(math.round(bodyPct(dbgDI) * 100)) + "% NOT exciting (need >=" + str.tostring(math.round(excitePct * 100)) + "%)"
+        else
+            dbgDLeginBody  = candleBody(dbgDI)
+            dbgDLeginIsRed = isRed(dbgDI)
+            string patType = dbgDLeginIsRed ? "DBR" : "RBR"
+            if dbgDLeginBody <= 0
+                dreason := "D: legin body 0"
+            else if dbgDLeginIsRed and dbgDLegoutBody < legoutMinRatio * dbgDLeginBody
+                // ratio only checked for reversals (DBR): red legin → green legout
+                ratio = dbgDLegoutBody / dbgDLeginBody
+                dreason := "D: " + str.tostring(dbgDBaseCount) + "b " + patType + " ratio " + str.tostring(math.round(ratio * 100) / 100) + " < " + str.tostring(legoutMinRatio)
+            else if not na(dbgDBHB) and close[1] <= dbgDBHB
+                dreason := "D: " + str.tostring(dbgDBaseCount) + "b " + patType + " PENDING (close " + str.tostring(math.round(close[1]*100)/100) + " <= bHB " + str.tostring(math.round(dbgDBHB*100)/100) + ")"
+            else
+                dreason := "D: ZONE ✓ " + str.tostring(dbgDBaseCount) + "b " + patType
+
+        dlabelColor = str.contains(dreason, "ZONE") ? color.new(color.green, 20) : color.new(color.blue, 30)
+        label.new(bar_index - 1, low[1] - (high[1] - low[1]) * 0.3, dreason, style = label.style_label_up, color = dlabelColor, textcolor = color.white, size = size.tiny)
+
+// On each confirmed bar, check pending candidates. The confirmation candle
+// for any pending entry is the bar at pBornBar + 1. After this bar's close,
+// bar[1] has bar_index = bar_index - 1. So we look for pBornBar + 1 == bar_index - 1
+// i.e. pBornBar == bar_index - 2.
+// =============================================================================
+if barstate.isconfirmed and array.size(pType) > 0
+    n = array.size(pType)
+    idx = n - 1
+    while idx >= 0
+        born = array.get(pBornBar, idx)
+        if born == bar_index - 2
+            // bar[1] is the confirmation candle
+            t        = array.get(pType,        idx)
+            lgAbs    = array.get(pLeginAbs,    idx)
+            prox     = array.get(pBaseProx,    idx)
+            dist     = array.get(pBaseDist,    idx)
+            legBody  = array.get(pLeginBody,   idx)
+            lO       = array.get(pLegoutO,     idx)
+            lT       = array.get(pBornTime,    idx)
+            lTE      = array.get(pBornEndTime, idx)
+
+            confirmed = false
+            if t == 1 and close[1] > legBody
+                confirmed := true
+            else if t == -1 and close[1] < legBody
+                confirmed := true
+
+            if confirmed
+                bCt      = array.get(pBaseCount, idx)
+                confBody = math.abs(close[1] - open[1])
+                confRng  = high[1] - low[1]
+                confStr  = (confRng > 0 ? confBody / confRng : 0.0) >= excitePct ? 2 : 1
+                f_drawZone(t, prox, dist, lgAbs, confStr, bCt, lO, lT, lTE)
+
+            array.remove(pType,        idx)
+            array.remove(pLeginAbs,    idx)
+            array.remove(pBaseProx,    idx)
+            array.remove(pBaseDist,    idx)
+            array.remove(pLeginBody,   idx)
+            array.remove(pBornBar,     idx)
+            array.remove(pBaseCount,   idx)
+            array.remove(pLegoutO,     idx)
+            array.remove(pBornTime,    idx)
+            array.remove(pBornEndTime, idx)
+
+        else if born < bar_index - 2
+            // Stale, drop
+            array.remove(pType,        idx)
+            array.remove(pLeginAbs,    idx)
+            array.remove(pBaseProx,    idx)
+            array.remove(pBaseDist,    idx)
+            array.remove(pLeginBody,   idx)
+            array.remove(pBornBar,     idx)
+            array.remove(pBaseCount,   idx)
+            array.remove(pLegoutO,     idx)
+            array.remove(pBornTime,    idx)
+            array.remove(pBornEndTime, idx)
+        idx -= 1
+
+// =============================================================================
+// MULTI-TIMEFRAME OVERLAY (Phase 2)
+// =============================================================================
+// For each enabled HTF (Weekly, Monthly), fetch HTF OHLC data via
+// request.security() and run the same detection rules on it. Project the
+// detected zones onto the current chart with TF-distinct colors.
+//
+// Approach:
+//   * Fetch the most recent HTF OHLC value per current-chart bar.
+//   * Run detection only when a new HTF bar has just closed (HTF time changed).
+//   * Walk back through HTF history using the [N] operator on the security
+//     series to find base + legin candidates.
+//   * Draw zones using bar_time so the box anchors correctly even though we
+//     are on a different chart timeframe.
+// =============================================================================
+
+curTfSec = timeframe.in_seconds(timeframe.period)
+
+shouldDrawWeekly      = mtfShowWeekly  and timeframe.isintraday and timeframe.period != "5" and timeframe.period != "15"
+shouldDrawMonthly     = mtfShowMonthly and timeframe.isdaily
+shouldDraw3M          = mtfShow3M      and timeframe.isweekly
+shouldDraw6M          = mtfShow6M      and timeframe.ismonthly
+shouldDraw75m         = timeframe.period == "5"
+shouldDrawDailyFor15m = timeframe.period == "15"
+
+// --- Storage for MTF zones (separate from current-TF zones) ---
+var array<int>   mtfType   = array.new<int>()    // 1=demand, -1=supply
+var array<int>   mtfTfTag  = array.new<int>()    // 1=weekly, 2=monthly
+var array<float> mtfProx   = array.new<float>()
+var array<float> mtfDist   = array.new<float>()
+var array<int>   mtfTime   = array.new<int>()
+var array<box>   mtfBoxArr    = array.new<box>()
+var array<label> mtfLblArr = array.new<label>()  // TF tag labels (W / M)
+var array<int>   mtfState  = array.new<int>()    // 0 fresh, 1 tested, 2 invalid
+var array<int>   mtfTestCount = array.new<int>()   // distinct entry events
+var array<bool>  mtfWasInZone = array.new<bool>()  // entry/exit gate
+var array<int>   mtfStrength  = array.new<int>()   // 0/1/2 same as current-TF
+var array<int>   mtfBaseCount = array.new<int>()   // base count for time-at-base score
+var array<int>   mtfBornBar   = array.new<int>()   // birth bar (guard same-bar invalidation)
+
+// --- Helper: pick MTF zone color based on TF tag and zone type ---
+f_mtfBgColor(tfTag, zType) =>
+    if tfTag == 1
+        zType == 1 ? mtfWeeklyDemandColor  : mtfWeeklySupplyColor
+    else if tfTag == 2
+        zType == 1 ? mtfMonthlyDemandColor : mtfMonthlySupplyColor
+    else if tfTag == 3
+        zType == 1 ? mtf3MDemandColor      : mtf3MSupplyColor
+    else if tfTag == 5
+        zType == 1 ? mtfWeeklyDemandColor  : mtfWeeklySupplyColor
+    else if tfTag == 6
+        zType == 1 ? mtfMonthlyDemandColor : mtfMonthlySupplyColor
+    else
+        zType == 1 ? mtf6MDemandColor      : mtf6MSupplyColor
+
+// --- Score helpers (must be defined before f_drawMtfZone uses them) ---
+f_freshnessScore(testCt) =>
+    testCt == 0 ? 3.0 : testCt == 1 ? 1.5 : 0.0
+
+f_timeAtBaseScore(baseCt) =>
+    if baseCt <= 3
+        2.0
+    else if baseCt <= 5
+        1.0
+    else
+        0.0
+
+// --- Draw an MTF zone box anchored by HTF legin bar time ---
+//     All HTF zones: dashed border. TF tag: W / M / 3M / 6M
+f_drawMtfZone(zType, tfTag, prox, dist, leginTime, strength, baseCt) =>
+    initialScore = 3.0 + strength + f_timeAtBaseScore(baseCt)
+    if initialScore >= effectiveMtfMinScore
+        bgC = f_mtfBgColor(tfTag, zType)
+        border_c = color.new(bgC, 30)
+        top_v = math.max(prox, dist)
+        bot_v = math.min(prox, dist)
+        rightTime = time + (curTfSec * 1000) * 50
+        bx = box.new(leginTime, top_v, rightTime, bot_v, border_color = border_c, border_style = line.style_dashed, border_width = 2, bgcolor = bgC, xloc = xloc.bar_time, extend = extend.right)
+
+        label lbl = na
+        if mtfShowTfTag
+            tagText = tfTag == 1 ? "W" : tfTag == 2 ? "M" : tfTag == 3 ? "3M" : tfTag == 4 ? "6M" : tfTag == 5 ? "75m" : "D"
+            lblBg   = color.new(bgC, 20)
+            lbl := label.new(leginTime, top_v, tagText, xloc = xloc.bar_time, style = label.style_label_down, color = lblBg, textcolor = color.white, size = size.small)
+
+        array.push(mtfType,      zType)
+        array.push(mtfTfTag,     tfTag)
+        array.push(mtfProx,      prox)
+        array.push(mtfDist,      dist)
+        array.push(mtfTime,      leginTime)
+        array.push(mtfBoxArr,    bx)
+        array.push(mtfLblArr,    lbl)
+        array.push(mtfState,     0)
+        array.push(mtfTestCount, 0)
+        array.push(mtfWasInZone, true)
+        array.push(mtfStrength,  strength)
+        array.push(mtfBaseCount, baseCt)
+        array.push(mtfBornBar,   bar_index)
+
+// --- HTF body / classification helpers (operate on raw OHLC values) ---
+f_htfBodyPct(o, h, l, c) =>
+    rng = h - l
+    rng > 0 ? math.abs(c - o) / rng : 0.0
+f_htfIsBase(o, h, l, c) =>
+    f_htfBodyPct(o, h, l, c) < basePct
+f_htfIsExciting(o, h, l, c) =>
+    f_htfBodyPct(o, h, l, c) >= excitePct
+f_htfBodyHigh(o, c) => math.max(o, c)
+f_htfBodyLow(o, c)  => math.min(o, c)
+
+// --- Fetch HTF OHLC series via request.security ---
+// PERFORMANCE: combined into 2 tuple-return calls instead of 10 separate
+// calls. Each request.security() executes the entire expression at HTF, so
+// fewer calls = much faster historical replay. The tuple form lets us
+// retrieve O/H/L/C/T from a single security context.
+[htfWO, htfWH, htfWL, htfWC, htfWT] = request.security(syminfo.tickerid, mtfWeeklyTF,  [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+[htfMO, htfMH, htfML, htfMC, htfMT] = request.security(syminfo.tickerid, mtfMonthlyTF, [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+[htf3O, htf3H, htf3L, htf3C, htf3T] = request.security(syminfo.tickerid, mtf3MTF,      [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+[htf6O, htf6H, htf6L, htf6C, htf6T] = request.security(syminfo.tickerid, mtf6MTF,      [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+[htfDO, htfDH, htfDL, htfDC, htfDT] = request.security(syminfo.tickerid, "D",           [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+[htf75O, htf75H, htf75L, htf75C, htf75T] = request.security(syminfo.tickerid, "75",      [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+
+// =============================================================================
+// MTF — store HTF history in our own arrays so [N] works correctly
+// =============================================================================
+// Pine's [N] on a request.security() result counts CURRENT-CHART bars, not HTF
+// bars. So we accumulate the last K closed HTF bars into our own arrays and
+// walk back through them when a new HTF bar closes.
+
+int MTF_HIST = 60   // number of HTF bars to keep
+
+var array<float> wkO = array.new<float>()
+var array<float> wkH = array.new<float>()
+var array<float> wkL = array.new<float>()
+var array<float> wkC = array.new<float>()
+var array<int>   wkT = array.new<int>()
+
+var array<float> moO = array.new<float>()
+var array<float> moH = array.new<float>()
+var array<float> moL = array.new<float>()
+var array<float> moC = array.new<float>()
+var array<int>   moT = array.new<int>()
+
+var array<float> q3O = array.new<float>()   // 3M quarterly
+var array<float> q3H = array.new<float>()
+var array<float> q3L = array.new<float>()
+var array<float> q3C = array.new<float>()
+var array<int>   q3T = array.new<int>()
+
+var array<float> saO = array.new<float>()   // 6M semi-annual
+var array<float> saH = array.new<float>()
+var array<float> saL = array.new<float>()
+var array<float> saC = array.new<float>()
+var array<int>   saT = array.new<int>()
+
+var int lastWeeklyTime  = 0
+var int lastMonthlyTime = 0
+var int last3MTime      = 0
+var int last6MTime      = 0
+var int lastDailyTime   = 0
+var int last75Time      = 0
+
+var array<float> dyO = array.new<float>()
+var array<float> dyH = array.new<float>()
+var array<float> dyL = array.new<float>()
+var array<float> dyC = array.new<float>()
+var array<int>   dyT = array.new<int>()
+
+var array<float> m75O = array.new<float>()
+var array<float> m75H = array.new<float>()
+var array<float> m75L = array.new<float>()
+var array<float> m75C = array.new<float>()
+var array<int>   m75T = array.new<int>()
+
+// Helper: push a new HTF bar onto front of arrays, drop oldest if at limit
+f_pushHtf(arrO, arrH, arrL, arrC, arrT, o, h, l, c, t) =>
+    array.unshift(arrO, o)
+    array.unshift(arrH, h)
+    array.unshift(arrL, l)
+    array.unshift(arrC, c)
+    array.unshift(arrT, t)
+    if array.size(arrO) > MTF_HIST
+        array.pop(arrO)
+        array.pop(arrH)
+        array.pop(arrL)
+        array.pop(arrC)
+        array.pop(arrT)
+
+// --- 75-min zones for 5-min chart (via request.security — exact match with native 75-min chart) ---
+if barstate.isconfirmed and shouldDraw75m and not na(htf75T) and htf75T != last75Time
+    last75Time := htf75T
+    f_pushHtf(m75O, m75H, m75L, m75C, m75T, htf75O, htf75H, htf75L, htf75C, htf75T)
+    if array.size(m75O) >= 3
+        legoutO = array.get(m75O, 0)
+        legoutH = array.get(m75H, 0)
+        legoutL = array.get(m75L, 0)
+        legoutC = array.get(m75C, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+            bool walking = true
+            while walking and baseCnt < maxBaseDW and ii < array.size(m75O) - 1
+                o_i = array.get(m75O, ii)
+                h_i = array.get(m75H, ii)
+                l_i = array.get(m75L, ii)
+                c_i = array.get(m75C, ii)
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(m75O, ii + 1)
+                    cl_c = array.get(m75C, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+            if baseCnt >= 1 and baseCnt <= maxBaseDW and ii < array.size(m75O)
+                leg_o = array.get(m75O, ii)
+                leg_h = array.get(m75H, ii)
+                leg_l = array.get(m75L, ii)
+                leg_c = array.get(m75C, ii)
+                leg_t = array.get(m75T, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            m75LeginIsRed = leg_c < leg_o
+                            extDist75 = m75LeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDist75
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDist75
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 5, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            m75LeginIsGreen = leg_c > leg_o
+                            extDist75 = m75LeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDist75
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDist75
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 5, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- On every confirmed bar, check if a new HTF bar has closed; if yes, store its OHLC ---
+if barstate.isconfirmed and not na(htfWT) and htfWT != lastWeeklyTime
+    lastWeeklyTime := htfWT
+    f_pushHtf(wkO, wkH, wkL, wkC, wkT, htfWO, htfWH, htfWL, htfWC, htfWT)
+
+    // After storing, attempt detection on this newly closed Weekly bar
+    if shouldDrawWeekly and array.size(wkO) >= 3
+        // Index 0 in our arrays is the just-closed Weekly bar (the legout candidate)
+        legoutO = array.get(wkO, 0)
+        legoutH = array.get(wkH, 0)
+        legoutL = array.get(wkL, 0)
+        legoutC = array.get(wkC, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+
+            bool walking = true
+            wMaxBase = 3   // Weekly cap is 3
+            while walking and baseCnt < wMaxBase and ii < array.size(wkO) - 1
+                o_i = array.get(wkO, ii)
+                h_i = array.get(wkH, ii)
+                l_i = array.get(wkL, ii)
+                c_i = array.get(wkC, ii)
+
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(wkO, ii + 1)
+                    cl_c = array.get(wkC, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+
+            if baseCnt >= 1 and baseCnt <= wMaxBase and ii < array.size(wkO)
+                leg_o = array.get(wkO, ii)
+                leg_h = array.get(wkH, ii)
+                leg_l = array.get(wkL, ii)
+                leg_c = array.get(wkC, ii)
+                leg_t = array.get(wkT, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            // DBR (red legin)   → min(base, legin, legout)
+                            // RBR (green legin) → min(base, legout)
+                            htfLeginIsRed = leg_c < leg_o
+                            extDistW = htfLeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDistW
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDistW
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 1, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            // RBD (green legin) → max(base, legin, legout)
+                            // DBD (red legin)   → max(base, legout)
+                            htfLeginIsGreen = leg_c > leg_o
+                            extDistW = htfLeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDistW
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDistW
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 1, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- Same logic for Monthly ---
+if barstate.isconfirmed and not na(htfMT) and htfMT != lastMonthlyTime
+    lastMonthlyTime := htfMT
+    f_pushHtf(moO, moH, moL, moC, moT, htfMO, htfMH, htfML, htfMC, htfMT)
+
+    if shouldDrawMonthly and array.size(moO) >= 3
+        legoutO = array.get(moO, 0)
+        legoutH = array.get(moH, 0)
+        legoutL = array.get(moL, 0)
+        legoutC = array.get(moC, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+
+            bool walking = true
+            mMaxBase = 5
+            while walking and baseCnt < mMaxBase and ii < array.size(moO) - 1
+                o_i = array.get(moO, ii)
+                h_i = array.get(moH, ii)
+                l_i = array.get(moL, ii)
+                c_i = array.get(moC, ii)
+
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(moO, ii + 1)
+                    cl_c = array.get(moC, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+
+            if baseCnt >= 1 and baseCnt <= mMaxBase and ii < array.size(moO)
+                leg_o = array.get(moO, ii)
+                leg_h = array.get(moH, ii)
+                leg_l = array.get(moL, ii)
+                leg_c = array.get(moC, ii)
+                leg_t = array.get(moT, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            // DBR (red legin)   → min(base, legin, legout)
+                            // RBR (green legin) → min(base, legout)
+                            moLeginIsRed = leg_c < leg_o
+                            extDistM = moLeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDistM
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDistM
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 2, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            // RBD (green legin) → max(base, legin, legout)
+                            // DBD (red legin)   → max(base, legout)
+                            moLeginIsGreen = leg_c > leg_o
+                            extDistM = moLeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDistM
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDistM
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 2, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- Same logic for 3M (quarterly) ---
+if barstate.isconfirmed and not na(htf3T) and htf3T != last3MTime
+    last3MTime := htf3T
+    f_pushHtf(q3O, q3H, q3L, q3C, q3T, htf3O, htf3H, htf3L, htf3C, htf3T)
+
+    if shouldDraw3M and array.size(q3O) >= 3
+        legoutO = array.get(q3O, 0)
+        legoutH = array.get(q3H, 0)
+        legoutL = array.get(q3L, 0)
+        legoutC = array.get(q3C, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+
+            bool walking = true
+            while walking and baseCnt < maxBaseMonthly and ii < array.size(q3O) - 1
+                o_i = array.get(q3O, ii)
+                h_i = array.get(q3H, ii)
+                l_i = array.get(q3L, ii)
+                c_i = array.get(q3C, ii)
+
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(q3O, ii + 1)
+                    cl_c = array.get(q3C, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+
+            if baseCnt >= 1 and baseCnt <= maxBaseMonthly and ii < array.size(q3O)
+                leg_o = array.get(q3O, ii)
+                leg_h = array.get(q3H, ii)
+                leg_l = array.get(q3L, ii)
+                leg_c = array.get(q3C, ii)
+                leg_t = array.get(q3T, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            q3LeginIsRed = leg_c < leg_o
+                            extDist3 = q3LeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDist3
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDist3
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 3, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            q3LeginIsGreen = leg_c > leg_o
+                            extDist3 = q3LeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDist3
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDist3
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 3, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- Same logic for 6M (semi-annual) ---
+if barstate.isconfirmed and not na(htf6T) and htf6T != last6MTime
+    last6MTime := htf6T
+    f_pushHtf(saO, saH, saL, saC, saT, htf6O, htf6H, htf6L, htf6C, htf6T)
+
+    if shouldDraw6M and array.size(saO) >= 3
+        legoutO = array.get(saO, 0)
+        legoutH = array.get(saH, 0)
+        legoutL = array.get(saL, 0)
+        legoutC = array.get(saC, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+
+            bool walking = true
+            while walking and baseCnt < maxBaseMonthly and ii < array.size(saO) - 1
+                o_i = array.get(saO, ii)
+                h_i = array.get(saH, ii)
+                l_i = array.get(saL, ii)
+                c_i = array.get(saC, ii)
+
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(saO, ii + 1)
+                    cl_c = array.get(saC, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+
+            if baseCnt >= 1 and baseCnt <= maxBaseMonthly and ii < array.size(saO)
+                leg_o = array.get(saO, ii)
+                leg_h = array.get(saH, ii)
+                leg_l = array.get(saL, ii)
+                leg_c = array.get(saC, ii)
+                leg_t = array.get(saT, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            saLeginIsRed = leg_c < leg_o
+                            extDist6 = saLeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDist6
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDist6
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 4, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            saLeginIsGreen = leg_c > leg_o
+                            extDist6 = saLeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDist6
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDist6
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 4, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- Daily zones for 15-min chart ---
+if barstate.isconfirmed and not na(htfDT) and htfDT != lastDailyTime
+    lastDailyTime := htfDT
+    f_pushHtf(dyO, dyH, dyL, dyC, dyT, htfDO, htfDH, htfDL, htfDC, htfDT)
+    if shouldDrawDailyFor15m and array.size(dyO) >= 3
+        legoutO = array.get(dyO, 0)
+        legoutH = array.get(dyH, 0)
+        legoutL = array.get(dyL, 0)
+        legoutC = array.get(dyC, 0)
+        legoutBody  = math.abs(legoutC - legoutO)
+        legoutGreen = legoutC > legoutO
+        legoutRed   = legoutC < legoutO
+        if legoutBody > 0 and (legoutGreen or legoutRed)
+            baseCnt = 0
+            ii = 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+            bool walking = true
+            while walking and baseCnt < maxBaseDW and ii < array.size(dyO) - 1
+                o_i = array.get(dyO, ii)
+                h_i = array.get(dyH, ii)
+                l_i = array.get(dyL, ii)
+                c_i = array.get(dyC, ii)
+                qStd = f_htfIsBase(o_i, h_i, l_i, c_i)
+                qOvr = false
+                if not qStd and smallBodyOverride
+                    cl_o = array.get(dyO, ii + 1)
+                    cl_c = array.get(dyC, ii + 1)
+                    candLegBody = math.abs(cl_c - cl_o)
+                    thisBody    = math.abs(c_i - o_i)
+                    if candLegBody > 0 and thisBody < smallBodyVsLegout * legoutBody and thisBody < smallBodyVsLegin * candLegBody
+                        qOvr := true
+                if qStd or qOvr
+                    bH = f_htfBodyHigh(o_i, c_i)
+                    bL = f_htfBodyLow(o_i, c_i)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? h_i : math.max(bHW, h_i)
+                    bLW := na(bLW) ? l_i : math.min(bLW, l_i)
+                    baseCnt += 1
+                    ii += 1
+                else
+                    walking := false
+            if baseCnt >= 1 and baseCnt <= maxBaseDW and ii < array.size(dyO)
+                leg_o = array.get(dyO, ii)
+                leg_h = array.get(dyH, ii)
+                leg_l = array.get(dyL, ii)
+                leg_c = array.get(dyC, ii)
+                leg_t = array.get(dyT, ii)
+                if f_htfIsExciting(leg_o, leg_h, leg_l, leg_c)
+                    leginBody = math.abs(leg_c - leg_o)
+                    if leginBody > 0 and f_htfIsExciting(legoutO, legoutH, legoutL, legoutC) and legoutBody >= legoutMinRatio * leginBody
+                        if legoutGreen and legoutC > bHB
+                            dyLeginIsRed = leg_c < leg_o
+                            extDistD = dyLeginIsRed ? math.min(bLW, math.min(leg_l, legoutL)) : math.min(bLW, legoutL)
+                            prox = bHB
+                            dist = extDistD
+                            if markMethod == "Body to Body"
+                                dist := bLB
+                            else if markMethod == "Wick to Wick"
+                                prox := bHW
+                                dist := extDistD
+                            mtfStr = legoutO > bHB ? 2 : 1
+                            f_drawMtfZone(1, 6, prox, dist, leg_t, mtfStr, baseCnt)
+                        else if legoutRed and legoutC < bLB
+                            dyLeginIsGreen = leg_c > leg_o
+                            extDistD = dyLeginIsGreen ? math.max(bHW, math.max(leg_h, legoutH)) : math.max(bHW, legoutH)
+                            prox = bLB
+                            dist = extDistD
+                            if markMethod == "Body to Body"
+                                dist := bHB
+                            else if markMethod == "Wick to Wick"
+                                prox := bLW
+                                dist := extDistD
+                            mtfStr = legoutO < bLB ? 2 : 1
+                            f_drawMtfZone(-1, 6, prox, dist, leg_t, mtfStr, baseCnt)
+
+// --- MTF zone state updates (mark tested / remove invalidated) ---
+if barstate.isconfirmed and array.size(mtfType) > 0
+    nM = array.size(mtfType)
+    jj = nM - 1
+    while jj >= 0
+        st = array.get(mtfState, jj)
+        if st < 2
+            t       = array.get(mtfType,    jj)
+            tg      = array.get(mtfTfTag,   jj)
+            pr      = array.get(mtfProx,    jj)
+            ds      = array.get(mtfDist,    jj)
+            bornBar = array.get(mtfBornBar, jj)
+            // Use each HTF's own bar H/L so a single current-TF wick cannot erase a valid HTF zone
+            float chkLow  = tg == 5 ? htf75L : tg == 6 ? htfDL : tg == 1 ? htfWL : tg == 2 ? htfML : tg == 3 ? htf3L : tg == 4 ? htf6L : low[1]
+            float chkHigh = tg == 5 ? htf75H : tg == 6 ? htfDH : tg == 1 ? htfWH : tg == 2 ? htfMH : tg == 3 ? htf3H : tg == 4 ? htf6H : high[1]
+            invalidated = false
+            wasIn   = array.get(mtfWasInZone, jj)
+            isIn    = false
+            if bar_index > bornBar + 1
+                if t == 1
+                    isIn := chkLow <= pr
+                    if chkLow < ds
+                        invalidated := true
+                    else if chkLow <= pr and st == 0
+                        array.set(mtfState, jj, 1)
+                        bx = array.get(mtfBoxArr, jj)
+                        box.set_bgcolor(bx, color.new(f_mtfBgColor(tg, t), 90))
+                else
+                    isIn := chkHigh >= pr
+                    if chkHigh > ds
+                        invalidated := true
+                    else if chkHigh >= pr and st == 0
+                        array.set(mtfState, jj, 1)
+                        bx = array.get(mtfBoxArr, jj)
+                        box.set_bgcolor(bx, color.new(f_mtfBgColor(tg, t), 90))
+
+                if not invalidated
+                    if isIn and not wasIn
+                        newCt = array.get(mtfTestCount, jj) + 1
+                        if newCt >= 2
+                            invalidated := true
+                        else
+                            array.set(mtfTestCount, jj, newCt)
+                            array.set(mtfWasInZone, jj, true)
+                            str   = array.get(mtfStrength,  jj)
+                            bc    = array.get(mtfBaseCount, jj)
+                            score = f_freshnessScore(newCt) + str + f_timeAtBaseScore(bc)
+                            if score < effectiveMtfMinScore
+                                invalidated := true
+                    else if not isIn and wasIn
+                        array.set(mtfWasInZone, jj, false)
+
+            if invalidated
+                bx = array.get(mtfBoxArr, jj)
+                box.delete(bx)
+                lbl = array.get(mtfLblArr, jj)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.remove(mtfType,      jj)
+                array.remove(mtfTfTag,     jj)
+                array.remove(mtfProx,      jj)
+                array.remove(mtfDist,      jj)
+                array.remove(mtfTime,      jj)
+                array.remove(mtfBoxArr,    jj)
+                array.remove(mtfLblArr,    jj)
+                array.remove(mtfState,     jj)
+                array.remove(mtfTestCount,   jj)
+                array.remove(mtfWasInZone,   jj)
+                array.remove(mtfStrength,    jj)
+                array.remove(mtfBaseCount,   jj)
+                array.remove(mtfBornBar,     jj)
+        jj -= 1
+
+// =============================================================================
+// ZONE STATE UPDATES (Fresh / Tested / Invalid)
+// Phase 4: also tracks test count (re-entries) for freshness scoring.
+// =============================================================================
+var int demandBreachCount = 0
+var int supplyBreachCount = 0
+var bool breachDemandThisBar = false
+var bool breachSupplyThisBar = false
+
+if barstate.isconfirmed and array.size(zType) > 0
+    breachDemandThisBar := false
+    breachSupplyThisBar := false
+
+    n2 = array.size(zType)
+    j = n2 - 1
+    while j >= 0
+        st = array.get(zState, j)
+        if st < 2
+            t  = array.get(zType, j)
+            pr = array.get(zProx, j)
+            ds = array.get(zDist, j)
+
+            invalidated = false
+            // low[1] at bar_index M = bar M-1's candle.
+            // We must not invalidate using the legout, detection bar, or
+            // confirmation candle — all of which are "inside" the zone creation
+            // sequence. The first genuinely independent candle is at bar M-1
+            // where M > bornBar + 1, i.e. bar_index > bornBar + 1.
+            bornBar = array.get(zBornBar, j)
+            wasIn = array.get(zWasInZone, j)
+            isIn  = false
+            if bar_index > bornBar + 1
+                if t == 1
+                    isIn := low[1] <= pr
+                    if low[1] < ds
+                        invalidated := true
+                        breachDemandThisBar := true
+                    else if low[1] <= pr and st == 0
+                        array.set(zState, j, 1)
+                        bx = array.get(zBoxArr, j)
+                        box.set_bgcolor(bx, color.new(demandColor, testedFade))
+                else
+                    isIn := high[1] >= pr
+                    if high[1] > ds
+                        invalidated := true
+                        breachSupplyThisBar := true
+                    else if high[1] >= pr and st == 0
+                        array.set(zState, j, 1)
+                        bx = array.get(zBoxArr, j)
+                        box.set_bgcolor(bx, color.new(supplyColor, testedFade))
+
+            if not invalidated and bar_index > bornBar
+                if isIn and not wasIn
+                    array.set(zTestCount, j, array.get(zTestCount, j) + 1)
+                    array.set(zWasInZone, j, true)
+                else if not isIn and wasIn
+                    array.set(zWasInZone, j, false)
+
+            if invalidated
+                bx = array.get(zBoxArr, j)
+                box.delete(bx)
+                pl = array.get(zProxLn, j)
+                if not na(pl)
+                    line.delete(pl)
+                dl = array.get(zDistLn, j)
+                if not na(dl)
+                    line.delete(dl)
+                lbl = array.get(zScoreLbl, j)
+                if not na(lbl)
+                    label.delete(lbl)
+                gb = array.get(zGapBox, j)
+                if not na(gb)
+                    box.delete(gb)
+                array.remove(zType,         j)
+                array.remove(zProx,         j)
+                array.remove(zDist,         j)
+                array.remove(zLeft,         j)
+                array.remove(zState,        j)
+                array.remove(zBoxArr,       j)
+                array.remove(zProxLn,       j)
+                array.remove(zDistLn,       j)
+                array.remove(zGapBox,       j)
+                array.remove(zTestCount,    j)
+                array.remove(zWasInZone,    j)
+                array.remove(zBaseCount,    j)
+                array.remove(zStrength,     j)
+                array.remove(zScoreLbl,     j)
+                array.remove(zCurrentScore, j)
+                array.remove(zBornBar,      j)
+        j -= 1
+
+// Real-time invalidation: remove zones already violated by the current live bar
+// (the barstate.isconfirmed loop uses high[1]/low[1] so it misses the current bar)
+// Guard: bar_index > bornBar ensures we do not delete on the birth bar itself
+// (direct zones: bornBar = detection bar; pending: bornBar = confirmation bar).
+if barstate.islast and array.size(zType) > 0
+    k = array.size(zType) - 1
+    while k >= 0
+        t       = array.get(zType,    k)
+        ds      = array.get(zDist,    k)
+        bornBar = array.get(zBornBar, k)
+        violated = bar_index > bornBar and ((t == 1 and low <= ds) or (t != 1 and high >= ds))
+        if violated
+            bx = array.get(zBoxArr, k)
+            box.delete(bx)
+            pl = array.get(zProxLn, k)
+            if not na(pl)
+                line.delete(pl)
+            dl = array.get(zDistLn, k)
+            if not na(dl)
+                line.delete(dl)
+            lbl = array.get(zScoreLbl, k)
+            if not na(lbl)
+                label.delete(lbl)
+            gb = array.get(zGapBox, k)
+            if not na(gb)
+                box.delete(gb)
+            array.remove(zType,         k)
+            array.remove(zProx,         k)
+            array.remove(zDist,         k)
+            array.remove(zLeft,         k)
+            array.remove(zState,        k)
+            array.remove(zBoxArr,       k)
+            array.remove(zProxLn,       k)
+            array.remove(zDistLn,       k)
+            array.remove(zGapBox,       k)
+            array.remove(zTestCount,    k)
+            array.remove(zWasInZone,    k)
+            array.remove(zBaseCount,    k)
+            array.remove(zStrength,     k)
+            array.remove(zScoreLbl,     k)
+            array.remove(zCurrentScore, k)
+            array.remove(zBornBar,      k)
+        k -= 1
+
+// =============================================================================
+// PHASE 4: TRADE SCORE COMPUTATION + LABEL DRAWING
+// Score = freshness (3 / 1.5 / 0) + strength (2 / 2 / 1) + time-at-base (2 / 1 / 0)
+// Maximum 7. Per PDF pages 34-35.
+// =============================================================================
+
+if barstate.islast and array.size(zType) > 0
+    nz = array.size(zType)
+    for k = 0 to nz - 1
+        // Compute score
+        tc      = array.get(zTestCount, k)
+        bc      = array.get(zBaseCount, k)
+        str     = array.get(zStrength,  k)
+        score   = f_freshnessScore(tc) + str + f_timeAtBaseScore(bc)
+        array.set(zCurrentScore, k, score)
+
+        // Delete old label if present
+        oldLbl = array.get(zScoreLbl, k)
+        if not na(oldLbl)
+            label.delete(oldLbl)
+            array.set(zScoreLbl, k, na)
+
+        // Draw new label only if scoring is enabled and score meets threshold
+        if showScore and score >= effectiveMinScore
+            zt    = array.get(zType, k)
+            pr    = array.get(zProx, k)
+            ds    = array.get(zDist, k)
+            leftB = array.get(zLeft, k)
+            yPos  = math.max(pr, ds)
+            xPos  = math.max(leftB + 3, bar_index - 490)
+            fScore = f_freshnessScore(tc)
+            bScore = f_timeAtBaseScore(bc)
+            // Breakdown: total | F:freshness S:strength B:base
+            scoreTxt = str.tostring(math.round(score * 10) / 10) + " | F:" + str.tostring(fScore) + " S:" + str.tostring(str) + " B:" + str.tostring(bScore) + " (bc:" + str.tostring(bc) + " tc:" + str.tostring(tc) + ")"
+            newLbl = label.new(xPos, yPos, scoreTxt, style = label.style_label_down, color = scoreLabelColor, textcolor = color.white, size = size.small)
+            array.set(zScoreLbl, k, newLbl)
+        else if not showScore
+            // Make sure label is gone when toggle is off
+            existing = array.get(zScoreLbl, k)
+            if not na(existing)
+                label.delete(existing)
+                array.set(zScoreLbl, k, na)
+
+// =============================================================================
+// PHASE 4: HIDE ZONES BELOW MINIMUM SCORE
+// When user sets a minimum score, zones below it should not just lose their
+// score label but be visually hidden (box transparent).
+// =============================================================================
+if barstate.islast and array.size(zType) > 0 and effectiveMinScore > 0
+    nz2 = array.size(zType)
+    for k = 0 to nz2 - 1
+        score = array.get(zCurrentScore, k)
+        bx = array.get(zBoxArr, k)
+        pl = array.get(zProxLn, k)
+        dl = array.get(zDistLn, k)
+        if score < effectiveMinScore
+            // Hide box and lines: full transparency
+            box.set_bgcolor(bx, color.new(color.gray, 100))
+            box.set_border_color(bx, color.new(color.gray, 100))
+            if not na(pl)
+                line.set_color(pl, color.new(color.gray, 100))
+            if not na(dl)
+                line.set_color(dl, color.new(color.gray, 100))
+        else
+            // Restore appropriate color based on current state
+            zt = array.get(zType, k)
+            st = array.get(zState, k)
+            baseColor = zt == 1 ? demandColor : supplyColor
+            if st == 0
+                box.set_bgcolor(bx, baseColor)
+            else
+                box.set_bgcolor(bx, color.new(baseColor, testedFade))
+            if not na(pl)
+                line.set_color(pl, zt == 1 ? color.new(color.green, 0) : color.new(color.red, 0))
+            if not na(dl)
+                line.set_color(dl, zt == 1 ? color.new(color.green, 30) : color.new(color.red, 30))
+
+
+
+// =============================================================================
+// TRADE SETUP (Phase 3)
+// =============================================================================
+// On every confirmed bar, find:
+//   * Nearest fresh DEMAND zone below current price (highest proximal that's
+//     still below current close).
+//   * Nearest fresh SUPPLY zone above current price (lowest proximal that's
+//     still above current close).
+// Draw entry / stop loss / target lines for each, with the configured R:R.
+// Lines are redrawn every bar so they track the "nearest" zones as price moves.
+// =============================================================================
+
+// Persistent line/label handles so we can delete and recreate each bar.
+var line   setupDemandEntry  = na
+var line   setupDemandSL     = na
+var line   setupDemandTgt    = na
+var label  setupDemandEntryL = na
+var label  setupDemandSLL    = na
+var label  setupDemandTgtL   = na
+
+var line   setupSupplyEntry  = na
+var line   setupSupplySL     = na
+var line   setupSupplyTgt    = na
+var label  setupSupplyEntryL = na
+var label  setupSupplySLL    = na
+var label  setupSupplyTgtL   = na
+
+// Helper: delete a line if it exists
+f_delLine(ln) =>
+    if not na(ln)
+        line.delete(ln)
+
+f_delLabel(lbl) =>
+    if not na(lbl)
+        label.delete(lbl)
+
+// Always clean up previous setup drawings on the last bar so that toggling
+// "Show trade setup lines" off actually removes the lines from the chart.
+if barstate.islast
+    f_delLine(setupDemandEntry)
+    f_delLine(setupDemandSL)
+    f_delLine(setupDemandTgt)
+    f_delLabel(setupDemandEntryL)
+    f_delLabel(setupDemandSLL)
+    f_delLabel(setupDemandTgtL)
+    f_delLine(setupSupplyEntry)
+    f_delLine(setupSupplySL)
+    f_delLine(setupSupplyTgt)
+    f_delLabel(setupSupplyEntryL)
+    f_delLabel(setupSupplySLL)
+    f_delLabel(setupSupplyTgtL)
+    setupDemandEntry  := na
+    setupDemandSL     := na
+    setupDemandTgt    := na
+    setupDemandEntryL := na
+    setupDemandSLL    := na
+    setupDemandTgtL   := na
+    setupSupplyEntry  := na
+    setupSupplySL     := na
+    setupSupplyTgt    := na
+    setupSupplyEntryL := na
+    setupSupplySLL    := na
+    setupSupplyTgtL   := na
+
+if showSetup and barstate.islast and array.size(zType) > 0
+    // Find the nearest fresh zones above and below price
+    int   bestDemandIdx = -1
+    float bestDemandProx = na
+    int   bestSupplyIdx = -1
+    float bestSupplyProx = na
+
+    nz = array.size(zType)
+    for k = 0 to nz - 1
+        st = array.get(zState, k)
+        if st < 2  // fresh or tested (not invalid)
+            t  = array.get(zType, k)
+            pr = array.get(zProx, k)
+            if t == 1 and pr < close
+                // Demand below price: we want the HIGHEST proximal (closest to price from below)
+                if na(bestDemandProx) or pr > bestDemandProx
+                    bestDemandProx := pr
+                    bestDemandIdx  := k
+            else if t == -1 and pr > close
+                // Supply above price: we want the LOWEST proximal (closest to price from above)
+                if na(bestSupplyProx) or pr < bestSupplyProx
+                    bestSupplyProx := pr
+                    bestSupplyIdx  := k
+
+    // Draw setup for nearest demand
+    if bestDemandIdx >= 0
+        prox = array.get(zProx, bestDemandIdx)
+        dist = array.get(zDist, bestDemandIdx)
+        // Demand: entry just above proximal, SL just below distal, target above entry
+        bufferAmt = prox * setupBufferPct / 100.0
+        entry  = prox + bufferAmt
+        sl     = dist - bufferAmt
+        risk   = entry - sl
+        target = entry + setupRR * risk
+
+        leftBar = bar_index - 5
+        rightBar = bar_index + 30
+
+        setupDemandEntry := line.new(leftBar, entry,  rightBar, entry,  color = setupEntryColor, width = 2,                          extend = extend.right)
+        setupDemandSL    := line.new(leftBar, sl,     rightBar, sl,     color = setupSlColor,    width = 1, style = line.style_dashed, extend = extend.right)
+        setupDemandTgt   := line.new(leftBar, target, rightBar, target, color = setupTgtColor,   width = 1, style = line.style_dashed, extend = extend.right)
+
+        if setupShowLabels
+            rrTxt = str.tostring(math.round(setupRR * 100) / 100)
+            setupDemandEntryL := label.new(rightBar, entry,  "Entry @ " + str.tostring(math.round(entry * 100) / 100),                  style = label.style_label_left, color = setupEntryColor, textcolor = color.black, size = size.small)
+            setupDemandSLL    := label.new(rightBar, sl,     "SL @ "    + str.tostring(math.round(sl    * 100) / 100),                  style = label.style_label_left, color = setupSlColor,    textcolor = color.white, size = size.small)
+            setupDemandTgtL   := label.new(rightBar, target, "TGT @ "   + str.tostring(math.round(target* 100) / 100) + "  R:R " + rrTxt, style = label.style_label_left, color = setupTgtColor,   textcolor = color.white, size = size.small)
+
+    // Draw setup for nearest supply
+    if bestSupplyIdx >= 0
+        prox = array.get(zProx, bestSupplyIdx)
+        dist = array.get(zDist, bestSupplyIdx)
+        // Supply: entry just below proximal, SL just above distal, target below entry
+        bufferAmt = prox * setupBufferPct / 100.0
+        entry  = prox - bufferAmt
+        sl     = dist + bufferAmt
+        risk   = sl - entry
+        target = entry - setupRR * risk
+
+        leftBar = bar_index - 5
+        rightBar = bar_index + 30
+
+        setupSupplyEntry := line.new(leftBar, entry,  rightBar, entry,  color = setupEntryColor, width = 2,                          extend = extend.right)
+        setupSupplySL    := line.new(leftBar, sl,     rightBar, sl,     color = setupSlColor,    width = 1, style = line.style_dashed, extend = extend.right)
+        setupSupplyTgt   := line.new(leftBar, target, rightBar, target, color = setupTgtColor,   width = 1, style = line.style_dashed, extend = extend.right)
+
+        if setupShowLabels
+            rrTxt = str.tostring(math.round(setupRR * 100) / 100)
+            setupSupplyEntryL := label.new(rightBar, entry,  "Entry @ " + str.tostring(math.round(entry * 100) / 100),                  style = label.style_label_left, color = setupEntryColor, textcolor = color.black, size = size.small)
+            setupSupplySLL    := label.new(rightBar, sl,     "SL @ "    + str.tostring(math.round(sl    * 100) / 100),                  style = label.style_label_left, color = setupSlColor,    textcolor = color.white, size = size.small)
+            setupSupplyTgtL   := label.new(rightBar, target, "TGT @ "   + str.tostring(math.round(target* 100) / 100) + "  R:R " + rrTxt, style = label.style_label_left, color = setupTgtColor,   textcolor = color.white, size = size.small)
+
+// =============================================================================
+// TREND
+// =============================================================================
+sma50 = ta.sma(close, 50)
+slope7      = (sma50 - sma50[7]) / 7.0
+slopePct    = close > 0 ? slope7 / close * 100.0 : 0.0
+flatThresh  = 0.05
+
+normalTrend = slopePct > flatThresh ? "Uptrend" : slopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+var string advTrend = "Sideways"
+if barstate.isfirst
+    advTrend := normalTrend
+
+if barstate.isconfirmed
+    if advTrend == "Uptrend"
+        if breachDemandThisBar
+            demandBreachCount += 1
+            if demandBreachCount == 1
+                advTrend := "Sideways"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+            else if demandBreachCount >= 2
+                advTrend := "Downtrend"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+    else if advTrend == "Downtrend"
+        if breachSupplyThisBar
+            supplyBreachCount += 1
+            if supplyBreachCount == 1
+                advTrend := "Sideways"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+            else if supplyBreachCount >= 2
+                advTrend := "Uptrend"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+    else
+        if breachDemandThisBar
+            demandBreachCount += 1
+            if demandBreachCount >= 2
+                advTrend := "Downtrend"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+        if breachSupplyThisBar
+            supplyBreachCount += 1
+            if supplyBreachCount >= 2
+                advTrend := "Uptrend"
+                demandBreachCount := 0
+                supplyBreachCount := 0
+
+trendOut = trendMode == "Normal" ? normalTrend : advTrend
+
+var label trendLbl = na
+if showTrendLabel and barstate.islast
+    if not na(trendLbl)
+        label.delete(trendLbl)
+    txt = "Trend: " + trendOut + " (" + trendMode + ")"
+    bg  = trendOut == "Uptrend" ? color.new(color.green, 30) : trendOut == "Downtrend" ? color.new(color.red, 30) : color.new(color.gray, 30)
+    trendLbl := label.new(bar_index, high + (high - low) * 0.5, txt, style = label.style_label_down, color = bg, textcolor = color.white, size = size.normal)
+
+// =============================================================================
+// PHASE 6: TREND PANEL & INFO TABLE
+// =============================================================================
+// Multi-row table showing:
+//   Row 1-3: Daily / Weekly / Monthly trend (colour coded)
+//   Row 4:   Volume info (highest 10 bar, current vs avg)
+//   Row 5-6: EMA 20 and EMA 50 values
+//   Row 7:   Sector
+// Position is configurable.
+// =============================================================================
+
+// --- Fetch HTF trend values via request.security ---
+// Daily 50 SMA slope (used when chart is intraday)
+dSma50      = request.security(syminfo.tickerid, "D", ta.sma(close, 50), lookahead = barmerge.lookahead_off)
+dSma50Prev  = request.security(syminfo.tickerid, "D", ta.sma(close, 50)[7], lookahead = barmerge.lookahead_off)
+dSlopePct   = not na(dSma50) and not na(dSma50Prev) and close > 0 ? (dSma50 - dSma50Prev) / 7.0 / close * 100.0 : 0.0
+dTrend      = dSlopePct > flatThresh ? "Uptrend" : dSlopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+// Weekly 50 SMA slope
+wkSma50      = request.security(syminfo.tickerid, "W", ta.sma(close, 50), lookahead = barmerge.lookahead_off)
+wkSma50Prev  = request.security(syminfo.tickerid, "W", ta.sma(close, 50)[7], lookahead = barmerge.lookahead_off)
+wkSlopePct   = not na(wkSma50) and not na(wkSma50Prev) and close > 0 ? (wkSma50 - wkSma50Prev) / 7.0 / close * 100.0 : 0.0
+wkTrend      = wkSlopePct > flatThresh ? "Uptrend" : wkSlopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+// Monthly 50 SMA slope
+moSma50      = request.security(syminfo.tickerid, "M", ta.sma(close, 50), lookahead = barmerge.lookahead_off)
+moSma50Prev  = request.security(syminfo.tickerid, "M", ta.sma(close, 50)[7], lookahead = barmerge.lookahead_off)
+moSlopePct   = not na(moSma50) and not na(moSma50Prev) and close > 0 ? (moSma50 - moSma50Prev) / 7.0 / close * 100.0 : 0.0
+moTrend      = moSlopePct > flatThresh ? "Uptrend" : moSlopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+// 15-min SMA slope (for 5-min chart HTF trend)
+m15Sma50     = request.security(syminfo.tickerid, "15", ta.sma(close, 50), lookahead = barmerge.lookahead_off)
+m15Sma50Prev = request.security(syminfo.tickerid, "15", ta.sma(close, 50)[7], lookahead = barmerge.lookahead_off)
+m15SlopePct  = not na(m15Sma50) and not na(m15Sma50Prev) and close > 0 ? (m15Sma50 - m15Sma50Prev) / 7.0 / close * 100.0 : 0.0
+m15Trend     = m15SlopePct > flatThresh ? "Uptrend" : m15SlopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+// 75-min SMA slope (for 15-min chart HTF trend)
+m75Sma50     = request.security(syminfo.tickerid, "75", ta.sma(close, 50), lookahead = barmerge.lookahead_off)
+m75Sma50Prev = request.security(syminfo.tickerid, "75", ta.sma(close, 50)[7], lookahead = barmerge.lookahead_off)
+m75SlopePct  = not na(m75Sma50) and not na(m75Sma50Prev) and close > 0 ? (m75Sma50 - m75Sma50Prev) / 7.0 / close * 100.0 : 0.0
+m75Trend     = m75SlopePct > flatThresh ? "Uptrend" : m75SlopePct < -flatThresh ? "Downtrend" : "Sideways"
+
+// Weekly and Monthly EMA values
+wkEma20 = request.security(syminfo.tickerid, "W", ta.ema(close, 20), lookahead = barmerge.lookahead_off)
+wkEma50 = request.security(syminfo.tickerid, "W", ta.ema(close, 50), lookahead = barmerge.lookahead_off)
+moEma20 = request.security(syminfo.tickerid, "M", ta.ema(close, 20), lookahead = barmerge.lookahead_off)
+moEma50 = request.security(syminfo.tickerid, "M", ta.ema(close, 50), lookahead = barmerge.lookahead_off)
+
+// Volume info
+highVol10    = ta.highest(volume, volLookback)
+avgVol10     = ta.sma(volume, volLookback)
+volRatio     = avgVol10 > 0 ? volume / avgVol10 : 0.0
+
+// Helper: trend colour
+f_trendColor(t) =>
+    t == "Uptrend" ? color.new(color.green, 20) : t == "Downtrend" ? color.new(color.red, 20) : color.new(color.gray, 40)
+
+// Helper: format large numbers (volume)
+f_fmtVol(v) =>
+    if v >= 10000000
+        str.tostring(math.round(v / 1000000.0 * 10) / 10) + "M"
+    else if v >= 100000
+        str.tostring(math.round(v / 100000.0 * 10) / 10) + "L"
+    else if v >= 1000
+        str.tostring(math.round(v / 1000.0 * 10) / 10) + "K"
+    else
+        str.tostring(math.round(v))
+
+// Helper: format price
+f_fmtPrice(v) =>
+    str.tostring(math.round(v * 100) / 100)
+
+// Panel position mapping
+f_panelPos(pos) =>
+    if pos == "Top Right"
+        position.top_right
+    else if pos == "Top Left"
+        position.top_left
+    else if pos == "Bottom Right"
+        position.bottom_right
+    else if pos == "Bottom Left"
+        position.bottom_left
+    else if pos == "Middle Right"
+        position.middle_right
+    else
+        position.middle_left
+
+// Text size mapping
+f_txtSize(sz) =>
+    if sz == "tiny"
+        size.tiny
+    else if sz == "small"
+        size.small
+    else
+        size.normal
+
+// Build the table
+var table infoPanel = na
+
+if showPanel and barstate.islast
+    if not na(infoPanel)
+        table.delete(infoPanel)
+
+    // Count rows needed
+    nRows = 1  // 1 dynamic HTF trend row
+    if showVolTable
+        nRows += 2  // volume rows
+    if showEmaTable
+        nRows += 4  // EMA 20/50 per D+W+M condensed into 2 rows
+    if showSectorTable
+        nRows += 1
+
+    infoPanel := table.new(f_panelPos(panelPosition), columns = 2, rows = nRows, bgcolor = panelBgColor, border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.new(color.gray, 40), frame_width = 1)
+
+    txtSz = f_txtSize(panelTextSize)
+    row = 0
+
+    // --- Dynamic HTF trend row (1 level above current TF) ---
+    htfLabel    = timeframe.period == "5" ? "15m Trend" : timeframe.period == "15" ? "75m Trend" : timeframe.isintraday ? "Daily Trend"  : timeframe.isdaily ? "Weekly Trend" : "Monthly Trend"
+    htfTrendStr = timeframe.period == "5" ? m15Trend   : timeframe.period == "15" ? m75Trend   : timeframe.isintraday ? dTrend         : timeframe.isdaily ? wkTrend        : moTrend
+    htfColor    = f_trendColor(htfTrendStr)
+    table.cell(infoPanel, 0, row, htfLabel,    text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+    table.cell(infoPanel, 1, row, htfTrendStr, text_color = color.white,    text_size = txtSz, bgcolor = htfColor)
+    row += 1
+
+    // --- Volume rows ---
+    if showVolTable
+        highVolFmt = f_fmtVol(highVol10)
+        table.cell(infoPanel, 0, row, "High Vol (" + str.tostring(volLookback) + ")", text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        table.cell(infoPanel, 1, row, highVolFmt,   text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        row += 1
+
+        ratioTxt  = str.tostring(math.round(volRatio * 100) / 100) + "x avg"
+        ratioColor = volRatio >= 2.0 ? color.new(color.orange, 20) : volRatio >= 1.0 ? color.new(color.green, 50) : panelBgColor
+        table.cell(infoPanel, 0, row, "Vol vs Avg",   text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        table.cell(infoPanel, 1, row, ratioTxt,       text_color = panelTextColor, text_size = txtSz, bgcolor = ratioColor)
+        row += 1
+
+    // --- EMA rows ---
+    if showEmaTable
+        ema20Val = ta.ema(close, 20)
+        ema50Val = ta.ema(close, 50)
+        table.cell(infoPanel, 0, row, "EMA 20 (D/W/M)", text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        table.cell(infoPanel, 1, row, f_fmtPrice(ema20Val) + " / " + f_fmtPrice(wkEma20) + " / " + f_fmtPrice(moEma20), text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        row += 1
+
+        table.cell(infoPanel, 0, row, "EMA 50 (D/W/M)", text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        table.cell(infoPanel, 1, row, f_fmtPrice(ema50Val) + " / " + f_fmtPrice(wkEma50) + " / " + f_fmtPrice(moEma50), text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        row += 1
+
+    // --- Sector row ---
+    if showSectorTable
+        table.cell(infoPanel, 0, row, "Sector",        text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+        table.cell(infoPanel, 1, row, syminfo.sector,  text_color = panelTextColor, text_size = txtSz, bgcolor = panelBgColor)
+
+// =============================================================================
+// EMAs
+// =============================================================================
+ema5  = ta.ema(close, 5)
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+plot(showEma5  ? ema5  : na, "EMA 5",  color = ema5Color,  linewidth = 2)
+plot(showEma20 ? ema20 : na, "EMA 20", color = ema20Color, linewidth = 2)
+plot(showEma50 ? ema50 : na, "EMA 50", color = ema50Color, linewidth = 2)
+plot(showSma50 ? sma50 : na, "SMA 50", color = sma50Color, linewidth = 2)

@@ -1,0 +1,1699 @@
+//@version=6
+// =============================================================================
+// IDEAL Zone Screener — Unified Stock Scanner
+// Covers all stock batches A-M (520 stocks) via a single Batch dropdown.
+// Selecting a batch loads that group's 40 symbols; the script reloads.
+// Same IDEAL detection logic as the per-batch scanners.
+//
+// Note: Pine Script v5 limits to 40 request.security() calls per script.
+// =============================================================================
+indicator("IDEAL Near Zone Scanner — Unified", shorttitle = "IDEAL Scanner", overlay = false)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+grpBatch = "Stock Universe"
+batch = input.string("A", "Stock Batch",
+     options = ["A","B","C","D","E","F","G","H","I","J","K","L","M","indices"],
+     group = grpBatch,
+     tooltip = "Select which group of 40 stocks to scan. A=Nifty50, B-M=other NSE stocks, indices=NSE sector/broad indices.")
+
+grpScan = "Scanner Settings"
+scanMode       = input.string("Both",   "Scan for zones",     options = ["Demand only", "Supply only", "Both"], group = grpScan)
+minDistPct     = input.float(0.0,  "Min % from proximal", minval = 0.0, maxval = 20.0, step = 0.5,  group = grpScan, tooltip = "Price must be at least this % away from the zone proximal.")
+maxDistPct     = input.float(7.0, "Max % from proximal", minval = 0.5, maxval = 30.0, step = 0.5,  group = grpScan, tooltip = "Price must be within this % of the zone proximal.")
+
+grpFilter = "Filters"
+useTrendFilter = input.bool(false, "Trend filter",   group = grpFilter, tooltip = "Demand zones: only show if stock is in Uptrend. Supply zones: only if Downtrend.")
+useScoreFilter = input.bool(true,  "Score filter",   group = grpFilter, tooltip = "Only show zones with trade score >= minimum.")
+minScore       = input.float(7.0,  "Minimum score",  minval = 0.0, maxval = 7.0, step = 0.5, group = grpFilter)
+maxZoneTests   = input.int(1,     "Max zone tests (0=fresh only, 1=+tested once)", minval = 0, maxval = 2, group = grpFilter)
+maxHtfZoneTests = input.int(1,    "Max HTF zone tests (0=fresh only, 1=+tested once)", minval = 0, maxval = 2, group = grpFilter)
+
+grpDetect = "Detection Settings"
+basePct        = input.float(0.50, "Base candle body % (max)",   minval = 0.1, maxval = 0.9, step = 0.05, group = grpDetect)
+excitePct      = input.float(0.50, "Exciting candle body % (min)", minval = 0.1, maxval = 0.9, step = 0.05, group = grpDetect)
+legoutMinRatio         = input.float(0.8,  "Legout / legin min ratio",          minval = 0.5,  maxval = 1.0,  step = 0.05, group = grpDetect)
+maxBase                = input.int(3,      "Max base candles",                  minval = 1,    maxval = 5,               group = grpDetect)
+allowSmallBodyOverride = input.bool(true,  "Small body override",                                                        group = grpDetect, tooltip = "Treat a candle as a base if its body is tiny vs both the legout and legin, even when bodyPct exceeds the base threshold.")
+smallBodyVsLegout      = input.float(0.30, "Small body: max % of legout body",  minval = 0.05, maxval = 0.6,  step = 0.05, group = grpDetect)
+smallBodyVsLegin       = input.float(0.30, "Small body: max % of legin body",   minval = 0.05, maxval = 0.6,  step = 0.05, group = grpDetect)
+allowZeroBase          = input.bool(true,  "Allow zero-base zones",                                                      group = grpDetect, tooltip = "Detect engulfing spike reversals with no base candle between legin and legout.")
+lookbackBars           = input.int(50,     "Zone lookback (bars)",               minval = 10,   maxval = 200,             group = grpDetect, tooltip = "How many bars back to scan for zone formations. 50 matches the indicator's effective detection window.")
+// rrRatio        = input.float(2.0,  "R:R for target",             minval = 1.0, maxval = 5.0, step = 0.25, group = grpDetect)
+bufferPct      = input.float(0.5,  "Entry / SL buffer %",        minval = 0.0, maxval = 2.0, step = 0.1,  group = grpDetect)
+
+grpTable = "Table"
+tablePos  = input.string("Top", "Position", options = ["Top", "Bottom"], group = grpTable)
+// showEntry = input.bool(true, "Show Entry / SL / Target", group = grpTable)
+
+grpAlert = "Alerts"
+enableAlerts  = input.bool(true,  "Enable zone-approach alerts", group = grpAlert, tooltip = "Fires a dynamic alert() message when price crosses the entry line. Only active on Daily and Weekly timeframes. Create one TradingView alert: Condition = this script, 'Any alert() function call'.")
+alertDemand   = input.bool(true,  "Alert on demand approach",    group = grpAlert)
+alertSupply   = input.bool(true,  "Alert on supply approach",    group = grpAlert)
+alertEntryPct = input.float(0.5,  "Entry line % from proximal",  minval = 0.0, maxval = 5.0, step = 0.05, group = grpAlert, tooltip = "Entry line = proximal + this % (demand) / proximal - this % (supply). Alert fires when price crosses this line approaching the zone. Pick 0.05, 0.1, 0.5, 1.0, etc.")
+alertMinScore = input.float(7.0,  "Alert min score",             minval = 0.0, maxval = 7.0, step = 0.5,  group = grpAlert, tooltip = "Only fire alerts for zones whose score >= this value. Independent of the table's score filter. Set 0 to alert on every approach.")
+alertOnlyQualified = input.bool(true, "Apply trend filter to alerts", group = grpAlert, tooltip = "Also require zone trend to match (demand=Uptrend, supply=Downtrend). Score filter is separate (see above).")
+
+// =============================================================================
+// SYMBOLS  (40 per batch, selected via the Batch dropdown)
+// =============================================================================
+sym01 = switch batch
+    "A" => "NSE:ADANIENT"
+    "B" => "NSE:360ONE"
+    "C" => "NSE:ASTRAZEN"
+    "D" => "NSE:CAMPUS"
+    "E" => "NSE:DEEPAKFERT"
+    "F" => "NSE:MEDANTA"
+    "G" => "NSE:IFCI"
+    "H" => "NSE:JYOTHYLAB"
+    "I" => "NSE:MASTEK"
+    "J" => "NSE:PERSISTENT"
+    "K" => "NSE:SRF"
+    "L" => "NSE:TMB"
+    "M" => "NSE:VAIBHAVGBL"
+    "indices" => "NSE:CNXAUTO"
+    => "NSE:ADANIENT"
+
+sym02 = switch batch
+    "A" => "NSE:ADANIPORTS"
+    "B" => "NSE:3MINDIA"
+    "C" => "NSE:ASTRAL"
+    "D" => "NSE:CANFINHOME"
+    "E" => "NSE:DEEPAKNTR"
+    "F" => "NSE:GPIL"
+    "G" => "NSE:IIFL"
+    "H" => "NSE:KPRMILL"
+    "I" => "NSE:MFSL"
+    "J" => "NSE:PETRONET"
+    "K" => "NSE:SAFARI"
+    "L" => "NSE:TANLA"
+    "M" => "NSE:VTL"
+    "indices" => "NSE:BANKNIFTY"
+    => "NSE:ADANIPORTS"
+
+sym03 = switch batch
+    "A" => "NSE:APOLLOHOSP"
+    "B" => "NSE:ABB"
+    "C" => "NSE:ATUL"
+    "D" => "NSE:CANBK"
+    "E" => "NSE:DELHIVERY"
+    "F" => "NSE:GODFRYPHLP"
+    "G" => "NSE:IRB"
+    "H" => "NSE:KEI"
+    "I" => "NSE:MAXHEALTH"
+    "J" => "NSE:PHOENIXLTD"
+    "K" => "NSE:SAMMAANCAP"
+    "L" => "NSE:TATACHEM"
+    "M" => "NSE:VARROC"
+    "indices" => "NSE:NIFTY_CHEMICALS"
+    => "NSE:APOLLOHOSP"
+
+sym04 = switch batch
+    "A" => "NSE:ASIANPAINT"
+    "B" => "NSE:ACC"
+    "C" => "NSE:AUROPHARMA"
+    "D" => "NSE:CAPLIPOINT"
+    "E" => "NSE:DEVYANI"
+    "F" => "NSE:GODREJCP"
+    "G" => "NSE:IRCON"
+    "H" => "NSE:KNRCON"
+    "I" => "NSE:MAZDOCK"
+    "J" => "NSE:PIDILITIND"
+    "K" => "NSE:MOTHERSON"
+    "L" => "NSE:TATACOMM"
+    "M" => "NSE:VBL"
+    "indices" => "NSE:CNXFINANCE"
+    => "NSE:ASIANPAINT"
+
+sym05 = switch batch
+    "A" => "NSE:AXISBANK"
+    "B" => "NSE:AIAENG"
+    "C" => "NSE:AVANTIFEED"
+    "D" => "NSE:CGCL"
+    "E" => "NSE:DIVISLAB"
+    "F" => "NSE:GODREJIND"
+    "G" => "NSE:ITI"
+    "H" => "NSE:KPITTECH"
+    "I" => "NSE:MEDPLUS"
+    "J" => "NSE:PIRAMALFIN"
+    "K" => "NSE:SANOFI"
+    "L" => "NSE:TCS"
+    "M" => "NSE:MANYAVAR"
+    "indices" => "NSE:CNXFMCG"
+    => "NSE:AXISBANK"
+
+sym06 = switch batch
+    "A" => "NSE:BAJAJ_AUTO"
+    "B" => "NSE:APLAPOLLO"
+    "C" => "NSE:DMART"
+    "D" => "NSE:CARBORUNIV"
+    "E" => "NSE:DIXON"
+    "F" => "NSE:GODREJPROP"
+    "G" => "NSE:INDIACEM"
+    "H" => "NSE:KRBL"
+    "I" => "NSE:METROBRAND"
+    "J" => "NSE:PPLPHARMA"
+    "K" => "NSE:SAPPHIRE"
+    "L" => "NSE:TATACONSUM"
+    "M" => "NSE:VEDL"
+    "indices" => "NSE:NIFTY_HEALTHCARE"
+    => "NSE:BAJAJ_AUTO"
+
+sym07 = switch batch
+    "A" => "NSE:BAJFINANCE"
+    "B" => "NSE:AUBANK"
+    "C" => "NSE:BEML"
+    "D" => "NSE:CASTROLIND"
+    "E" => "NSE:LALPATHLAB"
+    "F" => "NSE:GRANULES"
+    "G" => "NSE:INDIAMART"
+    "H" => "NSE:KSB"
+    "I" => "NSE:METROPOLIS"
+    "J" => "NSE:POLYMED"
+    "K" => "NSE:SAREGAMA"
+    "L" => "NSE:TATAELXSI"
+    "M" => "NSE:VIJAYA"
+    "indices" => "NSE:CNXIT"
+    => "NSE:BAJFINANCE"
+
+sym08 = switch batch
+    "A" => "NSE:BAJAJFINSV"
+    "B" => "NSE:AARTIIND"
+    "C" => "NSE:BLS"
+    "D" => "NSE:CEATLTD"
+    "E" => "NSE:EIDPARRY"
+    "F" => "NSE:GRAPHITE"
+    "G" => "NSE:INDIANB"
+    "H" => "NSE:KAJARIACER"
+    "I" => "NSE:MINDACORP"
+    "J" => "NSE:POLYCAB"
+    "K" => "NSE:SCHAEFFLER"
+    "L" => "NSE:TATAINVEST"
+    "M" => "NSE:IDEA"
+    "indices" => "NSE:CNXMEDIA"
+    => "NSE:BAJAJFINSV"
+
+sym09 = switch batch
+    "A" => "NSE:BEL"
+    "B" => "NSE:AAVAS"
+    "C" => "NSE:BSE"
+    "D" => "NSE:CELLO"
+    "E" => "NSE:EIHOTEL"
+    "F" => "NSE:GESHIP"
+    "G" => "NSE:IEX"
+    "H" => "NSE:KPIL"
+    "I" => "NSE:MSUMI"
+    "J" => "NSE:POONAWALLA"
+    "K" => "NSE:SCHNEIDER"
+    "L" => "NSE:TATAMOTORS"
+    "M" => "NSE:VOLTAS"
+    "indices" => "NSE:CNXMETAL"
+    => "NSE:BEL"
+
+sym10 = switch batch
+    "A" => "NSE:BHARTIARTL"
+    "B" => "NSE:ABBOTINDIA"
+    "C" => "NSE:BAJAJHLDNG"
+    "D" => "NSE:CENTRALBK"
+    "E" => "NSE:EPL"
+    "F" => "NSE:GRINDWELL"
+    "G" => "NSE:INDHOTEL"
+    "H" => "NSE:KALYANKJIL"
+    "I" => "NSE:MOTILALOFS"
+    "J" => "NSE:PFC"
+    "K" => "NSE:SHREECEM"
+    "L" => "NSE:TATAPOWER"
+    "M" => "NSE:WELCORP"
+    "indices" => "NSE:CNXPHARMA"
+    => "NSE:BHARTIARTL"
+
+sym11 = switch batch
+    "A" => "NSE:BPCL"
+    "B" => "NSE:ACE"
+    "C" => "NSE:BALAMINES"
+    "D" => "NSE:CDSL"
+    "E" => "NSE:EASEMYTRIP"
+    "F" => "NSE:GAEL"
+    "G" => "NSE:IOC"
+    "H" => "NSE:KANSAINER"
+    "I" => "NSE:MPHASIS"
+    "J" => "NSE:PRAJIND"
+    "K" => "NSE:RENUKA"
+    "L" => "NSE:TATASTEEL"
+    "M" => "NSE:WELSPUNLIV"
+    "indices" => "NSE:NIFTYPVTBANK"
+    => "NSE:BPCL"
+
+sym12 = switch batch
+    "A" => "NSE:BRITANNIA"
+    "B" => "NSE:ADANIENSOL"
+    "C" => "NSE:BALKRISIND"
+    "D" => "NSE:CENTURYPLY"
+    "E" => "NSE:ELECON"
+    "F" => "NSE:FLUOROCHEM"
+    "G" => "NSE:IOB"
+    "H" => "NSE:KARURVYSYA"
+    "I" => "NSE:MCX"
+    "J" => "NSE:PRESTIGE"
+    "K" => "NSE:SHRIRAMFIN"
+    "L" => "NSE:TATATECH"
+    "M" => "NSE:WESTLIFE"
+    "indices" => "NSE:CNXPSUBANK"
+    => "NSE:BRITANNIA"
+
+sym13 = switch batch
+    "A" => "NSE:CIPLA"
+    "B" => "NSE:ADANIGREEN"
+    "C" => "NSE:BALRAMCHIN"
+    "D" => "NSE:ABREL"
+    "E" => "NSE:ELGIEQUIP"
+    "F" => "NSE:GUJGASLTD"
+    "G" => "NSE:IRCTC"
+    "H" => "NSE:KAYNES"
+    "I" => "NSE:MUTHOOTFIN"
+    "J" => "NSE:PRINCEPIPE"
+    "K" => "NSE:SHYAMMETL"
+    "L" => "NSE:TTML"
+    "M" => "NSE:WHIRLPOOL"
+    "indices" => "NSE:CNXREALTY"
+    => "NSE:CIPLA"
+
+sym14 = switch batch
+    "A" => "NSE:COALINDIA"
+    "B" => "NSE:ADANIPOWER"
+    "C" => "NSE:BANDHANBNK"
+    "D" => "NSE:CERA"
+    "E" => "NSE:EMAMILTD"
+    "F" => "NSE:GMDCLTD"
+    "G" => "NSE:IRFC"
+    "H" => "NSE:KEC"
+    "I" => "NSE:NATCOPHARM"
+    "J" => "NSE:PRSMJOHNSN"
+    "K" => "NSE:SIEMENS"
+    "L" => "NSE:TECHM"
+    "M" => "NSE:WIPRO"
+    "indices" => "NSE:NIFTY_CONSR_DURBL"
+    => "NSE:COALINDIA"
+
+sym15 = switch batch
+    "A" => "NSE:DRREDDY"
+    "B" => "NSE:ATGL"
+    "C" => "NSE:BANKBARODA"
+    "D" => "NSE:CHALET"
+    "E" => "NSE:ENDURANCE"
+    "F" => "NSE:GNFC"
+    "G" => "NSE:INDIGOPNTS"
+    "H" => "NSE:KFINTECH"
+    "I" => "NSE:NBCC"
+    "J" => "NSE:PGHH"
+    "K" => "NSE:SIGNATURE"
+    "L" => "NSE:TEJASNET"
+    "M" => "NSE:YESBANK"
+    "indices" => "NSE:NIFTY_OIL_AND_GAS"
+    => "NSE:DRREDDY"
+
+sym16 = switch batch
+    "A" => "NSE:EICHERMOT"
+    "B" => "NSE:AWL"
+    "C" => "NSE:BANKINDIA"
+    "D" => "NSE:CHAMBLFERT"
+    "E" => "NSE:ENGINERSIN"
+    "F" => "NSE:GPPL"
+    "G" => "NSE:IGL"
+    "H" => "NSE:KIMS"
+    "I" => "NSE:NCC"
+    "J" => "NSE:PNB"
+    "K" => "NSE:SOBHA"
+    "L" => "NSE:NIACL"
+    "M" => "NSE:ZFCVINDIA"
+    "indices" => "NSE:CNXENERGY"
+    => "NSE:EICHERMOT"
+
+sym17 = switch batch
+    "A" => "NSE:ETERNAL"
+    "B" => "NSE:ABCAPITAL"
+    "C" => "NSE:MAHABANK"
+    "D" => "NSE:CHEMPLASTS"
+    "E" => "NSE:EQUITASBNK"
+    "F" => "NSE:GSFC"
+    "G" => "NSE:INDUSTOWER"
+    "H" => "NSE:LTF"
+    "I" => "NSE:NHPC"
+    "J" => "NSE:QUESS"
+    "K" => "NSE:SOLARINDS"
+    "L" => "NSE:RAMCOCEM"
+    "M" => "NSE:ZEEL"
+    "indices" => "NSE:CNXSERVICE"
+    => "NSE:ETERNAL"
+
+sym18 = switch batch
+    "A" => "NSE:GRASIM"
+    "B" => "NSE:ABFRL"
+    "C" => "NSE:BATAINDIA"
+    "D" => "NSE:CHENNPETRO"
+    "E" => "NSE:ERIS"
+    "F" => "NSE:GSPL"
+    "G" => "NSE:NAUKRI"
+    "H" => "NSE:LTTS"
+    "I" => "NSE:NLCINDIA"
+    "J" => "NSE:RRKABEL"
+    "K" => "NSE:SONACOMS"
+    "L" => "NSE:THERMAX"
+    "M" => "NSE:ZENSARTECH"
+    "indices" => "NSE:CNXCONSUMPTION"
+    => "NSE:GRASIM"
+
+sym19 = switch batch
+    "A" => "NSE:HCLTECH"
+    "B" => "NSE:AEGISLOG"
+    "C" => "NSE:BAYERCROP"
+    "D" => "NSE:CHOLAHLDNG"
+    "E" => "NSE:ESCORTS"
+    "F" => "NSE:HEG"
+    "G" => "NSE:INOXWIND"
+    "H" => "NSE:LICHSGFIN"
+    "I" => "NSE:NMDC"
+    "J" => "NSE:RBLBANK"
+    "K" => "NSE:SONATSOFTW"
+    "L" => "NSE:TIMKEN"
+    "M" => "NSE:ZYDUSLIFE"
+    "indices" => "NSE:CNXCOMMODITIES"
+    => "NSE:HCLTECH"
+
+sym20 = switch batch
+    "A" => "NSE:HDFCBANK"
+    "B" => "NSE:AETHER"
+    "C" => "NSE:BERGEPAINT"
+    "D" => "NSE:CHOLAFIN"
+    "E" => "NSE:EXIDEIND"
+    "F" => "NSE:HBLENGINE"
+    "G" => "NSE:INTELLECT"
+    "H" => "NSE:LTIM"
+    "I" => "NSE:NSLNISP"
+    "J" => "NSE:RECLTD"
+    "K" => "NSE:STARHEALTH"
+    "L" => "NSE:TITAGARH"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXMNC"
+    => "NSE:HDFCBANK"
+
+sym21 = switch batch
+    "A" => "NSE:HDFCLIFE"
+    "B" => "NSE:AFFLE"
+    "C" => "NSE:BDL"
+    "D" => "NSE:CUB"
+    "E" => "NSE:FDC"
+    "F" => "NSE:HDFCAMC"
+    "G" => "NSE:INDIGO"
+    "H" => "NSE:LATENTVIEW"
+    "I" => "NSE:NH"
+    "J" => "NSE:RHIM"
+    "K" => "NSE:SBIN"
+    "L" => "NSE:TITAN"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXINFRA"
+    => "NSE:HDFCLIFE"
+
+sym22 = switch batch
+    "A" => "NSE:HEROMOTOCO"
+    "B" => "NSE:AJANTPHARM"
+    "C" => "NSE:BHARATFORG"
+    "D" => "NSE:CLEAN"
+    "E" => "NSE:NYKAA"
+    "F" => "NSE:HFCL"
+    "G" => "NSE:IPCALAB"
+    "H" => "NSE:LAURUSLABS"
+    "I" => "NSE:NATIONALUM"
+    "J" => "NSE:RITES"
+    "K" => "NSE:SAIL"
+    "L" => "NSE:TORNTPHARM"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNX100"
+    => "NSE:HEROMOTOCO"
+
+sym23 = switch batch
+    "A" => "NSE:HINDALCO"
+    "B" => "NSE:APLLTD"
+    "C" => "NSE:BHEL"
+    "D" => "NSE:COCHINSHIP"
+    "E" => "NSE:FEDERALBNK"
+    "F" => "NSE:HAPPSTMNDS"
+    "G" => "NSE:JBCHEPHARM"
+    "H" => "NSE:LXCHEM"
+    "I" => "NSE:NAVINFLUOR"
+    "J" => "NSE:RADICO"
+    "K" => "NSE:SWSOLAR"
+    "L" => "NSE:TORNTPOWER"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNX200"
+    => "NSE:HINDALCO"
+
+sym24 = switch batch
+    "A" => "NSE:HINDUNILVR"
+    "B" => "NSE:ALKEM"
+    "C" => "NSE:BIKAJI"
+    "D" => "NSE:COFORGE"
+    "E" => "NSE:FACT"
+    "F" => "NSE:HAPPYFORGE"
+    "G" => "NSE:JKCEMENT"
+    "H" => "NSE:LEMONTREE"
+    "I" => "NSE:NETWORK18"
+    "J" => "NSE:RVNL"
+    "K" => "NSE:STLTECH"
+    "L" => "NSE:TRENT"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXMIDCAP"
+    => "NSE:HINDUNILVR"
+
+sym25 = switch batch
+    "A" => "NSE:ICICIBANK"
+    "B" => "NSE:ALKYLAMINE"
+    "C" => "NSE:BIOCON"
+    "D" => "NSE:COLPAL"
+    "E" => "NSE:FINEORG"
+    "F" => "NSE:HAVELLS"
+    "G" => "NSE:JBMA"
+    "H" => "NSE:LINDEINDIA"
+    "I" => "NSE:NAM_INDIA"
+    "J" => "NSE:RAILTEL"
+    "K" => "NSE:SUMICHEM"
+    "L" => "NSE:TRIDENT"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXSMALLCAP"
+    => "NSE:ICICIBANK"
+
+sym26 = switch batch
+    "A" => "NSE:INDUSINDBK"
+    "B" => "NSE:ALLCARGO"
+    "C" => "NSE:BIRLACORPN"
+    "D" => "NSE:CAMS"
+    "E" => "NSE:FINCABLES"
+    "F" => "NSE:HSCL"
+    "G" => "NSE:JKLAKSHMI"
+    "H" => "NSE:LLOYDSME"
+    "I" => "NSE:NUVAMA"
+    "J" => "NSE:RAINBOW"
+    "K" => "NSE:SPARC"
+    "L" => "NSE:TRIVENI"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:INDUSINDBK"
+
+sym27 = switch batch
+    "A" => "NSE:INFY"
+    "B" => "NSE:ALOKINDS"
+    "C" => "NSE:BSOFT"
+    "D" => "NSE:CONCORDBIO"
+    "E" => "NSE:FINPIPE"
+    "F" => "NSE:HAL"
+    "G" => "NSE:JKPAPER"
+    "H" => "NSE:LUPIN"
+    "I" => "NSE:NUVOCO"
+    "J" => "NSE:RAJESHEXPO"
+    "K" => "NSE:SUNPHARMA"
+    "L" => "NSE:TRITURBINE"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:INFY"
+
+sym28 = switch batch
+    "A" => "NSE:ITC"
+    "B" => "NSE:ARE&M"
+    "C" => "NSE:BLUEDART"
+    "D" => "NSE:CONCOR"
+    "E" => "NSE:FSL"
+    "F" => "NSE:HINDCOPPER"
+    "G" => "NSE:JMFINANCIL"
+    "H" => "NSE:MMTC"
+    "I" => "NSE:OBEROIRLTY"
+    "J" => "NSE:RKFORGE"
+    "K" => "NSE:SUNTV"
+    "L" => "NSE:TIINDIA"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:ITC"
+
+sym29 = switch batch
+    "A" => "NSE:JIOFIN"
+    "B" => "NSE:AMBER"
+    "C" => "NSE:BLUESTARCO"
+    "D" => "NSE:COROMANDEL"
+    "E" => "NSE:FIVESTAR"
+    "F" => "NSE:HINDPETRO"
+    "G" => "NSE:JSWENERGY"
+    "H" => "NSE:MRF"
+    "I" => "NSE:OIL"
+    "J" => "NSE:RCF"
+    "K" => "NSE:SUNDARMFIN"
+    "L" => "NSE:UCOBANK"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:JIOFIN"
+
+sym30 = switch batch
+    "A" => "NSE:JSWSTEEL"
+    "B" => "NSE:AMBUJACEM"
+    "C" => "NSE:BBTC"
+    "D" => "NSE:CRAFTSMAN"
+    "E" => "NSE:FORTIS"
+    "F" => "NSE:HINDZINC"
+    "G" => "NSE:JSWINFRA"
+    "H" => "NSE:MTARTECH"
+    "I" => "NSE:OLECTRA"
+    "J" => "NSE:RATNAMANI"
+    "K" => "NSE:SUNDRMFAST"
+    "L" => "NSE:UNOMINDA"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:JSWSTEEL"
+
+sym31 = switch batch
+    "A" => "NSE:KOTAKBANK"
+    "B" => "NSE:ANANDRATHI"
+    "C" => "NSE:BORORENEW"
+    "D" => "NSE:CREDITACC"
+    "E" => "NSE:GAIL"
+    "F" => "NSE:POWERINDIA"
+    "G" => "NSE:JAIBALAJI"
+    "H" => "NSE:LODHA"
+    "I" => "NSE:PAYTM"
+    "J" => "NSE:RTNINDIA"
+    "K" => "NSE:SUNTECK"
+    "L" => "NSE:UPL"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:KOTAKBANK"
+
+sym32 = switch batch
+    "A" => "NSE:LT"
+    "B" => "NSE:ANGELONE"
+    "C" => "NSE:BOSCHLTD"
+    "D" => "NSE:CROMPTON"
+    "E" => "NSE:GMMPFAUDLR"
+    "F" => "NSE:HOMEFIRST"
+    "G" => "NSE:J&KBANK"
+    "H" => "NSE:MGL"
+    "I" => "NSE:OFSS"
+    "J" => "NSE:RAYMOND"
+    "K" => "NSE:SUPREMEIND"
+    "L" => "NSE:UTIAMC"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:LT"
+
+sym33 = switch batch
+    "A" => "NSE:LICI"
+    "B" => "NSE:ANURAS"
+    "C" => "NSE:BRIGADE"
+    "D" => "NSE:CUMMINSIND"
+    "E" => "NSE:GMRAIRPORT"
+    "F" => "NSE:HONASA"
+    "G" => "NSE:JINDALSAW"
+    "H" => "NSE:MAHSEAMLES"
+    "I" => "NSE:POLICYBZR"
+    "J" => "NSE:REDINGTON"
+    "K" => "NSE:COHANCE"
+    "L" => "NSE:UJJIVANSFB"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:LICI"
+
+sym34 = switch batch
+    "A" => "NSE:M&M"
+    "B" => "NSE:APARINDS"
+    "C" => "NSE:MAPMYINDIA"
+    "D" => "NSE:CYIENT"
+    "E" => "NSE:GRSE"
+    "F" => "NSE:HONAUT"
+    "G" => "NSE:JSL"
+    "H" => "NSE:M&MFIN"
+    "I" => "NSE:PCBL"
+    "J" => "NSE:RBA"
+    "K" => "NSE:SUZLON"
+    "L" => "NSE:ULTRACEMCO"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:M&M"
+
+sym35 = switch batch
+    "A" => "NSE:MARUTI"
+    "B" => "NSE:APOLLOTYRE"
+    "C" => "NSE:CCL"
+    "D" => "NSE:DCMSHRIRAM"
+    "E" => "NSE:GICRE"
+    "F" => "NSE:HUDCO"
+    "G" => "NSE:JINDALSTEL"
+    "H" => "NSE:MHRIL"
+    "I" => "NSE:PIIND"
+    "J" => "NSE:ROUTE"
+    "K" => "NSE:SWANENERGY"
+    "L" => "NSE:UNIONBANK"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:MARUTI"
+
+sym36 = switch batch
+    "A" => "NSE:NESTLEIND"
+    "B" => "NSE:APTUS"
+    "C" => "NSE:CESC"
+    "D" => "NSE:DLF"
+    "E" => "NSE:GILLETTE"
+    "F" => "NSE:ICICIGI"
+    "G" => "NSE:JUBLFOOD"
+    "H" => "NSE:MAHLIFE"
+    "I" => "NSE:PNBHOUSING"
+    "J" => "NSE:SBFC"
+    "K" => "NSE:SYNGENE"
+    "L" => "NSE:UBL"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:NESTLEIND"
+
+sym37 = switch batch
+    "A" => "NSE:NTPC"
+    "B" => "NSE:ACI"
+    "C" => "NSE:CGPOWER"
+    "D" => "NSE:DOMS"
+    "E" => "NSE:GLAND"
+    "F" => "NSE:ICICIPRULI"
+    "G" => "NSE:JUBLINGREA"
+    "H" => "NSE:MANAPPURAM"
+    "I" => "NSE:PNCINFRA"
+    "J" => "NSE:SBICARD"
+    "K" => "NSE:SYRMA"
+    "L" => "NSE:UNITDSPR"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:NTPC"
+
+sym38 = switch batch
+    "A" => "NSE:ONGC"
+    "B" => "NSE:ASAHIINDIA"
+    "C" => "NSE:CIEINDIA"
+    "D" => "NSE:DABUR"
+    "E" => "NSE:GLAXO"
+    "F" => "NSE:IDBI"
+    "G" => "NSE:JUBLPHARMA"
+    "H" => "NSE:MRPL"
+    "I" => "NSE:PVRINOX"
+    "J" => "NSE:SBILIFE"
+    "K" => "NSE:TBOTEK"
+    "L" => "NSE:USHAMART"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:ONGC"
+
+sym39 = switch batch
+    "A" => "NSE:POWERGRID"
+    "B" => "NSE:ASHOKLEY"
+    "C" => "NSE:CRISIL"
+    "D" => "NSE:DALBHARAT"
+    "E" => "NSE:ALIVUS"
+    "F" => "NSE:IDFCFIRSTB"
+    "G" => "NSE:JWL"
+    "H" => "NSE:MANKIND"
+    "I" => "NSE:PAGEIND"
+    "J" => "NSE:SJVN"
+    "K" => "NSE:TVSMOTOR"
+    "L" => "NSE:VGUARD"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:POWERGRID"
+
+sym40 = switch batch
+    "A" => "NSE:RELIANCE"
+    "B" => "NSE:ASTERDM"
+    "C" => "NSE:CSBBANK"
+    "D" => "NSE:DATAPATTNS"
+    "E" => "NSE:GLENMARK"
+    "F" => "NSE:IDFCFIRSTB"
+    "G" => "NSE:JUSTDIAL"
+    "H" => "NSE:MARICO"
+    "I" => "NSE:PATANJALI"
+    "J" => "NSE:SKFINDIA"
+    "K" => "NSE:TVSSCS"
+    "L" => "NSE:VIPIND"
+    "M" => "NSE:ECLERX"
+    "indices" => "NSE:CNXDIVIDOPPT"
+    => "NSE:RELIANCE"
+
+// =============================================================================
+// --- Session-aligned 75-min boundary helper ---
+f_is75mBoundary() =>
+    var int _dayStart75   = na
+    var int _prevBucket75 = -1
+    if session.isfirstbar
+        _dayStart75   := time
+        _prevBucket75 := -1
+    _mins = na(_dayStart75) ? 0 : int((time - _dayStart75) / 60000)
+    _bkt  = _mins / 75
+    _isBnd = session.isfirstbar or _bkt > _prevBucket75
+    _prevBucket75 := _bkt
+    _isBnd
+
+// ZONE DETECTION FUNCTION  (mirrors zones.pine logic exactly)
+// Runs inside request.security() context for each stock.
+// Returns: [demDistPct, demProx, demDist, demScore,
+//           supDistPct, supProx, supDist, supScore, trendDir]
+//
+// Includes: standard zones, small-body override, zero-base (engulfing)
+//           zones, confirmation-candle zones, gap strength scoring.
+// Marking: Body to Wick (IDEAL default). Freshness tracked live (0=fresh, 1=tested once).
+// -999 = no zone found.  trendDir: 1=Up, -1=Down, 0=Side (50 SMA slope).
+// =============================================================================
+f_scanZones() =>
+    // --- Trend via 50 SMA clock method ---
+    sma50v   = ta.sma(close, 50)
+    slopeVal = close > 0 ? (sma50v - sma50v[7]) / 7.0 / close * 100.0 : 0.0
+    trendDir = slopeVal > 0.05 ? 1 : slopeVal < -0.05 ? -1 : 0
+    bool _m75bnd     = f_is75mBoundary()
+
+    // --- HTF trend: weekly closes on daily chart, monthly closes on weekly chart ---
+    var float[] htfCloses = array.new<float>()
+    bool htfChange = timeframe.period == "5" ? timeframe.change("15") : timeframe.period == "15" ? _m75bnd : (timeframe.isintraday and timeframe.change("D")) or (timeframe.isdaily and timeframe.change("W")) or (timeframe.isweekly and timeframe.change("M")) or (timeframe.ismonthly and timeframe.change("3M"))
+    if htfChange and not na(close[1])
+        array.unshift(htfCloses, close[1])
+        if array.size(htfCloses) > 57
+            array.pop(htfCloses)
+    float htfTrendDir = 0.0
+    if array.size(htfCloses) >= 57
+        float s1 = 0.0
+        float s2 = 0.0
+        for i = 0 to 49
+            s1 += array.get(htfCloses, i)
+            s2 += array.get(htfCloses, i + 7)
+        htfSma   = s1 / 50.0
+        htfSma7  = s2 / 50.0
+        htfSlope = close > 0 ? (htfSma - htfSma7) / 7.0 / close * 100.0 : 0.0
+        htfTrendDir := htfSlope > 0.05 ? 1.0 : htfSlope < -0.05 ? -1.0 : 0.0
+
+    // --- HTF zone detection: weekly OHLC on intraday, monthly OHLC on daily ---
+    // Tests and invalidation are checked at HTF bar close only (not per intraday bar).
+    bool htfZoneChange = timeframe.period == "5" ? _m75bnd : timeframe.period == "15" ? timeframe.change("D") : (timeframe.isintraday and timeframe.change("W")) or (timeframe.isdaily and timeframe.change("M")) or (timeframe.isweekly and timeframe.change("3M")) or (timeframe.ismonthly and timeframe.change("6M"))
+    var float htfRunO = na
+    var float htfRunH = na
+    var float htfRunL = na
+    var float[] hzO   = array.new<float>()
+    var float[] hzH   = array.new<float>()
+    var float[] hzL   = array.new<float>()
+    var float[] hzC   = array.new<float>()
+
+    var float htfDP     = na
+    var float htfDD     = na
+    var float htfDBS    = 0.0
+    var int   htfDTc    = 0
+    var bool  htfDWasIn = false
+    var float htfSP     = na
+    var float htfSD     = na
+    var float htfSBS    = 0.0
+    var int   htfSTc    = 0
+    var bool  htfSWasIn = false
+
+    if htfZoneChange and not na(htfRunO)
+        // 1. Test / invalidate with the COMPLETED HTF bar (htfRunH/L before reset)
+        if not na(htfDP)
+            if htfRunL < htfDD
+                htfDP := na
+                htfDD := na
+            else
+                htfDIn = htfRunL <= htfDP
+                if htfDIn and not htfDWasIn
+                    htfDTc    += 1
+                    htfDWasIn := true
+                else if not htfDIn and htfDWasIn
+                    htfDWasIn := false
+        if not na(htfSP)
+            if htfRunH > htfSD
+                htfSP := na
+                htfSD := na
+            else
+                htfSIn = htfRunH >= htfSP
+                if htfSIn and not htfSWasIn
+                    htfSTc    += 1
+                    htfSWasIn := true
+                else if not htfSIn and htfSWasIn
+                    htfSWasIn := false
+
+        // 2. Store completed HTF bar OHLC
+        array.unshift(hzO, htfRunO)
+        array.unshift(hzH, htfRunH)
+        array.unshift(hzL, htfRunL)
+        array.unshift(hzC, close[1])
+        if array.size(hzO) > 60
+            array.pop(hzO)
+            array.pop(hzH)
+            array.pop(hzL)
+            array.pop(hzC)
+
+        // 3. Reset accumulators for new HTF period
+        htfRunO := open
+        htfRunH := high
+        htfRunL := low
+
+        // 4. Detect new HTF zones — scan all stored bars as legout candidates
+        int hzSize = array.size(hzO)
+        if hzSize >= 3
+            for hLegoutIdx = 0 to hzSize - 3
+                hLo    = array.get(hzO, hLegoutIdx)
+                hLh    = array.get(hzH, hLegoutIdx)
+                hLl    = array.get(hzL, hLegoutIdx)
+                hLc    = array.get(hzC, hLegoutIdx)
+                hLbody = math.abs(hLc - hLo)
+                hLrng  = hLh - hLl
+                hLbPct = hLrng > 0 ? hLbody / hLrng : 0.0
+                hLgrn  = hLc > hLo
+                hLred  = hLc < hLo
+                if hLbody > 0 and (hLgrn or hLred) and hLbPct >= excitePct
+                    int   hBCnt = 0
+                    int   hii   = hLegoutIdx + 1
+                    float hBHB  = na
+                    float hBLB  = na
+                    float hBHW  = na
+                    float hBLW  = na
+                    bool  hGo   = true
+                    while hGo and hBCnt < 3 and hii < hzSize - 1
+                        ho_i = array.get(hzO, hii)
+                        hh_i = array.get(hzH, hii)
+                        hl_i = array.get(hzL, hii)
+                        hc_i = array.get(hzC, hii)
+                        hb_i = math.abs(hc_i - ho_i)
+                        hr_i = hh_i - hl_i
+                        hp_i = hr_i > 0 ? hb_i / hr_i : 0.0
+                        if hp_i < basePct
+                            hBHB := na(hBHB) ? math.max(ho_i,hc_i) : math.max(hBHB, math.max(ho_i,hc_i))
+                            hBLB := na(hBLB) ? math.min(ho_i,hc_i) : math.min(hBLB, math.min(ho_i,hc_i))
+                            hBHW := na(hBHW) ? hh_i : math.max(hBHW, hh_i)
+                            hBLW := na(hBLW) ? hl_i : math.min(hBLW, hl_i)
+                            hBCnt += 1
+                            hii   += 1
+                        else
+                            hGo := false
+                    if hBCnt >= 1 and hBCnt <= 3 and hii < hzSize
+                        hLego = array.get(hzO, hii)
+                        hLegh = array.get(hzH, hii)
+                        hLegl = array.get(hzL, hii)
+                        hLegc = array.get(hzC, hii)
+                        hLegb = math.abs(hLegc - hLego)
+                        hLegr = hLegh - hLegl
+                        hLegp = hLegr > 0 ? hLegb / hLegr : 0.0
+                        hIsRev = (hLgrn and hLegc < hLego) or (hLred and hLegc > hLego)
+                        hRatOk = hIsRev ? hLbody >= legoutMinRatio * hLegb : true
+                        if hLegb > 0 and hLegp >= excitePct and hRatOk
+                            hTSc = 2.0
+                            if hLgrn and hLc > hBHB
+                                hStr  = hLo > hBHB ? 2.0 : 1.0
+                                newDP = hBHB
+                                newDD = hLegc < hLego ? math.min(hBLW, math.min(hLegl, hLl)) : math.min(hBLW, hLl)
+                                // Walk subsequent (more-recent) bars: check for breach + count tests
+                                bool hDemValid = true
+                                int  hDemTc    = 0
+                                bool hDemWasIn = false
+                                if hLegoutIdx > 0
+                                    for hChk = hLegoutIdx - 1 to 0
+                                        chkL = array.get(hzL, hChk)
+                                        if chkL < newDD
+                                            hDemValid := false
+                                            break
+                                        if chkL <= newDP and not hDemWasIn
+                                            hDemTc    += 1
+                                            hDemWasIn := true
+                                        else if chkL > newDP
+                                            hDemWasIn := false
+                                if hDemValid and hDemTc <= maxHtfZoneTests and (na(htfDP) or newDP > htfDP)
+                                    htfDP     := newDP
+                                    htfDD     := newDD
+                                    htfDBS    := hStr + hTSc
+                                    htfDTc    := hDemTc
+                                    htfDWasIn := hDemWasIn
+                            else if hLred and hLc < hBLB
+                                hStr  = hLo < hBLB ? 2.0 : 1.0
+                                newSP = hBLB
+                                newSD = hLegc > hLego ? math.max(hBHW, math.max(hLegh, hLh)) : math.max(hBHW, hLh)
+                                // Walk subsequent (more-recent) bars: check for breach + count tests
+                                bool hSupValid = true
+                                int  hSupTc    = 0
+                                bool hSupWasIn = false
+                                if hLegoutIdx > 0
+                                    for hChk = hLegoutIdx - 1 to 0
+                                        chkH = array.get(hzH, hChk)
+                                        if chkH > newSD
+                                            hSupValid := false
+                                            break
+                                        if chkH >= newSP and not hSupWasIn
+                                            hSupTc    += 1
+                                            hSupWasIn := true
+                                        else if chkH < newSP
+                                            hSupWasIn := false
+                                if hSupValid and hSupTc <= maxHtfZoneTests and (na(htfSP) or newSP < htfSP)
+                                    htfSP     := newSP
+                                    htfSD     := newSD
+                                    htfSBS    := hStr + hTSc
+                                    htfSTc    := hSupTc
+                                    htfSWasIn := hSupWasIn
+
+                    // ── HTF zero-base path (engulfing spike, no base candles) ──
+                    else if allowZeroBase and hBCnt == 0 and hii < hzSize
+                        hzLego = array.get(hzO, hii)
+                        hzLegh = array.get(hzH, hii)
+                        hzLegl = array.get(hzL, hii)
+                        hzLegc = array.get(hzC, hii)
+                        hzLegb = math.abs(hzLegc - hzLego)
+                        hzLegr = hzLegh - hzLegl
+                        hzLegp = hzLegr > 0 ? hzLegb / hzLegr : 0.0
+
+                        hzbDem = hzLegc < hzLego and hLgrn
+                        hzbSup = hzLegc > hzLego and hLred
+
+                        if (hzbDem or hzbSup) and hzLegp >= excitePct and hzLegb > 0 and hLbody >= legoutMinRatio * hzLegb
+                            if hzbDem
+                                hzbLeginBdyHigh = math.max(hzLego, hzLegc)
+                                newDP           = math.max(math.min(hzLego, hzLegc), hLo)
+                                newDD           = math.min(hzLegl, hLl)
+                                hzbDemZV = hLc > hzbLeginBdyHigh
+                                if hzbDemZV
+                                    bool hDemValid = true
+                                    int  hDemTc    = 0
+                                    bool hDemWasIn = false
+                                    if hLegoutIdx > 0
+                                        for hChk = hLegoutIdx - 1 to 0
+                                            chkL = array.get(hzL, hChk)
+                                            if chkL < newDD
+                                                hDemValid := false
+                                                break
+                                            if chkL <= newDP and not hDemWasIn
+                                                hDemTc    += 1
+                                                hDemWasIn := true
+                                            else if chkL > newDP
+                                                hDemWasIn := false
+                                    hzbDSc = hLo > hzbLeginBdyHigh ? 2.0 : 1.0
+                                    if hDemValid and hDemTc <= maxHtfZoneTests and (na(htfDP) or newDP > htfDP)
+                                        htfDP     := newDP
+                                        htfDD     := newDD
+                                        htfDBS    := hzbDSc + 2.0
+                                        htfDTc    := hDemTc
+                                        htfDWasIn := hDemWasIn
+                            else if hzbSup
+                                hzbLeginBdyLow = math.min(hzLego, hzLegc)
+                                newSP          = math.min(math.max(hzLego, hzLegc), hLo)
+                                newSD          = math.max(hzLegh, hLh)
+                                hzbSupZV = hLc < hzbLeginBdyLow
+                                if hzbSupZV
+                                    bool hSupValid = true
+                                    int  hSupTc    = 0
+                                    bool hSupWasIn = false
+                                    if hLegoutIdx > 0
+                                        for hChk = hLegoutIdx - 1 to 0
+                                            chkH = array.get(hzH, hChk)
+                                            if chkH > newSD
+                                                hSupValid := false
+                                                break
+                                            if chkH >= newSP and not hSupWasIn
+                                                hSupTc    += 1
+                                                hSupWasIn := true
+                                            else if chkH < newSP
+                                                hSupWasIn := false
+                                    hzbSSc = hLo < hzbLeginBdyLow ? 2.0 : 1.0
+                                    if hSupValid and hSupTc <= maxHtfZoneTests and (na(htfSP) or newSP < htfSP)
+                                        htfSP     := newSP
+                                        htfSD     := newSD
+                                        htfSBS    := hzbSSc + 2.0
+                                        htfSTc    := hSupTc
+                                        htfSWasIn := hSupWasIn
+
+    else if not na(htfRunO)
+        htfRunH := math.max(htfRunH, high)
+        htfRunL := math.min(htfRunL, low)
+    else
+        htfRunO := open
+        htfRunH := high
+        htfRunL := low
+
+    // % distance using zone-range as 100%: demPct + supPct = 100 when both exist
+    float htfDemDistPct = -999.0
+    float htfDemScoreV  = 0.0
+    float htfSupDistPct = -999.0
+    float htfSupScoreV  = 0.0
+    bool htfDemOk     = not na(htfDP) and htfDTc <= maxHtfZoneTests and close > htfDP
+    bool htfSupOk     = not na(htfSP) and htfSTc <= maxHtfZoneTests and close < htfSP
+    bool htfDemInside = not na(htfDP) and not na(htfDD) and htfDTc <= maxHtfZoneTests and close <= htfDP and close >= htfDD
+    bool htfSupInside = not na(htfSP) and not na(htfSD) and htfSTc <= maxHtfZoneTests and close >= htfSP and close <= htfSD
+    if htfDemOk and htfSupOk
+        zoneRange = htfSP - htfDP
+        if zoneRange > 0
+            htfDemDistPct := (close - htfDP) / zoneRange * 100.0
+            htfSupDistPct := (htfSP - close) / zoneRange * 100.0
+        htfDFSc = htfDTc == 0 ? 3.0 : htfDTc == 1 ? 1.5 : 0.0
+        htfSFSc = htfSTc == 0 ? 3.0 : htfSTc == 1 ? 1.5 : 0.0
+        htfDemScoreV := htfDFSc + htfDBS
+        htfSupScoreV := htfSFSc + htfSBS
+    else if htfDemOk
+        htfDFSc = htfDTc == 0 ? 3.0 : htfDTc == 1 ? 1.5 : 0.0
+        htfDemDistPct := (close - htfDP) / close * 100.0
+        htfDemScoreV  := htfDFSc + htfDBS
+    else if htfSupOk
+        htfSFSc = htfSTc == 0 ? 3.0 : htfSTc == 1 ? 1.5 : 0.0
+        htfSupDistPct := (htfSP - close) / close * 100.0
+        htfSupScoreV  := htfSFSc + htfSBS
+    // -1.0 sentinel: price is currently inside this HTF zone
+    if htfDemInside
+        htfDemDistPct := -1.0
+        htfDemScoreV  := (htfDTc == 0 ? 3.0 : htfDTc == 1 ? 1.5 : 0.0) + htfDBS
+    if htfSupInside
+        htfSupDistPct := -1.0
+        htfSupScoreV  := (htfSTc == 0 ? 3.0 : htfSTc == 1 ? 1.5 : 0.0) + htfSBS
+
+
+    float bestDP = na
+    float bestDD = na
+    float bestSP = na
+    float bestSD = na
+    float bestDS = 0.0
+    float bestSS = 0.0
+
+    for startBar = 1 to lookbackBars
+        lOut_o    = open[startBar]
+        lOut_h    = high[startBar]
+        lOut_l    = low[startBar]
+        lOut_c    = close[startBar]
+        lOut_body = math.abs(lOut_c - lOut_o)
+        lOut_rng  = lOut_h - lOut_l
+        lOut_bPct = lOut_rng > 0 ? lOut_body / lOut_rng : 0.0
+        lOut_grn  = lOut_c > lOut_o
+        lOut_red  = lOut_c < lOut_o
+        // Post-legout candle (bar immediately after legout) for 2-exciting check
+        nxt_body  = math.abs(close[startBar - 1] - open[startBar - 1])
+        nxt_rng   = high[startBar - 1] - low[startBar - 1]
+        nxt_bPct  = nxt_rng > 0 ? nxt_body / nxt_rng : 0.0
+
+        if lOut_bPct >= excitePct and lOut_body > 0 and (lOut_grn or lOut_red)
+            baseCnt = 0
+            ii      = startBar + 1
+            float bHB = na
+            float bLB = na
+            float bHW = na
+            float bLW = na
+            bool  going = true
+
+            while going and baseCnt < maxBase and ii <= startBar + maxBase + 1
+                c_o    = open[ii]
+                c_h    = high[ii]
+                c_l    = low[ii]
+                c_c    = close[ii]
+                c_body = math.abs(c_c - c_o)
+                c_rng  = c_h - c_l
+                c_bPct = c_rng > 0 ? c_body / c_rng : 0.0
+
+                // Standard base check + small-body override (mirrors zones.pine)
+                qualStd = c_bPct < basePct
+                qualOvr = false
+                if not qualStd and allowSmallBodyOverride
+                    candLeginBody = math.abs(close[ii + 1] - open[ii + 1])
+                    if candLeginBody > 0 and lOut_body > 0
+                        if c_body < smallBodyVsLegout * lOut_body and c_body < smallBodyVsLegin * candLeginBody
+                            qualOvr := true
+
+                if qualStd or qualOvr
+                    bH   = math.max(c_o, c_c)
+                    bL   = math.min(c_o, c_c)
+                    bHB := na(bHB) ? bH : math.max(bHB, bH)
+                    bLB := na(bLB) ? bL : math.min(bLB, bL)
+                    bHW := na(bHW) ? c_h : math.max(bHW, c_h)
+                    bLW := na(bLW) ? c_l : math.min(bLW, c_l)
+                    baseCnt += 1
+                    ii      += 1
+                else
+                    going := false
+
+            // Confirmation close: bar immediately after the legout.
+            // startBar=1 -> close[0]=current close; startBar=2 -> close[1], etc.
+            confirmClose = close[startBar - 1]
+
+            // ── Standard zone path (≥1 base candle) ─────────────────────────
+            if baseCnt >= 1 and baseCnt <= maxBase
+                leg_o    = open[ii]
+                leg_h    = high[ii]
+                leg_l    = low[ii]
+                leg_c    = close[ii]
+                leg_body = math.abs(leg_c - leg_o)
+                leg_rng  = leg_h - leg_l
+                leg_bPct = leg_rng > 0 ? leg_body / leg_rng : 0.0
+
+                leginIsRed = leg_c < leg_o
+                leginIsGrn = leg_c > leg_o
+                isReversal = (lOut_grn and leginIsRed) or (lOut_red and leginIsGrn)
+                ratioOk    = isReversal ? lOut_body >= legoutMinRatio * leg_body : true
+
+                if leg_bPct >= excitePct and leg_body > 0 and ratioOk
+
+                    // ── DEMAND (green legout = DBR / RBR) ───────────────────
+                    if lOut_grn
+                        prox = bHB
+                        dist = leginIsRed ? math.min(bLW, math.min(leg_l, lOut_l)) : math.min(bLW, lOut_l)
+                        // Immediate close OR confirmation candle closes beyond proximal
+                        zoneValid = lOut_c > bHB or confirmClose > bHB
+
+                        if not na(prox) and not na(dist) and zoneValid and close > prox
+                            dPct   = (close - prox) / close * 100.0
+                            tScore = baseCnt <= 3 ? 2 : baseCnt <= 5 ? 1 : 0
+                            isGap  = lOut_o > bHB
+                            sScore = isGap ? 2 : nxt_bPct >= excitePct ? 2 : 1
+
+                            int  demTc    = 0
+                            bool demWasIn = false
+                            bool demInv   = false
+                            int  vBar     = startBar - 1
+                            while vBar >= 0
+                                vLow = low[vBar]
+                                if vLow < dist
+                                    demInv := true
+                                    break
+                                vIsIn = vLow <= prox
+                                if vIsIn and not demWasIn
+                                    demTc += 1
+                                demWasIn := vIsIn
+                                vBar -= 1
+
+                            if not demInv and demTc <= maxZoneTests
+                                fScore = demTc == 0 ? 3.0 : demTc == 1 ? 1.5 : 0.0
+                                sc     = fScore + sScore + tScore
+                                curBestPct = na(bestDP) ? 999.0 : (close - bestDP) / close * 100.0
+                                if dPct < curBestPct
+                                    bestDP := prox
+                                    bestDD := dist
+                                    bestDS := sc
+
+                    // ── SUPPLY (red legout = RBD / DBD) ─────────────────────
+                    else if lOut_red
+                        prox = bLB
+                        dist = leginIsGrn ? math.max(bHW, math.max(leg_h, lOut_h)) : math.max(bHW, lOut_h)
+                        zoneValid  = lOut_c < bLB or confirmClose < bLB
+
+                        if not na(prox) and not na(dist) and zoneValid and close < prox
+                            dPct   = (prox - close) / close * 100.0
+                            tScore = baseCnt <= 3 ? 2 : baseCnt <= 5 ? 1 : 0
+                            isGap  = lOut_o < bLB
+                            sScore = isGap ? 2 : nxt_bPct >= excitePct ? 2 : 1
+
+                            int  supTc    = 0
+                            bool supWasIn = false
+                            bool supInv   = false
+                            int  vBar     = startBar - 1
+                            while vBar >= 0
+                                vHigh = high[vBar]
+                                if vHigh > dist
+                                    supInv := true
+                                    break
+                                vIsIn = vHigh >= prox
+                                if vIsIn and not supWasIn
+                                    supTc += 1
+                                supWasIn := vIsIn
+                                vBar -= 1
+
+                            if not supInv and supTc <= maxZoneTests
+                                fScore = supTc == 0 ? 3.0 : supTc == 1 ? 1.5 : 0.0
+                                sc     = fScore + sScore + tScore
+                                curBestPct = na(bestSP) ? 999.0 : (bestSP - close) / close * 100.0
+                                if dPct < curBestPct
+                                    bestSP := prox
+                                    bestSD := dist
+                                    bestSS := sc
+
+            // ── Zero-base path (engulfing spike reversal, no base candles) ──
+            else if allowZeroBase and baseCnt == 0
+                leg2_o    = open[startBar + 1]
+                leg2_h    = high[startBar + 1]
+                leg2_l    = low[startBar + 1]
+                leg2_c    = close[startBar + 1]
+                leg2_body = math.abs(leg2_c - leg2_o)
+                leg2_rng  = leg2_h - leg2_l
+                leg2_bPct = leg2_rng > 0 ? leg2_body / leg2_rng : 0.0
+
+                zbDemand = leg2_c < leg2_o and lOut_grn  // red legin → green legout
+                zbSupply = leg2_c > leg2_o and lOut_red  // green legin → red legout
+
+                if (zbDemand or zbSupply) and leg2_bPct >= excitePct and leg2_body > 0 and lOut_body >= legoutMinRatio * leg2_body
+
+                    if zbDemand
+                        prox = math.max(math.min(leg2_o, leg2_c), lOut_o)
+                        dist = math.min(leg2_l, lOut_l)
+                        leginBdyHigh = math.max(leg2_o, leg2_c)
+                        zoneValid    = lOut_c > leginBdyHigh or confirmClose > leginBdyHigh
+
+                        if not na(prox) and not na(dist) and zoneValid and close > prox
+                            dPct   = (close - prox) / close * 100.0
+                            isGap  = lOut_o > leginBdyHigh
+                            sScore = isGap ? 2 : nxt_bPct >= excitePct ? 2 : 1
+
+                            int  demTc    = 0
+                            bool demWasIn = false
+                            bool demInv   = false
+                            int  vBar     = startBar - 1
+                            while vBar >= 0
+                                vLow = low[vBar]
+                                if vLow < dist
+                                    demInv := true
+                                    break
+                                vIsIn = vLow <= prox
+                                if vIsIn and not demWasIn
+                                    demTc += 1
+                                demWasIn := vIsIn
+                                vBar -= 1
+
+                            if not demInv and demTc <= maxZoneTests
+                                fScore = demTc == 0 ? 3.0 : demTc == 1 ? 1.5 : 0.0
+                                sc     = fScore + sScore + 2.0  // baseCnt=0 → tScore=2
+                                curBestPct = na(bestDP) ? 999.0 : (close - bestDP) / close * 100.0
+                                if dPct < curBestPct
+                                    bestDP := prox
+                                    bestDD := dist
+                                    bestDS := sc
+
+                    else
+                        prox = math.min(math.max(leg2_o, leg2_c), lOut_o)
+                        dist = math.max(leg2_h, lOut_h)
+                        leginBdyLow = math.min(leg2_o, leg2_c)
+                        zoneValid   = lOut_c < leginBdyLow or confirmClose < leginBdyLow
+
+                        if not na(prox) and not na(dist) and zoneValid and close < prox
+                            dPct   = (prox - close) / close * 100.0
+                            isGap  = lOut_o < leginBdyLow
+                            sScore = isGap ? 2 : nxt_bPct >= excitePct ? 2 : 1
+
+                            int  supTc    = 0
+                            bool supWasIn = false
+                            bool supInv   = false
+                            int  vBar     = startBar - 1
+                            while vBar >= 0
+                                vHigh = high[vBar]
+                                if vHigh > dist
+                                    supInv := true
+                                    break
+                                vIsIn = vHigh >= prox
+                                if vIsIn and not supWasIn
+                                    supTc += 1
+                                supWasIn := vIsIn
+                                vBar -= 1
+
+                            if not supInv and supTc <= maxZoneTests
+                                fScore = supTc == 0 ? 3.0 : supTc == 1 ? 1.5 : 0.0
+                                sc     = fScore + sScore + 2.0  // baseCnt=0 → tScore=2
+                                curBestPct = na(bestSP) ? 999.0 : (bestSP - close) / close * 100.0
+                                if dPct < curBestPct
+                                    bestSP := prox
+                                    bestSD := dist
+                                    bestSS := sc
+
+    float demDistPct = na(bestDP) ? -999.0 : (close - bestDP) / close * 100.0
+    float supDistPct = na(bestSP) ? -999.0 : (bestSP - close) / close * 100.0
+
+    [demDistPct, bestDP, bestDD, bestDS,
+     supDistPct, bestSP, bestSD, bestSS, float(trendDir), float(htfTrendDir),
+     htfDemDistPct, htfDemScoreV, htfSupDistPct, htfSupScoreV]
+
+// =============================================================================
+// FETCH ZONE DATA FOR ALL 40 STOCKS
+// Each call returns a 9-tuple at the current chart timeframe.
+// =============================================================================
+[dd01,dp01,ddi01,ds01, sd01,sp01,sdi01,ss01,tr01,ht01,hdd01,hdds01,hsd01,hsds01] = request.security(sym01, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd02,dp02,ddi02,ds02, sd02,sp02,sdi02,ss02,tr02,ht02,hdd02,hdds02,hsd02,hsds02] = request.security(sym02, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd03,dp03,ddi03,ds03, sd03,sp03,sdi03,ss03,tr03,ht03,hdd03,hdds03,hsd03,hsds03] = request.security(sym03, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd04,dp04,ddi04,ds04, sd04,sp04,sdi04,ss04,tr04,ht04,hdd04,hdds04,hsd04,hsds04] = request.security(sym04, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd05,dp05,ddi05,ds05, sd05,sp05,sdi05,ss05,tr05,ht05,hdd05,hdds05,hsd05,hsds05] = request.security(sym05, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd06,dp06,ddi06,ds06, sd06,sp06,sdi06,ss06,tr06,ht06,hdd06,hdds06,hsd06,hsds06] = request.security(sym06, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd07,dp07,ddi07,ds07, sd07,sp07,sdi07,ss07,tr07,ht07,hdd07,hdds07,hsd07,hsds07] = request.security(sym07, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd08,dp08,ddi08,ds08, sd08,sp08,sdi08,ss08,tr08,ht08,hdd08,hdds08,hsd08,hsds08] = request.security(sym08, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd09,dp09,ddi09,ds09, sd09,sp09,sdi09,ss09,tr09,ht09,hdd09,hdds09,hsd09,hsds09] = request.security(sym09, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd10,dp10,ddi10,ds10, sd10,sp10,sdi10,ss10,tr10,ht10,hdd10,hdds10,hsd10,hsds10] = request.security(sym10, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd11,dp11,ddi11,ds11, sd11,sp11,sdi11,ss11,tr11,ht11,hdd11,hdds11,hsd11,hsds11] = request.security(sym11, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd12,dp12,ddi12,ds12, sd12,sp12,sdi12,ss12,tr12,ht12,hdd12,hdds12,hsd12,hsds12] = request.security(sym12, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd13,dp13,ddi13,ds13, sd13,sp13,sdi13,ss13,tr13,ht13,hdd13,hdds13,hsd13,hsds13] = request.security(sym13, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd14,dp14,ddi14,ds14, sd14,sp14,sdi14,ss14,tr14,ht14,hdd14,hdds14,hsd14,hsds14] = request.security(sym14, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd15,dp15,ddi15,ds15, sd15,sp15,sdi15,ss15,tr15,ht15,hdd15,hdds15,hsd15,hsds15] = request.security(sym15, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd16,dp16,ddi16,ds16, sd16,sp16,sdi16,ss16,tr16,ht16,hdd16,hdds16,hsd16,hsds16] = request.security(sym16, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd17,dp17,ddi17,ds17, sd17,sp17,sdi17,ss17,tr17,ht17,hdd17,hdds17,hsd17,hsds17] = request.security(sym17, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd18,dp18,ddi18,ds18, sd18,sp18,sdi18,ss18,tr18,ht18,hdd18,hdds18,hsd18,hsds18] = request.security(sym18, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd19,dp19,ddi19,ds19, sd19,sp19,sdi19,ss19,tr19,ht19,hdd19,hdds19,hsd19,hsds19] = request.security(sym19, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd20,dp20,ddi20,ds20, sd20,sp20,sdi20,ss20,tr20,ht20,hdd20,hdds20,hsd20,hsds20] = request.security(sym20, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd21,dp21,ddi21,ds21, sd21,sp21,sdi21,ss21,tr21,ht21,hdd21,hdds21,hsd21,hsds21] = request.security(sym21, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd22,dp22,ddi22,ds22, sd22,sp22,sdi22,ss22,tr22,ht22,hdd22,hdds22,hsd22,hsds22] = request.security(sym22, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd23,dp23,ddi23,ds23, sd23,sp23,sdi23,ss23,tr23,ht23,hdd23,hdds23,hsd23,hsds23] = request.security(sym23, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd24,dp24,ddi24,ds24, sd24,sp24,sdi24,ss24,tr24,ht24,hdd24,hdds24,hsd24,hsds24] = request.security(sym24, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd25,dp25,ddi25,ds25, sd25,sp25,sdi25,ss25,tr25,ht25,hdd25,hdds25,hsd25,hsds25] = request.security(sym25, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd26,dp26,ddi26,ds26, sd26,sp26,sdi26,ss26,tr26,ht26,hdd26,hdds26,hsd26,hsds26] = request.security(sym26, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd27,dp27,ddi27,ds27, sd27,sp27,sdi27,ss27,tr27,ht27,hdd27,hdds27,hsd27,hsds27] = request.security(sym27, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd28,dp28,ddi28,ds28, sd28,sp28,sdi28,ss28,tr28,ht28,hdd28,hdds28,hsd28,hsds28] = request.security(sym28, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd29,dp29,ddi29,ds29, sd29,sp29,sdi29,ss29,tr29,ht29,hdd29,hdds29,hsd29,hsds29] = request.security(sym29, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd30,dp30,ddi30,ds30, sd30,sp30,sdi30,ss30,tr30,ht30,hdd30,hdds30,hsd30,hsds30] = request.security(sym30, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd31,dp31,ddi31,ds31, sd31,sp31,sdi31,ss31,tr31,ht31,hdd31,hdds31,hsd31,hsds31] = request.security(sym31, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd32,dp32,ddi32,ds32, sd32,sp32,sdi32,ss32,tr32,ht32,hdd32,hdds32,hsd32,hsds32] = request.security(sym32, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd33,dp33,ddi33,ds33, sd33,sp33,sdi33,ss33,tr33,ht33,hdd33,hdds33,hsd33,hsds33] = request.security(sym33, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd34,dp34,ddi34,ds34, sd34,sp34,sdi34,ss34,tr34,ht34,hdd34,hdds34,hsd34,hsds34] = request.security(sym34, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd35,dp35,ddi35,ds35, sd35,sp35,sdi35,ss35,tr35,ht35,hdd35,hdds35,hsd35,hsds35] = request.security(sym35, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd36,dp36,ddi36,ds36, sd36,sp36,sdi36,ss36,tr36,ht36,hdd36,hdds36,hsd36,hsds36] = request.security(sym36, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd37,dp37,ddi37,ds37, sd37,sp37,sdi37,ss37,tr37,ht37,hdd37,hdds37,hsd37,hsds37] = request.security(sym37, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd38,dp38,ddi38,ds38, sd38,sp38,sdi38,ss38,tr38,ht38,hdd38,hdds38,hsd38,hsds38] = request.security(sym38, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd39,dp39,ddi39,ds39, sd39,sp39,sdi39,ss39,tr39,ht39,hdd39,hdds39,hsd39,hsds39] = request.security(sym39, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+[dd40,dp40,ddi40,ds40, sd40,sp40,sdi40,ss40,tr40,ht40,hdd40,hdds40,hsd40,hsds40] = request.security(sym40, timeframe.period, f_scanZones(), lookahead = barmerge.lookahead_off)
+
+// =============================================================================
+// PACK DATA INTO ARRAYS FOR PROCESSING
+// =============================================================================
+// Arrays: [sym, demDistPct, demProx, demDist, demScore,
+//           supDistPct, supProx, supDist, supScore, trendDir]
+
+var string[] syms  = array.from(sym01,sym02,sym03,sym04,sym05,sym06,sym07,sym08,sym09,sym10,sym11,sym12,sym13,sym14,sym15,sym16,sym17,sym18,sym19,sym20,sym21,sym22,sym23,sym24,sym25,sym26,sym27,sym28,sym29,sym30,sym31,sym32,sym33,sym34,sym35,sym36,sym37,sym38,sym39,sym40)
+
+// Track previous in-zone state per stock (for entry-edge alert detection)
+var bool[] prevInDem = array.new_bool(40, false)
+var bool[] prevInSup = array.new_bool(40, false)
+
+// Assemble per-stock result arrays on last bar
+f_arr40(v01,v02,v03,v04,v05,v06,v07,v08,v09,v10,v11,v12,v13,v14,v15,v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31,v32,v33,v34,v35,v36,v37,v38,v39,v40) =>
+    array.from(v01,v02,v03,v04,v05,v06,v07,v08,v09,v10,v11,v12,v13,v14,v15,v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31,v32,v33,v34,v35,v36,v37,v38,v39,v40)
+
+// =============================================================================
+// TABLE BUILDING
+// =============================================================================
+f_fmtPct(v) =>
+    str.tostring(math.round(v * 10) / 10) + "%"
+
+f_fmtPrice(v) =>
+    str.tostring(math.round(v * 100) / 100)
+
+f_trendTxt(t) =>
+    t == 1 ? "↑ Up" : t == -1 ? "↓ Down" : "→ Side"
+
+f_trendColor(t) =>
+    t == 1 ? color.new(color.green, 30) : t == -1 ? color.new(color.red, 30) : color.new(color.gray, 40)
+
+f_fillTblRow(tbl, row, sym_s, zType, distPct, prox, dist2, score, htfTrendV, htfDemD, htfDemSc, htfSupD, htfSupSc) =>
+    zoneTxt   = zType == 1 ? "🟢 Demand" : "🔴 Supply"
+    zoneColor = zType == 1 ? color.new(color.green, 40) : color.new(color.red, 40)
+    // bufAmt    = prox * bufferPct / 100.0
+    // float entry  = na
+    // float sl     = na
+    // float target = na
+    // if zType == 1
+        // entry  := prox + bufAmt
+        // sl     := dist2 - bufAmt
+        // target := entry + rrRatio * (entry - sl)
+    // else
+        // entry  := prox - bufAmt
+        // sl     := dist2 + bufAmt
+        // target := entry - rrRatio * (sl - entry)
+    htfDemNear = htfDemD == -1.0 or (htfDemD > 0.0 and htfDemD <= 40.0)
+    htfSupNear = htfSupD == -1.0 or (htfSupD > 0.0 and htfSupD <= 40.0)
+    isGreenRow = zType == 1  and int(htfTrendV) == 1  and htfDemNear
+    isRedRow   = zType == -1 and int(htfTrendV) == -1 and htfSupNear
+    rowBg = isGreenRow ? color.new(color.green, 50) : isRedRow ? color.new(color.red, 50) : color.new(color.gray, 60)
+    table.cell(tbl, 0, row, sym_s,               text_color = color.white,  text_size = size.small, bgcolor = rowBg)
+    table.cell(tbl, 1, row, zoneTxt,             text_color = color.white,  text_size = size.small, bgcolor = zoneColor)
+    table.cell(tbl, 2, row, f_fmtPct(distPct),  text_color = color.yellow, text_size = size.small, bgcolor = rowBg)
+    table.cell(tbl, 3, row, str.tostring(score), text_color = color.white,  text_size = size.small, bgcolor = rowBg)
+    table.cell(tbl, 4, row, f_trendTxt(int(htfTrendV)), text_color = color.white, text_size = size.small, bgcolor = f_trendColor(int(htfTrendV)))
+    htfDemTxt = htfDemD > 0.0 ? str.tostring(math.round(htfDemD)) + "% / " + str.tostring(math.round(htfDemSc * 10) / 10) : "-"
+    htfSupTxt = htfSupD > 0.0 ? str.tostring(math.round(htfSupD)) + "% / " + str.tostring(math.round(htfSupSc * 10) / 10) : "-"
+    htfDemBg  = htfDemD == -1.0 ? color.new(color.green, 40) : htfDemD > 0.0 ? (htfDemD < 40.0 ? color.new(color.green, 40) : color.new(color.red, 40)) : color.new(color.gray, 60)
+    htfSupBg  = htfSupD == -1.0 ? color.new(color.green, 40) : htfSupD > 0.0 ? (htfSupD < 40.0 ? color.new(color.green, 40) : color.new(color.red, 40)) : color.new(color.gray, 60)
+    table.cell(tbl, 5, row, htfDemTxt,  text_color = color.white, text_size = size.small, bgcolor = htfDemBg)
+    table.cell(tbl, 6, row, htfSupTxt,  text_color = color.white, text_size = size.small, bgcolor = htfSupBg)
+    // In MTF: show which zone price is inside (-1.0), or which is nearest when outside both
+    bool _bothIn  = htfDemD == -1.0 and htfSupD == -1.0
+    bool _demIn   = htfDemD == -1.0 and htfSupD != -1.0
+    bool _supIn   = htfSupD == -1.0 and htfDemD != -1.0
+    bool _demNear = htfDemD > 0.0 and htfSupD > 0.0 and htfDemD < htfSupD
+    bool _supNear = htfDemD > 0.0 and htfSupD > 0.0 and htfSupD <= htfDemD
+    bool _onlyDem = htfDemD > 0.0 and not (htfSupD > 0.0)
+    bool _onlySup = htfSupD > 0.0 and not (htfDemD > 0.0)
+    inZoneTxt = _bothIn ? "D+S" : _demIn ? "inD" : _supIn ? "inS" : _demNear ? "↓Dem" : _supNear ? "↑Sup" : _onlyDem ? "Dem" : _onlySup ? "Sup" : "-"
+    inZoneBg  = _bothIn ? color.new(color.orange, 40) : _demIn ? color.new(color.green, 40) : _supIn ? color.new(color.red, 40) : _demNear ? color.new(color.green, 60) : _supNear ? color.new(color.red, 60) : color.new(color.gray, 60)
+    table.cell(tbl, 7, row, inZoneTxt,  text_color = color.white, text_size = size.small, bgcolor = inZoneBg)
+    // if showEntry
+        // table.cell(tbl, 5, row, f_fmtPrice(entry) + " / " + f_fmtPrice(sl),  text_color = color.white,                text_size = size.small, bgcolor = rowBg)
+        // table.cell(tbl, 6, row, f_fmtPrice(target),                           text_color = color.new(color.green, 10), text_size = size.small, bgcolor = rowBg)
+
+f_addHeader(tbl) =>
+    headerBg = color.new(color.navy, 20)
+    table.cell(tbl, 0, 0, "Symbol",      text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 1, 0, "Zone",        text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 2, 0, "% Away",      text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 3, 0, "Score",       text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 4, 0, "HTF Trend",   text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 5, 0, "HTF Dem",     text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 6, 0, "HTF Sup",     text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    table.cell(tbl, 7, 0, "In MTF",      text_color = color.white, text_size = size.small, bgcolor = headerBg)
+    // if showEntry
+        // table.cell(tbl, 5, 0, "Entry / SL", text_color = color.white, text_size = size.small, bgcolor = headerBg)
+        // table.cell(tbl, 6, 0, "Target",     text_color = color.white, text_size = size.small, bgcolor = headerBg)
+
+var table tbl1 = na
+var table tbl2 = na
+var table tbl3 = na
+
+if barstate.islast
+    if not na(tbl1)
+        table.delete(tbl1)
+    if not na(tbl2)
+        table.delete(tbl2)
+    if not na(tbl3)
+        table.delete(tbl3)
+
+    // Assemble data arrays
+    demDists  = f_arr40(dd01,dd02,dd03,dd04,dd05,dd06,dd07,dd08,dd09,dd10,dd11,dd12,dd13,dd14,dd15,dd16,dd17,dd18,dd19,dd20,dd21,dd22,dd23,dd24,dd25,dd26,dd27,dd28,dd29,dd30,dd31,dd32,dd33,dd34,dd35,dd36,dd37,dd38,dd39,dd40)
+    demProxs  = f_arr40(dp01,dp02,dp03,dp04,dp05,dp06,dp07,dp08,dp09,dp10,dp11,dp12,dp13,dp14,dp15,dp16,dp17,dp18,dp19,dp20,dp21,dp22,dp23,dp24,dp25,dp26,dp27,dp28,dp29,dp30,dp31,dp32,dp33,dp34,dp35,dp36,dp37,dp38,dp39,dp40)
+    demDists2 = f_arr40(ddi01,ddi02,ddi03,ddi04,ddi05,ddi06,ddi07,ddi08,ddi09,ddi10,ddi11,ddi12,ddi13,ddi14,ddi15,ddi16,ddi17,ddi18,ddi19,ddi20,ddi21,ddi22,ddi23,ddi24,ddi25,ddi26,ddi27,ddi28,ddi29,ddi30,ddi31,ddi32,ddi33,ddi34,ddi35,ddi36,ddi37,ddi38,ddi39,ddi40)
+    demScores = f_arr40(ds01,ds02,ds03,ds04,ds05,ds06,ds07,ds08,ds09,ds10,ds11,ds12,ds13,ds14,ds15,ds16,ds17,ds18,ds19,ds20,ds21,ds22,ds23,ds24,ds25,ds26,ds27,ds28,ds29,ds30,ds31,ds32,ds33,ds34,ds35,ds36,ds37,ds38,ds39,ds40)
+    supDists  = f_arr40(sd01,sd02,sd03,sd04,sd05,sd06,sd07,sd08,sd09,sd10,sd11,sd12,sd13,sd14,sd15,sd16,sd17,sd18,sd19,sd20,sd21,sd22,sd23,sd24,sd25,sd26,sd27,sd28,sd29,sd30,sd31,sd32,sd33,sd34,sd35,sd36,sd37,sd38,sd39,sd40)
+    supProxs  = f_arr40(sp01,sp02,sp03,sp04,sp05,sp06,sp07,sp08,sp09,sp10,sp11,sp12,sp13,sp14,sp15,sp16,sp17,sp18,sp19,sp20,sp21,sp22,sp23,sp24,sp25,sp26,sp27,sp28,sp29,sp30,sp31,sp32,sp33,sp34,sp35,sp36,sp37,sp38,sp39,sp40)
+    supDists2 = f_arr40(sdi01,sdi02,sdi03,sdi04,sdi05,sdi06,sdi07,sdi08,sdi09,sdi10,sdi11,sdi12,sdi13,sdi14,sdi15,sdi16,sdi17,sdi18,sdi19,sdi20,sdi21,sdi22,sdi23,sdi24,sdi25,sdi26,sdi27,sdi28,sdi29,sdi30,sdi31,sdi32,sdi33,sdi34,sdi35,sdi36,sdi37,sdi38,sdi39,sdi40)
+    supScores = f_arr40(ss01,ss02,ss03,ss04,ss05,ss06,ss07,ss08,ss09,ss10,ss11,ss12,ss13,ss14,ss15,ss16,ss17,ss18,ss19,ss20,ss21,ss22,ss23,ss24,ss25,ss26,ss27,ss28,ss29,ss30,ss31,ss32,ss33,ss34,ss35,ss36,ss37,ss38,ss39,ss40)
+    trends    = f_arr40(tr01,tr02,tr03,tr04,tr05,tr06,tr07,tr08,tr09,tr10,tr11,tr12,tr13,tr14,tr15,tr16,tr17,tr18,tr19,tr20,tr21,tr22,tr23,tr24,tr25,tr26,tr27,tr28,tr29,tr30,tr31,tr32,tr33,tr34,tr35,tr36,tr37,tr38,tr39,tr40)
+    htfTrends = f_arr40(ht01,ht02,ht03,ht04,ht05,ht06,ht07,ht08,ht09,ht10,ht11,ht12,ht13,ht14,ht15,ht16,ht17,ht18,ht19,ht20,ht21,ht22,ht23,ht24,ht25,ht26,ht27,ht28,ht29,ht30,ht31,ht32,ht33,ht34,ht35,ht36,ht37,ht38,ht39,ht40)
+    htfDemDists  = f_arr40(hdd01,hdd02,hdd03,hdd04,hdd05,hdd06,hdd07,hdd08,hdd09,hdd10,hdd11,hdd12,hdd13,hdd14,hdd15,hdd16,hdd17,hdd18,hdd19,hdd20,hdd21,hdd22,hdd23,hdd24,hdd25,hdd26,hdd27,hdd28,hdd29,hdd30,hdd31,hdd32,hdd33,hdd34,hdd35,hdd36,hdd37,hdd38,hdd39,hdd40)
+    htfDemScores = f_arr40(hdds01,hdds02,hdds03,hdds04,hdds05,hdds06,hdds07,hdds08,hdds09,hdds10,hdds11,hdds12,hdds13,hdds14,hdds15,hdds16,hdds17,hdds18,hdds19,hdds20,hdds21,hdds22,hdds23,hdds24,hdds25,hdds26,hdds27,hdds28,hdds29,hdds30,hdds31,hdds32,hdds33,hdds34,hdds35,hdds36,hdds37,hdds38,hdds39,hdds40)
+    htfSupDists  = f_arr40(hsd01,hsd02,hsd03,hsd04,hsd05,hsd06,hsd07,hsd08,hsd09,hsd10,hsd11,hsd12,hsd13,hsd14,hsd15,hsd16,hsd17,hsd18,hsd19,hsd20,hsd21,hsd22,hsd23,hsd24,hsd25,hsd26,hsd27,hsd28,hsd29,hsd30,hsd31,hsd32,hsd33,hsd34,hsd35,hsd36,hsd37,hsd38,hsd39,hsd40)
+    htfSupScores = f_arr40(hsds01,hsds02,hsds03,hsds04,hsds05,hsds06,hsds07,hsds08,hsds09,hsds10,hsds11,hsds12,hsds13,hsds14,hsds15,hsds16,hsds17,hsds18,hsds19,hsds20,hsds21,hsds22,hsds23,hsds24,hsds25,hsds26,hsds27,hsds28,hsds29,hsds30,hsds31,hsds32,hsds33,hsds34,hsds35,hsds36,hsds37,hsds38,hsds39,hsds40)
+
+    // --- Collect qualifying rows ---
+    // Each match: [symIdx, zoneType (1=D/-1=S), distPct, prox, dist, score, trend]
+    var array<int>   rIdx   = array.new<int>()
+    var array<int>   rType  = array.new<int>()
+    var array<float> rDist  = array.new<float>()
+    var array<float> rProx  = array.new<float>()
+    var array<float> rDist2 = array.new<float>()
+    var array<float> rScore = array.new<float>()
+    var array<float> rTrend       = array.new<float>()
+    var array<float> rHtfTrend    = array.new<float>()
+    var array<float> rHtfDemDist  = array.new<float>()
+    var array<float> rHtfDemScore = array.new<float>()
+    var array<float> rHtfSupDist  = array.new<float>()
+    var array<float> rHtfSupScore = array.new<float>()
+
+    array.clear(rIdx)
+    array.clear(rType)
+    array.clear(rDist)
+    array.clear(rProx)
+    array.clear(rDist2)
+    array.clear(rScore)
+    array.clear(rTrend)
+    array.clear(rHtfTrend)
+    array.clear(rHtfDemDist)
+    array.clear(rHtfDemScore)
+    array.clear(rHtfSupDist)
+    array.clear(rHtfSupScore)
+
+    for i = 0 to 39
+        trendVal = array.get(trends, i)
+
+        // --- Check demand ---
+        if scanMode != "Supply only"
+            dPct   = array.get(demDists,  i)
+            dProx  = array.get(demProxs,  i)
+            dDist  = array.get(demDists2, i)
+            dScore = array.get(demScores, i)
+
+            passRange  = dPct >= minDistPct and dPct <= maxDistPct
+            passTrend  = not useTrendFilter  or trendVal == 1
+            passScore  = not useScoreFilter  or dScore >= minScore
+            passZone   = dPct > -999.0
+
+            // --- Alert: price has crossed below the entry line (transition outside -> inside) ---
+            // Entry line = proximal + alertEntryPct% (sits ABOVE the proximal for demand).
+            // dPct <= alertEntryPct means close <= prox * (1 + alertEntryPct/100), i.e.
+            // price is at or below the entry line = approaching the demand zone.
+            // Restricted to Daily and Weekly chart timeframes.
+            bool alertTfOk = timeframe.isdaily or timeframe.isweekly
+            inDemNow = passZone and dPct <= alertEntryPct
+            wasInDem = array.get(prevInDem, i)
+            if enableAlerts and alertTfOk and alertDemand and inDemNow and not wasInDem
+                scoreOk = dScore >= alertMinScore
+                trendOk = not alertOnlyQualified or passTrend
+                if scoreOk and trendOk
+                    symStr = array.get(syms, i)
+                    msg = symStr + " APPROACHING DEMAND zone | prox: " + str.tostring(math.round(dProx * 100) / 100) + " | score: " + str.tostring(math.round(dScore * 10) / 10)
+                    alert(msg, alert.freq_once_per_bar)
+            array.set(prevInDem, i, inDemNow)
+
+            if passZone and passRange and passTrend and passScore
+                array.push(rIdx,   i)
+                array.push(rType,  1)
+                array.push(rDist,  dPct)
+                array.push(rProx,  dProx)
+                array.push(rDist2, dDist)
+                array.push(rScore, dScore)
+                array.push(rTrend,       trendVal)
+                array.push(rHtfTrend,    array.get(htfTrends,    i))
+                array.push(rHtfDemDist,  array.get(htfDemDists,  i))
+                array.push(rHtfDemScore, array.get(htfDemScores, i))
+                array.push(rHtfSupDist,  array.get(htfSupDists,  i))
+                array.push(rHtfSupScore, array.get(htfSupScores, i))
+
+        // --- Check supply ---
+        if scanMode != "Demand only"
+            sPct   = array.get(supDists,  i)
+            sProx  = array.get(supProxs,  i)
+            sDist  = array.get(supDists2, i)
+            sScore = array.get(supScores, i)
+
+            passRange  = sPct >= minDistPct and sPct <= maxDistPct
+            passTrend  = not useTrendFilter  or trendVal == -1
+            passScore  = not useScoreFilter  or sScore >= minScore
+            passZone   = sPct > -999.0
+
+            // --- Alert: price has crossed above the entry line (transition outside -> inside) ---
+            // Entry line = proximal - alertEntryPct% (sits BELOW the proximal for supply).
+            // sPct <= alertEntryPct means close >= prox * (1 - alertEntryPct/100), i.e.
+            // price is at or above the entry line = approaching the supply zone.
+            // Restricted to Daily and Weekly chart timeframes.
+            bool alertTfOk = timeframe.isdaily or timeframe.isweekly
+            inSupNow = passZone and sPct <= alertEntryPct
+            wasInSup = array.get(prevInSup, i)
+            if enableAlerts and alertTfOk and alertSupply and inSupNow and not wasInSup
+                scoreOk = sScore >= alertMinScore
+                trendOk = not alertOnlyQualified or passTrend
+                if scoreOk and trendOk
+                    symStr = array.get(syms, i)
+                    msg = symStr + " APPROACHING SUPPLY zone | prox: " + str.tostring(math.round(sProx * 100) / 100) + " | score: " + str.tostring(math.round(sScore * 10) / 10)
+                    alert(msg, alert.freq_once_per_bar)
+            array.set(prevInSup, i, inSupNow)
+
+            if passZone and passRange and passTrend and passScore
+                array.push(rIdx,   i)
+                array.push(rType,  -1)
+                array.push(rDist,  sPct)
+                array.push(rProx,  sProx)
+                array.push(rDist2, sDist)
+                array.push(rScore, sScore)
+                array.push(rTrend,       trendVal)
+                array.push(rHtfTrend,    array.get(htfTrends,    i))
+                array.push(rHtfDemDist,  array.get(htfDemDists,  i))
+                array.push(rHtfDemScore, array.get(htfDemScores, i))
+                array.push(rHtfSupDist,  array.get(htfSupDists,  i))
+                array.push(rHtfSupScore, array.get(htfSupScores, i))
+
+    nMatches = array.size(rIdx)
+
+    // Sort matches by distPct ascending (closest zones first)
+    if nMatches > 1
+        for si = 1 to nMatches - 1
+            keyDist  = array.get(rDist,  si)
+            keyProx  = array.get(rProx,  si)
+            keyDist2 = array.get(rDist2, si)
+            keyScore = array.get(rScore, si)
+            keyTrend       = array.get(rTrend,       si)
+            keyHtfTrend    = array.get(rHtfTrend,    si)
+            keyHtfDemDist  = array.get(rHtfDemDist,  si)
+            keyHtfDemScore = array.get(rHtfDemScore, si)
+            keyHtfSupDist  = array.get(rHtfSupDist,  si)
+            keyHtfSupScore = array.get(rHtfSupScore, si)
+            keyIdx         = array.get(rIdx,         si)
+            keyType  = array.get(rType,  si)
+            sj = si - 1
+            while sj >= 0
+                if array.get(rDist, sj) <= keyDist
+                    break
+                array.set(rDist,  sj + 1, array.get(rDist,  sj))
+                array.set(rProx,  sj + 1, array.get(rProx,  sj))
+                array.set(rDist2, sj + 1, array.get(rDist2, sj))
+                array.set(rScore, sj + 1, array.get(rScore, sj))
+                array.set(rTrend,       sj + 1, array.get(rTrend,       sj))
+                array.set(rHtfTrend,    sj + 1, array.get(rHtfTrend,    sj))
+                array.set(rHtfDemDist,  sj + 1, array.get(rHtfDemDist,  sj))
+                array.set(rHtfDemScore, sj + 1, array.get(rHtfDemScore, sj))
+                array.set(rHtfSupDist,  sj + 1, array.get(rHtfSupDist,  sj))
+                array.set(rHtfSupScore, sj + 1, array.get(rHtfSupScore, sj))
+                array.set(rIdx,         sj + 1, array.get(rIdx,         sj))
+                array.set(rType,  sj + 1, array.get(rType,  sj))
+                sj -= 1
+            array.set(rDist,  sj + 1, keyDist)
+            array.set(rProx,  sj + 1, keyProx)
+            array.set(rDist2, sj + 1, keyDist2)
+            array.set(rScore, sj + 1, keyScore)
+            array.set(rTrend,       sj + 1, keyTrend)
+            array.set(rHtfTrend,    sj + 1, keyHtfTrend)
+            array.set(rHtfDemDist,  sj + 1, keyHtfDemDist)
+            array.set(rHtfDemScore, sj + 1, keyHtfDemScore)
+            array.set(rHtfSupDist,  sj + 1, keyHtfSupDist)
+            array.set(rHtfSupScore, sj + 1, keyHtfSupScore)
+            array.set(rIdx,         sj + 1, keyIdx)
+            array.set(rType,        sj + 1, keyType)
+
+    nCols    = 8
+    bgColor  = color.new(color.black, 15)
+
+    // Split results evenly across three side-by-side tables
+    split1  = nMatches > 0 ? math.ceil(nMatches / 3) : 0
+    split2  = nMatches > 0 ? math.ceil(nMatches * 2 / 3) : 0
+    nData1  = split1
+    nData2  = split2 - split1
+    nData3  = nMatches - split2
+
+    pos1 = tablePos == "Top" ? position.top_left    : position.bottom_left
+    pos2 = tablePos == "Top" ? position.top_center  : position.bottom_center
+    pos3 = tablePos == "Top" ? position.top_right   : position.bottom_right
+
+    tbl1 := table.new(pos1, columns = nCols, rows = math.max(nData1, 1) + 1,
+         bgcolor = bgColor, border_color = color.new(color.gray, 50), border_width = 1,
+         frame_color = color.new(color.gray, 30), frame_width = 1)
+    tbl2 := table.new(pos2, columns = nCols, rows = math.max(nData2, 1) + 1,
+         bgcolor = bgColor, border_color = color.new(color.gray, 50), border_width = 1,
+         frame_color = color.new(color.gray, 30), frame_width = 1)
+    tbl3 := table.new(pos3, columns = nCols, rows = math.max(nData3, 1) + 1,
+         bgcolor = bgColor, border_color = color.new(color.gray, 50), border_width = 1,
+         frame_color = color.new(color.gray, 30), frame_width = 1)
+
+    f_addHeader(tbl1)
+    f_addHeader(tbl2)
+    f_addHeader(tbl3)
+
+    if nMatches == 0
+        table.cell(tbl1, 0, 1, "No stocks match the criteria", text_color = color.gray, text_size = size.small, bgcolor = bgColor)
+    else
+        if split1 > 0
+            for r = 0 to split1 - 1
+                symIdx  = array.get(rIdx, r)
+                fullSym = array.get(syms, symIdx)
+                dispSym = str.length(fullSym) > 4 ? str.substring(fullSym, 4) : fullSym
+                f_fillTblRow(tbl1, r + 1, dispSym, array.get(rType, r), array.get(rDist, r),
+                     array.get(rProx, r), array.get(rDist2, r), array.get(rScore, r), array.get(rHtfTrend, r), array.get(rHtfDemDist, r), array.get(rHtfDemScore, r), array.get(rHtfSupDist, r), array.get(rHtfSupScore, r))
+
+        if split2 > split1
+            for r = split1 to split2 - 1
+                symIdx  = array.get(rIdx, r)
+                fullSym = array.get(syms, symIdx)
+                dispSym = str.length(fullSym) > 4 ? str.substring(fullSym, 4) : fullSym
+                f_fillTblRow(tbl2, r - split1 + 1, dispSym, array.get(rType, r), array.get(rDist, r),
+                     array.get(rProx, r), array.get(rDist2, r), array.get(rScore, r), array.get(rHtfTrend, r), array.get(rHtfDemDist, r), array.get(rHtfDemScore, r), array.get(rHtfSupDist, r), array.get(rHtfSupScore, r))
+
+        if nMatches > split2
+            for r = split2 to nMatches - 1
+                symIdx  = array.get(rIdx, r)
+                fullSym = array.get(syms, symIdx)
+                dispSym = str.length(fullSym) > 4 ? str.substring(fullSym, 4) : fullSym
+                f_fillTblRow(tbl3, r - split2 + 1, dispSym, array.get(rType, r), array.get(rDist, r),
+                     array.get(rProx, r), array.get(rDist2, r), array.get(rScore, r), array.get(rHtfTrend, r), array.get(rHtfDemDist, r), array.get(rHtfDemScore, r), array.get(rHtfSupDist, r), array.get(rHtfSupScore, r))
+
+// Dummy plot so indicator renders on chart
+plot(na)
