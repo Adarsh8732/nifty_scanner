@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -38,7 +38,14 @@ def state_path(tf: str) -> Path:
     return Path(f"state_{tf}.json")
 
 def period_for(tf: str) -> str:
-    return "1y" if tf == "1d" else "5y"
+    return {"1d": "1y", "1wk": "5y", "1mo": "10y"}.get(tf, "5y")
+
+def htf_for(tf: str) -> str:
+    """Higher timeframe used for confluence: daily→weekly, weekly→monthly."""
+    return {"1d": "1wk", "1wk": "1mo"}.get(tf, tf)
+
+def tf_label(tf: str) -> str:
+    return {"1d": "Daily", "1wk": "Weekly", "1mo": "Monthly"}.get(tf, tf)
 
 # Detection params (match Pine defaults)
 BASE_PCT         = 0.50
@@ -47,6 +54,51 @@ LEGOUT_MIN_RATIO = 0.8
 MAX_BASE         = 3
 LOOKBACK_BARS    = 50
 MAX_ZONE_TESTS   = 1
+
+
+# ─── TREND (50 SMA slope method, mirrors Pine) ──────────────────────────
+def compute_trend(df: pd.DataFrame, sma_period: int = 50, lookback: int = 7,
+                  threshold_pct: float = 0.05) -> int:
+    """Returns 1=Up, -1=Down, 0=Side based on SMA slope %."""
+    if df is None or len(df) < sma_period + lookback:
+        return 0
+    sma = df["Close"].rolling(sma_period).mean()
+    if pd.isna(sma.iloc[-1]) or pd.isna(sma.iloc[-1 - lookback]):
+        return 0
+    close = float(df["Close"].iloc[-1])
+    if close <= 0:
+        return 0
+    slope_pct = (sma.iloc[-1] - sma.iloc[-1 - lookback]) / lookback / close * 100.0
+    if slope_pct > threshold_pct:
+        return 1
+    if slope_pct < -threshold_pct:
+        return -1
+    return 0
+
+def trend_label(t: int) -> str:
+    return "↑ Up" if t == 1 else "↓ Down" if t == -1 else "→ Side"
+
+
+# ─── HTF CONFLUENCE STATUS ──────────────────────────────────────────────
+def htf_status(close: float, htf_dem: dict | None, htf_sup: dict | None) -> str:
+    """Mirrors Pine 'In MTF' column: where is price vs HTF zones."""
+    in_dem = htf_dem is not None and htf_dem["distal"] <= close <= htf_dem["proximal"]
+    in_sup = htf_sup is not None and htf_sup["proximal"] <= close <= htf_sup["distal"]
+    if in_dem and in_sup:
+        return "D+S"
+    if in_dem:
+        return "inD"
+    if in_sup:
+        return "inS"
+    if htf_dem and htf_sup:
+        d_dist = abs(close - htf_dem["proximal"])
+        s_dist = abs(close - htf_sup["proximal"])
+        return "↓ Dem" if d_dist <= s_dist else "↑ Sup"
+    if htf_dem:
+        return "Dem"
+    if htf_sup:
+        return "Sup"
+    return "-"
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────
@@ -264,21 +316,40 @@ def is_approaching(close_now: float, zone: dict) -> bool:
         return close_now >= entry and close_now < zone["distal"]
 
 
-def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str) -> str:
+def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
+                    ltf_trend: int, htf_trend: int, htf_dem: dict | None,
+                    htf_sup: dict | None) -> str:
+    """Builds Telegram alert message mirroring Pine scanner table fields."""
     if zone["type"] == "demand":
         entry = zone["proximal"] * (1 + ALERT_ENTRY_PCT / 100.0)
         direction = "🟢 *DEMAND* zone approach (↓)"
     else:
         entry = zone["proximal"] * (1 - ALERT_ENTRY_PCT / 100.0)
         direction = "🔴 *SUPPLY* zone approach (↑)"
-    tf_label = "Daily" if timeframe == "1d" else "Weekly" if timeframe == "1wk" else timeframe
+
+    htf_tf  = htf_for(timeframe)
+    htf_lbl = tf_label(htf_tf)
+
+    def _htf_zone_line(z: dict | None, ztype: str) -> str:
+        if z is None:
+            return f"HTF {ztype}: -"
+        if z["type"] == "demand":
+            d_pct = (close_now - z["proximal"]) / close_now * 100.0
+        else:
+            d_pct = (z["proximal"] - close_now) / close_now * 100.0
+        return f"HTF {ztype}: {d_pct:+.1f}% / score {z['score']:.1f}"
+
     return (
         f"{direction}\n"
-        f"*{symbol}*  CMP `{close_now:.2f}`\n"
-        f"Proximal: `{zone['proximal']:.2f}`\n"
-        f"Distal:   `{zone['distal']:.2f}`\n"
-        f"Entry line: `{entry:.2f}`\n"
-        f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  TF: {tf_label}"
+        f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
+        f"Zone: prox `{zone['proximal']:.2f}` → dist `{zone['distal']:.2f}`\n"
+        f"Entry line: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
+        f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
+        f"─────────\n"
+        f"HTF ({htf_lbl}) Trend: {trend_label(htf_trend)}\n"
+        f"{_htf_zone_line(htf_dem, 'Dem')}\n"
+        f"{_htf_zone_line(htf_sup, 'Sup')}\n"
+        f"HTF Position: {htf_status(close_now, htf_dem, htf_sup)}"
     )
 
 
@@ -290,13 +361,14 @@ def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
     new_state: dict = {}
     alerts: list[tuple[str, str]] = []
 
-    tf_label = "Daily" if timeframe == "1d" else "Weekly" if timeframe == "1wk" else timeframe
+    lbl = tf_label(timeframe)
+    htf = htf_for(timeframe)
     print()
-    print(f"━━━━━━ {tf_label} scan ({timeframe}) ━━━━━━")
+    print(f"━━━━━━ {lbl} scan ({timeframe}, HTF={htf}) ━━━━━━")
     print(f"Prev state: {len(state)} entries")
 
     for i, sym in enumerate(symbols, 1):
-        print(f"[{tf_label[:3]} {i:3}/{len(symbols)}] {sym:14}", end=" ", flush=True)
+        print(f"[{lbl[:3]} {i:3}/{len(symbols)}] {sym:14}", end=" ", flush=True)
         df = fetch_ohlc(sym, timeframe)
         if df is None:
             print("skip")
@@ -306,38 +378,66 @@ def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
         zones = detect_zones(df)
         dem, sup = zones["demand"], zones["supply"]
 
-        msg_bits = []
+        # Pick approaching + qualifying candidates
+        candidates = []
         for z in (dem, sup):
-            if z is None:
-                continue
-            if z["score"] < ALERT_MIN_SCORE:
+            if z is None or z["score"] < ALERT_MIN_SCORE:
                 continue
             if not is_approaching(close_now, z):
                 continue
-            key = zone_key(sym, z)
-            if key in state:
-                new_state[key] = state[key]
-                msg_bits.append(f"{z['type'][0].upper()}=seen")
-            else:
-                alerts.append((sym, build_alert_msg(sym, z, close_now, timeframe)))
-                new_state[key] = {
-                    "first_alerted": datetime.utcnow().isoformat(),
-                    "score":         z["score"],
-                    "cmp_at_alert":  close_now,
-                }
-                msg_bits.append(f"{z['type'][0].upper()}=NEW🔔")
+            candidates.append(z)
 
-        if not msg_bits:
+        if not candidates:
             d_txt = f"D@{dem['dist_pct']:.1f}%/{dem['score']:.1f}" if dem else "D-"
             s_txt = f"S@{sup['dist_pct']:.1f}%/{sup['score']:.1f}" if sup else "S-"
             print(f"{d_txt} {s_txt}")
-        else:
-            print(" ".join(msg_bits))
+            time.sleep(0.1)
+            continue
 
+        # Some zone is approaching — split into NEW vs SEEN
+        new_keys = [zone_key(sym, z) for z in candidates if zone_key(sym, z) not in state]
+        seen_keys = [zone_key(sym, z) for z in candidates if zone_key(sym, z) in state]
+        for k in seen_keys:
+            new_state[k] = state[k]
+
+        if not new_keys:
+            # All candidates are already alerted — no new TG message needed
+            print(" ".join(f"{c['type'][0].upper()}=seen" for c in candidates))
+            time.sleep(0.1)
+            continue
+
+        # Fresh alert(s) — fetch HTF data + trends ONLY now (saves time per run)
+        ltf_trend = compute_trend(df)
+        htf_df = fetch_ohlc(sym, htf)
+        if htf_df is not None:
+            htf_trend = compute_trend(htf_df)
+            htf_zones = detect_zones(htf_df)
+            htf_dem, htf_sup = htf_zones["demand"], htf_zones["supply"]
+        else:
+            htf_trend, htf_dem, htf_sup = 0, None, None
+
+        for z in candidates:
+            key = zone_key(sym, z)
+            if key in state:
+                continue   # already handled above
+            alerts.append((
+                sym,
+                build_alert_msg(sym, z, close_now, timeframe,
+                                ltf_trend, htf_trend, htf_dem, htf_sup),
+            ))
+            new_state[key] = {
+                "first_alerted": datetime.now(timezone.utc).isoformat(),
+                "score":         z["score"],
+                "cmp_at_alert":  close_now,
+            }
+
+        print(" ".join(f"{c['type'][0].upper()}=" +
+                       ("NEW🔔" if zone_key(sym, c) not in state else "seen")
+                       for c in candidates))
         time.sleep(0.1)
 
     state_file.write_text(json.dumps(new_state, indent=2, sort_keys=True))
-    print(f"{tf_label}: state now {len(new_state)} active zones")
+    print(f"{lbl}: state now {len(new_state)} active zones, {len(alerts)} fresh alerts")
     return alerts
 
 
