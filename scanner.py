@@ -121,12 +121,17 @@ def send_telegram(text: str) -> None:
 
 
 def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
-    """Fetch OHLC for an NSE symbol at the given timeframe. None on failure."""
+    """Fetch OHLC for an NSE symbol at the given timeframe. None on failure.
+
+    auto_adjust=True → split-adjusted OHLC (clean for zone detection).
+    actions=False    → skip dividends/splits events (avoids yfinance
+                       "Dividends out-of-range" crash on weekly fetches).
+    """
     yf_sym = symbol + ".NS"
     try:
         df = yf.download(
             yf_sym, period=period_for(timeframe), interval=timeframe,
-            progress=False, auto_adjust=False, threads=False,
+            progress=False, auto_adjust=True, actions=False, threads=False,
         )
         if df is None or df.empty:
             return None
