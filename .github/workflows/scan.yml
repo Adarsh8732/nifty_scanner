@@ -1,12 +1,10 @@
 name: Nifty Zone Scanner (Live)
 
 on:
-  schedule:
-    # TEST CRON: non-round minutes to avoid GitHub's global cron dedup.
-    # */5 and */10 on the round minute get heavily throttled on free public repos.
-    # 7,17,27,37,47,57 fires every 10 min at offset minutes — much higher success rate.
-    - cron: '7,17,27,37,47,57 * * * *'
-  workflow_dispatch:   # manual "Run workflow" button
+  # Scheduling is handled by an EXTERNAL service (cron-job.org) that POSTs to
+  # the workflow_dispatch endpoint on a real schedule. GitHub Actions' own
+  # cron is unreliable on free public repos, so it's removed here.
+  workflow_dispatch:
 
 permissions:
   contents: write      # needed to commit updated state.json back to repo
@@ -40,6 +38,8 @@ jobs:
           TIMEFRAMES:      '1d,1wk'    # both Daily and Weekly zones
           ALERT_ENTRY_PCT: '1.0'        # entry line = proximal +/- 1%
           ALERT_MIN_SCORE: '7.0'
+          STRICT_FILTER:   'true'       # demand: trend HTF up + price closer to zone HTF demand
+                                        # supply: trend HTF down + price closer to zone HTF supply
         run: python scanner.py
 
       - name: Commit updated state

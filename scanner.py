@@ -32,20 +32,36 @@ ALERT_ENTRY_PCT   = float(os.environ.get("ALERT_ENTRY_PCT", "1.0"))
 ALERT_MIN_SCORE   = float(os.environ.get("ALERT_MIN_SCORE", "7.0"))
 SCAN_DEMAND       = os.environ.get("SCAN_DEMAND", "true").lower() == "true"
 SCAN_SUPPLY       = os.environ.get("SCAN_SUPPLY", "true").lower() == "true"
+# When True, alerts must ALSO pass HTF trend + HTF zone confluence (mirrors
+# scanner.pine isGreenRow / isRedRow logic):
+#   demand alert → trend HTF up AND price closer to zone-HTF demand than supply
+#                  (or no zone-HTF supply at all)
+#   supply alert → trend HTF down AND price closer to zone-HTF supply than demand
+#                  (or no zone-HTF demand at all)
+STRICT_FILTER     = os.environ.get("STRICT_FILTER", "false").lower() == "true"
 
 # State file per timeframe to keep dedupe separate (daily ≠ weekly zones)
 def state_path(tf: str) -> Path:
     return Path(f"state_{tf}.json")
 
 def period_for(tf: str) -> str:
-    return {"1d": "1y", "1wk": "5y", "1mo": "10y"}.get(tf, "5y")
+    return {"1d": "1y", "1wk": "5y", "1mo": "10y", "3mo": "15y"}.get(tf, "5y")
 
-def htf_for(tf: str) -> str:
-    """Higher timeframe used for confluence: daily→weekly, weekly→monthly."""
+def trend_tf_for(tf: str) -> str:
+    """HTF used for trend (one level up): mirrors scanner.pine htfTrendDir."""
     return {"1d": "1wk", "1wk": "1mo"}.get(tf, tf)
 
+def zone_tf_for(tf: str) -> str:
+    """HTF used for confluence zones (two levels up): mirrors scanner.pine htfDP/htfSP."""
+    return {"1d": "1mo", "1wk": "3mo"}.get(tf, tf)
+
+# Backwards-compat: legacy callers used htf_for() expecting ONE HTF.
+# Default to the zone HTF since that's what richer alert messages show.
+def htf_for(tf: str) -> str:
+    return zone_tf_for(tf)
+
 def tf_label(tf: str) -> str:
-    return {"1d": "Daily", "1wk": "Weekly", "1mo": "Monthly"}.get(tf, tf)
+    return {"1d": "Daily", "1wk": "Weekly", "1mo": "Monthly", "3mo": "Quarterly"}.get(tf, tf)
 
 # Detection params (match Pine defaults)
 BASE_PCT         = 0.50
@@ -99,6 +115,40 @@ def htf_status(close: float, htf_dem: dict | None, htf_sup: dict | None) -> str:
     if htf_sup:
         return "Sup"
     return "-"
+
+
+def passes_strict_filter(zone_type: str, trend_htf: int,
+                         zone_dem: dict | None, zone_sup: dict | None) -> bool:
+    """Mirrors scanner.pine isGreenRow / isRedRow logic.
+
+    Demand alert qualifies if:
+      - Trend HTF is Up
+      - Zone HTF demand exists AND (no zone HTF supply OR demand is closer)
+
+    Supply alert qualifies if:
+      - Trend HTF is Down
+      - Zone HTF supply exists AND (no zone HTF demand OR supply is closer)
+    """
+    if zone_type == "demand":
+        if trend_htf != 1:
+            return False
+        if zone_dem is None:
+            return False
+        if zone_sup is None:
+            return True
+        # Both HTF zones exist — require HTF demand closer than HTF supply
+        return zone_dem["dist_pct"] < zone_sup["dist_pct"]
+
+    if zone_type == "supply":
+        if trend_htf != -1:
+            return False
+        if zone_sup is None:
+            return False
+        if zone_dem is None:
+            return True
+        return zone_sup["dist_pct"] < zone_dem["dist_pct"]
+
+    return False
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────
@@ -332,8 +382,8 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         entry = zone["proximal"] * (1 - ALERT_ENTRY_PCT / 100.0)
         direction = "🔴 *SUPPLY* zone approach (↑)"
 
-    htf_tf  = htf_for(timeframe)
-    htf_lbl = tf_label(htf_tf)
+    trend_lbl = tf_label(trend_tf_for(timeframe))   # weekly when LTF=daily
+    zone_lbl  = tf_label(zone_tf_for(timeframe))    # monthly when LTF=daily
 
     def _htf_zone_line(z: dict | None, ztype: str) -> str:
         if z is None:
@@ -351,10 +401,10 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"Entry line: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
         f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
         f"─────────\n"
-        f"HTF ({htf_lbl}) Trend: {trend_label(htf_trend)}\n"
-        f"{_htf_zone_line(htf_dem, 'Dem')}\n"
-        f"{_htf_zone_line(htf_sup, 'Sup')}\n"
-        f"HTF Position: {htf_status(close_now, htf_dem, htf_sup)}"
+        f"{trend_lbl} Trend: {trend_label(htf_trend)}\n"
+        f"{_htf_zone_line(htf_dem, f'{zone_lbl} Dem')}\n"
+        f"{_htf_zone_line(htf_sup, f'{zone_lbl} Sup')}\n"
+        f"{zone_lbl} Position: {htf_status(close_now, htf_dem, htf_sup)}"
     )
 
 
@@ -367,9 +417,11 @@ def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
     alerts: list[tuple[str, str]] = []
 
     lbl = tf_label(timeframe)
-    htf = htf_for(timeframe)
+    trend_htf = trend_tf_for(timeframe)
+    zone_htf  = zone_tf_for(timeframe)
     print()
-    print(f"━━━━━━ {lbl} scan ({timeframe}, HTF={htf}) ━━━━━━")
+    print(f"━━━━━━ {lbl} scan ({timeframe}, trend HTF={trend_htf}, "
+          f"zone HTF={zone_htf}, strict={STRICT_FILTER}) ━━━━━━")
     print(f"Prev state: {len(state)} entries")
 
     for i, sym in enumerate(symbols, 1):
@@ -411,20 +463,36 @@ def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
             time.sleep(0.1)
             continue
 
-        # Fresh alert(s) — fetch HTF data + trends ONLY now (saves time per run)
+        # Fresh alert(s) — fetch trend-HTF + zone-HTF data ONLY now (saves time per run)
         ltf_trend = compute_trend(df)
-        htf_df = fetch_ohlc(sym, htf)
-        if htf_df is not None:
-            htf_trend = compute_trend(htf_df)
-            htf_zones = detect_zones(htf_df)
+
+        # Trend HTF (one level up: weekly for daily, monthly for weekly)
+        trend_df = fetch_ohlc(sym, trend_htf)
+        htf_trend = compute_trend(trend_df) if trend_df is not None else 0
+
+        # Zone HTF (two levels up per scanner.pine: monthly for daily, quarterly for weekly)
+        # Optimization: if trend_htf == zone_htf, reuse the dataframe
+        if zone_htf == trend_htf:
+            zone_df = trend_df
+        else:
+            zone_df = fetch_ohlc(sym, zone_htf)
+        if zone_df is not None:
+            htf_zones = detect_zones(zone_df)
             htf_dem, htf_sup = htf_zones["demand"], htf_zones["supply"]
         else:
-            htf_trend, htf_dem, htf_sup = 0, None, None
+            htf_dem, htf_sup = None, None
 
+        # Apply strict filter (per user toggle) — drop candidates that fail confluence
+        filtered_candidates = []
         for z in candidates:
+            if zone_key(sym, z) in state:
+                continue
+            if STRICT_FILTER and not passes_strict_filter(z["type"], htf_trend, htf_dem, htf_sup):
+                continue
+            filtered_candidates.append(z)
+
+        for z in filtered_candidates:
             key = zone_key(sym, z)
-            if key in state:
-                continue   # already handled above
             alerts.append((
                 sym,
                 build_alert_msg(sym, z, close_now, timeframe,
@@ -436,9 +504,17 @@ def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
                 "cmp_at_alert":  close_now,
             }
 
-        print(" ".join(f"{c['type'][0].upper()}=" +
-                       ("NEW🔔" if zone_key(sym, c) not in state else "seen")
-                       for c in candidates))
+        # Status line
+        def _tag(c):
+            key = zone_key(sym, c)
+            if key in state:
+                return f"{c['type'][0].upper()}=seen"
+            if STRICT_FILTER and not passes_strict_filter(
+                c["type"], htf_trend, htf_dem, htf_sup
+            ):
+                return f"{c['type'][0].upper()}=filtered"
+            return f"{c['type'][0].upper()}=NEW🔔"
+        print(" ".join(_tag(c) for c in candidates))
         time.sleep(0.1)
 
     state_file.write_text(json.dumps(new_state, indent=2, sort_keys=True))
