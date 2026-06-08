@@ -1,7 +1,22 @@
 {
-  "CRAFTSMAN_demand_8978.0_8613.5": {
-    "cmp_at_alert": 9065.0,
-    "first_alerted": "2026-06-07T21:59:32.205265",
+  "ABFRL_supply_60.4_62.09": {
+    "cmp_at_alert": 59.88999938964844,
+    "first_alerted": "2026-06-08T06:01:30.195290+00:00",
+    "score": 7.0
+  },
+  "BHARTIARTL_supply_1815.0_1835.5": {
+    "cmp_at_alert": 1807.300048828125,
+    "first_alerted": "2026-06-08T06:01:45.619176+00:00",
+    "score": 7.0
+  },
+  "HCLTECH_supply_1166.4_1182.5": {
+    "cmp_at_alert": 1155.5,
+    "first_alerted": "2026-06-08T06:02:24.053687+00:00",
+    "score": 7.0
+  },
+  "INFY_supply_1201.3_1223.8": {
+    "cmp_at_alert": 1195.5,
+    "first_alerted": "2026-06-08T06:02:36.258001+00:00",
     "score": 7.0
   }
 }
