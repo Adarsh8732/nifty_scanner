@@ -40,6 +40,13 @@ SCAN_SUPPLY       = os.environ.get("SCAN_SUPPLY", "true").lower() == "true"
 #                  (or no zone-HTF demand at all)
 STRICT_FILTER     = os.environ.get("STRICT_FILTER", "false").lower() == "true"
 
+# Dhan live-quote credentials (optional). When set + the security-id map is
+# present, the scanner replaces yfinance's 15-min-delayed current bar close
+# with Dhan's real-time LTP. Historical OHLC still comes from yfinance.
+DHAN_TOKEN          = os.environ.get("DHAN_ACCESS_TOKEN", "")
+DHAN_CLIENT_ID      = os.environ.get("DHAN_CLIENT_ID", "")
+DHAN_SECID_FILE     = Path("dhan_security_ids.json")
+
 # State file per timeframe to keep dedupe separate (daily ≠ weekly zones)
 def state_path(tf: str) -> Path:
     return Path(f"state_{tf}.json")
@@ -70,6 +77,14 @@ LEGOUT_MIN_RATIO = 0.8
 MAX_BASE         = 3
 LOOKBACK_BARS    = 50
 MAX_ZONE_TESTS   = 1
+ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles between legin & legout)
+
+# Small-body override: a candle with bodyPct >= BASE_PCT can still qualify as a
+# base if its ABSOLUTE body is tiny compared to both the legout and legin bodies.
+# Catches spike-top reversal candles (doji-like inside fast reversals).
+SMALL_BODY_OVERRIDE      = True
+SMALL_BODY_VS_LEGOUT     = 0.30   # base body must be < 30% of legout body
+SMALL_BODY_VS_LEGIN      = 0.30   # AND < 30% of next-bar (legin candidate) body
 
 
 # ─── TREND (50 SMA slope method, mirrors Pine) ──────────────────────────
@@ -151,6 +166,63 @@ def passes_strict_filter(zone_type: str, trend_htf: int,
     return False
 
 
+# ─── DHAN LIVE LTP (real-time price, replaces yfinance's 15-min delay) ──
+def load_dhan_security_ids() -> dict[str, int]:
+    """Load symbol → security_id map. Returns {} if file missing."""
+    if not DHAN_SECID_FILE.exists():
+        return {}
+    try:
+        return {k: int(v) for k, v in json.loads(DHAN_SECID_FILE.read_text()).items()}
+    except Exception as e:
+        print(f"  Dhan secid map load error: {e}")
+        return {}
+
+
+def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, float]:
+    """Batch-fetch Last Traded Price from Dhan. Returns {symbol: ltp}.
+
+    Dhan API v2 endpoint: POST /v2/marketfeed/ltp
+    Rate limit: 1 req/sec, up to 1000 instruments per request.
+    """
+    if not DHAN_TOKEN or not DHAN_CLIENT_ID or not secid_map:
+        return {}
+
+    # Map symbols → security IDs (skip ones we don't have)
+    sym_to_sid = {s: secid_map[s] for s in symbols if s in secid_map}
+    if not sym_to_sid:
+        return {}
+
+    sec_ids = list(set(sym_to_sid.values()))
+    url     = "https://api.dhan.co/v2/marketfeed/ltp"
+    headers = {
+        "access-token":  DHAN_TOKEN,
+        "client-id":     DHAN_CLIENT_ID,
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+    # Dhan accepts up to 1000 IDs per request; chunk just in case
+    out: dict[str, float] = {}
+    for i in range(0, len(sec_ids), 1000):
+        chunk = sec_ids[i:i + 1000]
+        try:
+            r = requests.post(url, json={"NSE_EQ": chunk},
+                              headers=headers, timeout=15)
+            if not r.ok:
+                print(f"  Dhan LTP HTTP {r.status_code}: {r.text[:200]}")
+                continue
+            data = r.json().get("data", {}).get("NSE_EQ", {})
+            # Invert sid → ltp into sym → ltp using sym_to_sid
+            sid_to_ltp = {int(k): v.get("last_price") for k, v in data.items()
+                          if v.get("last_price")}
+            for sym, sid in sym_to_sid.items():
+                if sid in sid_to_ltp:
+                    out[sym] = float(sid_to_ltp[sid])
+        except Exception as e:
+            print(f"  Dhan LTP exception: {e}")
+        time.sleep(1.1)   # respect 1 req/sec rate limit
+    return out
+
+
 # ─── HELPERS ────────────────────────────────────────────────────────────
 def send_telegram(text: str) -> None:
     """Push a markdown message to your Telegram chat."""
@@ -227,15 +299,31 @@ def detect_zones(df: pd.DataFrame) -> dict:
         if lo_body == 0 or lo_bpct < EXCITE_PCT or not (lo_grn or lo_red):
             continue
 
-        # Walk back through base candles
+        # Walk back through base candles. Each candle qualifies if EITHER:
+        #   (a) standard rule: bodyPct < BASE_PCT, OR
+        #   (b) small-body override: absolute body tiny vs BOTH legout body AND
+        #       the next-bar (legin candidate) body — catches spike-top doji-like
+        #       candles whose body% looks big but body is microscopic in abs terms.
         base_cnt = 0
         ii = start_bar + 1
         b_hb = b_lb = b_hw = b_lw = None
         while base_cnt < MAX_BASE and ii < n - 1:
             c_o, c_h, c_l, c_c = O[ii], H[ii], L[ii], C[ii]
+            c_body = abs(c_c - c_o)
             c_rng  = c_h - c_l
-            c_bpct = abs(c_c - c_o) / c_rng if c_rng > 0 else 0.0
-            if c_bpct < BASE_PCT:
+            c_bpct = c_body / c_rng if c_rng > 0 else 0.0
+
+            qual_std = c_bpct < BASE_PCT
+            qual_ovr = False
+            if not qual_std and SMALL_BODY_OVERRIDE:
+                # Peek at the next candle back (would be legin if walk stops here)
+                cand_legin_body = abs(C[ii + 1] - O[ii + 1])
+                if cand_legin_body > 0 and lo_body > 0:
+                    if (c_body < SMALL_BODY_VS_LEGOUT * lo_body
+                            and c_body < SMALL_BODY_VS_LEGIN * cand_legin_body):
+                        qual_ovr = True
+
+            if qual_std or qual_ovr:
                 bh = max(c_o, c_c); bl = min(c_o, c_c)
                 b_hb = bh if b_hb is None else max(b_hb, bh)
                 b_lb = bl if b_lb is None else min(b_lb, bl)
@@ -246,9 +334,115 @@ def detect_zones(df: pd.DataFrame) -> dict:
             else:
                 break
 
-        if base_cnt < 1 or ii >= n:
+        if ii >= n:
             continue
 
+        # Strength score helper (next-candle after legout) — used by both paths
+        nx_o, nx_h, nx_l, nx_c = O[start_bar - 1], H[start_bar - 1], L[start_bar - 1], C[start_bar - 1]
+        nx_rng  = nx_h - nx_l
+        nx_bpct = abs(nx_c - nx_o) / nx_rng if nx_rng > 0 else 0.0
+
+        # ── Zero-base path (engulfing spike, just legin + legout) ───────
+        # Pine: scanner.pine f_scanZones() "else if allowZeroBase and baseCnt == 0"
+        # Legin is the candle IMMEDIATELY before the legout (start_bar + 1).
+        # DBR engulf (demand): red legin + green legout.
+        # RBD engulf (supply): green legin + red legout.
+        # Time-at-base score is 2.0 (no consolidation needed = best).
+        if base_cnt == 0:
+            if not ALLOW_ZERO_BASE:
+                continue
+            legin_idx = start_bar + 1
+            if legin_idx >= n:
+                continue
+
+            leg2_o = O[legin_idx]
+            leg2_h = H[legin_idx]
+            leg2_l = L[legin_idx]
+            leg2_c = C[legin_idx]
+            leg2_body = abs(leg2_c - leg2_o)
+            leg2_rng  = leg2_h - leg2_l
+            leg2_bpct = leg2_body / leg2_rng if leg2_rng > 0 else 0.0
+
+            zb_demand = leg2_c < leg2_o and lo_grn   # red legin + green legout
+            zb_supply = leg2_c > leg2_o and lo_red   # green legin + red legout
+
+            if not (zb_demand or zb_supply):
+                continue
+            if leg2_body == 0 or leg2_bpct < EXCITE_PCT:
+                continue
+            if lo_body < LEGOUT_MIN_RATIO * leg2_body:
+                continue
+
+            confirm_close = C[start_bar - 1] if start_bar >= 1 else lo_c
+
+            # Demand: prox = max(legin body-low, legout open); dist = lowest wick
+            if zb_demand and SCAN_DEMAND:
+                legin_bdy_high = max(leg2_o, leg2_c)
+                prox = max(min(leg2_o, leg2_c), lo_o)
+                dist = min(leg2_l, lo_l)
+                zone_valid = lo_c > legin_bdy_high or confirm_close > legin_bdy_high
+                if zone_valid and close_now > prox:
+                    valid, tc, was_in = True, 0, False
+                    for v in range(start_bar - 1, -1, -1):
+                        v_low = L[v]
+                        if v_low < dist:
+                            valid = False
+                            break
+                        in_zone = v_low <= prox
+                        if in_zone and not was_in:
+                            tc += 1
+                        was_in = in_zone
+                    if valid and tc <= MAX_ZONE_TESTS:
+                        is_gap  = lo_o > legin_bdy_high
+                        s_score = 2 if is_gap else (2 if nx_bpct >= EXCITE_PCT else 1)
+                        f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
+                        score = f_score + s_score + 2.0   # tScore = 2 (baseCnt=0)
+                        dist_pct = (close_now - prox) / close_now * 100.0
+                        if best_dem is None or dist_pct < best_dem["dist_pct"]:
+                            best_dem = {
+                                "type":      "demand",
+                                "proximal":  float(prox),
+                                "distal":    float(dist),
+                                "score":     float(score),
+                                "tests":     int(tc),
+                                "dist_pct":  float(dist_pct),
+                            }
+
+            # Supply: prox = min(legin body-high, legout open); dist = highest wick
+            if zb_supply and SCAN_SUPPLY:
+                legin_bdy_low = min(leg2_o, leg2_c)
+                prox = min(max(leg2_o, leg2_c), lo_o)
+                dist = max(leg2_h, lo_h)
+                zone_valid = lo_c < legin_bdy_low or confirm_close < legin_bdy_low
+                if zone_valid and close_now < prox:
+                    valid, tc, was_in = True, 0, False
+                    for v in range(start_bar - 1, -1, -1):
+                        v_high = H[v]
+                        if v_high > dist:
+                            valid = False
+                            break
+                        in_zone = v_high >= prox
+                        if in_zone and not was_in:
+                            tc += 1
+                        was_in = in_zone
+                    if valid and tc <= MAX_ZONE_TESTS:
+                        is_gap  = lo_o < legin_bdy_low
+                        s_score = 2 if is_gap else (2 if nx_bpct >= EXCITE_PCT else 1)
+                        f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
+                        score = f_score + s_score + 2.0
+                        dist_pct = (prox - close_now) / close_now * 100.0
+                        if best_sup is None or dist_pct < best_sup["dist_pct"]:
+                            best_sup = {
+                                "type":      "supply",
+                                "proximal":  float(prox),
+                                "distal":    float(dist),
+                                "score":     float(score),
+                                "tests":     int(tc),
+                                "dist_pct":  float(dist_pct),
+                            }
+            continue   # zero-base path complete for this start_bar
+
+        # ── Standard path (1+ base candles) ─────────────────────────────
         # Legin candle
         leg_o, leg_h, leg_l, leg_c = O[ii], H[ii], L[ii], C[ii]
         leg_body = abs(leg_c - leg_o)
@@ -262,14 +456,6 @@ def detect_zones(df: pd.DataFrame) -> dict:
         is_reversal = (lo_grn and legin_red) or (lo_red and legin_grn)
         if is_reversal and lo_body < LEGOUT_MIN_RATIO * leg_body:
             continue
-
-        # Strength score helper (next-candle exciting check)
-        if start_bar >= 1:
-            nx_o, nx_h, nx_l, nx_c = O[start_bar - 1], H[start_bar - 1], L[start_bar - 1], C[start_bar - 1]
-            nx_rng  = nx_h - nx_l
-            nx_bpct = abs(nx_c - nx_o) / nx_rng if nx_rng > 0 else 0.0
-        else:
-            nx_bpct = 0.0
 
         # ─── Demand zone (green legout) ──────────────────────────
         if lo_grn and SCAN_DEMAND:

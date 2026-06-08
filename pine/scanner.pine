@@ -55,6 +55,7 @@ alertSupply   = input.bool(true,  "Alert on supply approach",    group = grpAler
 alertEntryPct = input.float(0.5,  "Entry line % from proximal",  minval = 0.0, maxval = 5.0, step = 0.05, group = grpAlert, tooltip = "Entry line = proximal + this % (demand) / proximal - this % (supply). Alert fires when price crosses this line approaching the zone. Pick 0.05, 0.1, 0.5, 1.0, etc.")
 alertMinScore = input.float(7.0,  "Alert min score",             minval = 0.0, maxval = 7.0, step = 0.5,  group = grpAlert, tooltip = "Only fire alerts for zones whose score >= this value. Independent of the table's score filter. Set 0 to alert on every approach.")
 alertOnlyQualified = input.bool(true, "Apply trend filter to alerts", group = grpAlert, tooltip = "Also require zone trend to match (demand=Uptrend, supply=Downtrend). Score filter is separate (see above).")
+useStrictFilter = input.bool(true, "Strict filter (HTF trend + MTF confluence)", group = grpAlert, tooltip = "Demand alert: requires HTF trend = Up AND price closer to HTF demand zone than HTF supply (or no HTF supply zone). Supply alert: mirror. Same logic as the Python scanner STRICT_FILTER.")
 
 // =============================================================================
 // SYMBOLS  (40 per batch, selected via the Batch dropdown)
@@ -1530,7 +1531,22 @@ if barstate.islast
             if enableAlerts and alertTfOk and alertDemand and inDemNow and not wasInDem
                 scoreOk = dScore >= alertMinScore
                 trendOk = not alertOnlyQualified or passTrend
-                if scoreOk and trendOk
+
+                // Strict filter (port of Python passes_strict_filter):
+                //   HTF trend = Up AND price closer to HTF Demand than HTF Supply
+                //   (or HTF Supply doesn't exist).
+                //   -1.0  = price is INSIDE that HTF zone (most favorable)
+                //   -999.0 = no HTF zone of that type
+                htfTrendV_d = array.get(htfTrends,   i)
+                htfDemD_d   = array.get(htfDemDists, i)
+                htfSupD_d   = array.get(htfSupDists, i)
+                bool htfTrendUp = int(htfTrendV_d) == 1
+                bool demExists  = htfDemD_d == -1.0 or htfDemD_d > 0.0
+                bool supExists  = htfSupD_d == -1.0 or htfSupD_d > 0.0
+                bool demCloser  = htfDemD_d == -1.0 or (htfSupD_d != -1.0 and (not supExists or htfDemD_d < htfSupD_d))
+                bool strictOk   = not useStrictFilter or (htfTrendUp and demExists and demCloser)
+
+                if scoreOk and trendOk and strictOk
                     symStr = array.get(syms, i)
                     msg = symStr + " APPROACHING DEMAND zone | prox: " + str.tostring(math.round(dProx * 100) / 100) + " | score: " + str.tostring(math.round(dScore * 10) / 10)
                     alert(msg, alert.freq_once_per_bar)
@@ -1573,7 +1589,19 @@ if barstate.islast
             if enableAlerts and alertTfOk and alertSupply and inSupNow and not wasInSup
                 scoreOk = sScore >= alertMinScore
                 trendOk = not alertOnlyQualified or passTrend
-                if scoreOk and trendOk
+
+                // Strict filter (mirror of demand): HTF trend = Down AND price
+                // closer to HTF Supply than HTF Demand (or no HTF Demand).
+                htfTrendV_s = array.get(htfTrends,   i)
+                htfDemD_s   = array.get(htfDemDists, i)
+                htfSupD_s   = array.get(htfSupDists, i)
+                bool htfTrendDn  = int(htfTrendV_s) == -1
+                bool sDemExists  = htfDemD_s == -1.0 or htfDemD_s > 0.0
+                bool sSupExists2 = htfSupD_s == -1.0 or htfSupD_s > 0.0
+                bool supCloser   = htfSupD_s == -1.0 or (htfDemD_s != -1.0 and (not sDemExists or htfSupD_s < htfDemD_s))
+                bool strictOk_s  = not useStrictFilter or (htfTrendDn and sSupExists2 and supCloser)
+
+                if scoreOk and trendOk and strictOk_s
                     symStr = array.get(syms, i)
                     msg = symStr + " APPROACHING SUPPLY zone | prox: " + str.tostring(math.round(sProx * 100) / 100) + " | score: " + str.tostring(math.round(sScore * 10) / 10)
                     alert(msg, alert.freq_once_per_bar)
