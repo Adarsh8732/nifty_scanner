@@ -2,11 +2,10 @@ name: Nifty Zone Scanner (Live)
 
 on:
   schedule:
-    # TEMPORARY TEST CRON: every 5 min, all hours, all days.
-    # Used to verify the cron mechanism works at all on this repo.
-    # AFTER CONFIRMING SCHEDULED RUNS APPEAR IN THE ACTIONS TAB:
-    #   revert this to '*/10 4-10 * * 1-5' for NSE-hours-only operation.
-    - cron: '*/5 * * * *'
+    # TEST CRON: non-round minutes to avoid GitHub's global cron dedup.
+    # */5 and */10 on the round minute get heavily throttled on free public repos.
+    # 7,17,27,37,47,57 fires every 10 min at offset minutes — much higher success rate.
+    - cron: '7,17,27,37,47,57 * * * *'
   workflow_dispatch:   # manual "Run workflow" button
 
 permissions:
