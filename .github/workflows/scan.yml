@@ -2,12 +2,11 @@ name: Nifty Zone Scanner (Live)
 
 on:
   schedule:
-    # Run every 10 min during NSE market hours, Mon-Fri.
-    # NSE trades 9:15 AM - 3:30 PM IST = 3:45 - 10:00 UTC.
-    # We cover 4:00 - 10:50 UTC (9:30 AM - 4:20 PM IST) to catch open and close.
-    # NOTE: GitHub Actions cron has 5-15 min latency under load.
-    # NOTE: PUBLIC repo gives unlimited compute minutes (free).
-    - cron: '*/10 4-10 * * 1-5'
+    # TEMPORARY TEST CRON: every 5 min, all hours, all days.
+    # Used to verify the cron mechanism works at all on this repo.
+    # AFTER CONFIRMING SCHEDULED RUNS APPEAR IN THE ACTIONS TAB:
+    #   revert this to '*/10 4-10 * * 1-5' for NSE-hours-only operation.
+    - cron: '*/5 * * * *'
   workflow_dispatch:   # manual "Run workflow" button
 
 permissions:
