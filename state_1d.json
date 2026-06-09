@@ -1,7 +1,17 @@
 {
-  "BANKBARODA_demand_257.47_252.63": {
-    "cmp_at_alert": 259.25,
-    "first_alerted": "2026-06-08T17:38:34.787516+00:00",
+  "CHAMBLFERT_supply_458.5_470.0": {
+    "cmp_at_alert": 454.29998779296875,
+    "first_alerted": "2026-06-09T08:01:08.556812+00:00",
+    "score": 7.0
+  },
+  "IREDA_supply_123.43_125.67": {
+    "cmp_at_alert": 122.55000305175781,
+    "first_alerted": "2026-06-09T09:41:37.091398+00:00",
+    "score": 7.0
+  },
+  "SBICARD_supply_589.5_597.05": {
+    "cmp_at_alert": 584.0999755859375,
+    "first_alerted": "2026-06-09T09:12:55.325321+00:00",
     "score": 7.0
   }
 }
