@@ -1,9 +1,4 @@
 {
-  "CHAMBLFERT_supply_458.5_470.0": {
-    "cmp_at_alert": 454.79998779296875,
-    "first_alerted": "2026-06-09T07:21:15.083860+00:00",
-    "score": 7.0
-  },
   "GRANULES_demand_758.5_752.55": {
     "cmp_at_alert": 762.5,
     "first_alerted": "2026-06-09T07:21:52.985920+00:00",
