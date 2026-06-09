@@ -1,4 +1,9 @@
 {
+  "CHAMBLFERT_supply_458.5_470.0": {
+    "cmp_at_alert": 454.1499938964844,
+    "first_alerted": "2026-06-09T07:01:14.786436+00:00",
+    "score": 7.0
+  },
   "HINDPETRO_supply_382.8_390.9": {
     "cmp_at_alert": 379.20001220703125,
     "first_alerted": "2026-06-09T06:21:30.187352+00:00",
