@@ -1,9 +1,28 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
-.env
+
+# Editors
 .idea/
 .vscode/
+
+# Logs
 *.log
+
+# === Secrets / credentials (extra safety net) ===
+# Never commit any file with these patterns. Secrets live ONLY in GitHub
+# Actions repository secrets, never on disk.
+.env
+.env.*
+*.token
+*.secret
+*.pem
+*.key
+credentials.*
+secrets.*
+*_token.json
+*_secrets.json
+config.local.*

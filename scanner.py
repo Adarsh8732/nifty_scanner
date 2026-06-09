@@ -208,7 +208,8 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
             r = requests.post(url, json={"NSE_EQ": chunk},
                               headers=headers, timeout=15)
             if not r.ok:
-                print(f"  Dhan LTP HTTP {r.status_code}: {r.text[:200]}")
+                # Don't log r.text — Dhan errors may echo headers or token snippets.
+                print(f"  Dhan LTP failed: HTTP {r.status_code} (body redacted)")
                 continue
             data = r.json().get("data", {}).get("NSE_EQ", {})
             # Invert sid → ltp into sym → ltp using sym_to_sid
@@ -237,7 +238,9 @@ def send_telegram(text: str) -> None:
             timeout=10,
         )
         if not r.ok:
-            print(f"  TG error {r.status_code}: {r.text[:200]}")
+            # Telegram URL contains the bot token; don't log response body
+            # which may include the request URL or token snippets.
+            print(f"  TG failed: HTTP {r.status_code} (body redacted)")
     except Exception as e:
         print(f"  TG exception: {e}")
 
@@ -265,6 +268,51 @@ def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
     except Exception as e:
         print(f"  fetch error: {e}")
         return None
+
+
+def fetch_ohlc_batch(symbols: list[str], timeframe: str,
+                     chunk_size: int = 100) -> dict[str, pd.DataFrame]:
+    """Batch-fetch OHLC for many symbols at once. Returns {symbol: DataFrame}.
+
+    yfinance accepts a list of tickers and fetches them in parallel internally.
+    Much faster than sequential fetch_ohlc per symbol — typical 500-stock scan
+    drops from ~4 min to ~30-60 sec.
+
+    Chunks of 100 to handle individual ticker failures without losing the whole
+    batch. Failed tickers are silently dropped (not in the returned dict).
+    """
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), chunk_size):
+        chunk_syms = symbols[i:i + chunk_size]
+        yf_chunk = [s + ".NS" for s in chunk_syms]
+        try:
+            all_df = yf.download(
+                yf_chunk,
+                period=period_for(timeframe), interval=timeframe,
+                progress=False, auto_adjust=True, actions=False,
+                threads=True, group_by="ticker",
+            )
+        except Exception as e:
+            print(f"  batch chunk {i//chunk_size} error: {e}")
+            continue
+
+        for sym, yf_sym in zip(chunk_syms, yf_chunk):
+            try:
+                # When only one ticker is in the batch, columns are flat
+                df = all_df[yf_sym] if len(yf_chunk) > 1 else all_df
+            except (KeyError, IndexError):
+                continue
+            if df is None or df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            try:
+                df = df[["Open", "High", "Low", "Close"]].dropna()
+            except KeyError:
+                continue
+            if len(df) >= 20:
+                out[sym] = df
+    return out
 
 
 # ─── ZONE DETECTION (Pine port) ─────────────────────────────────────────
@@ -595,27 +643,52 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
 
 
 # ─── MAIN ───────────────────────────────────────────────────────────────
-def scan_one_tf(timeframe: str, symbols: list[str]) -> list[tuple[str, str]]:
-    """Scan all symbols for one timeframe. Returns list of (sym, msg) alerts."""
+def scan_one_tf(timeframe: str, symbols: list[str],
+                live_ltps: dict[str, float] | None = None) -> list[tuple[str, str]]:
+    """Scan all symbols for one timeframe. Returns list of (sym, msg) alerts.
+
+    If live_ltps is supplied (Dhan real-time prices), the in-progress bar's
+    close/high/low is overridden with the live price before zone detection.
+    Historical OHLC bars come from yfinance regardless.
+    """
     state_file = state_path(timeframe)
     state = json.loads(state_file.read_text()) if state_file.exists() else {}
     new_state: dict = {}
     alerts: list[tuple[str, str]] = []
+    live_ltps = live_ltps or {}
 
     lbl = tf_label(timeframe)
     trend_htf = trend_tf_for(timeframe)
     zone_htf  = zone_tf_for(timeframe)
     print()
     print(f"━━━━━━ {lbl} scan ({timeframe}, trend HTF={trend_htf}, "
-          f"zone HTF={zone_htf}, strict={STRICT_FILTER}) ━━━━━━")
+          f"zone HTF={zone_htf}, strict={STRICT_FILTER}, "
+          f"live={'on' if live_ltps else 'off'}) ━━━━━━")
     print(f"Prev state: {len(state)} entries")
+
+    # Batch-fetch OHLC for the whole universe at once (parallelized internally
+    # by yfinance). Drops scan time from ~4 min to ~30-60 sec for 500 stocks.
+    print(f"Batch-fetching {len(symbols)} symbols at {timeframe}...", flush=True)
+    t0 = time.time()
+    ohlc_dict = fetch_ohlc_batch(symbols, timeframe)
+    print(f"  got {len(ohlc_dict)} DataFrames in {time.time() - t0:.1f}s")
 
     for i, sym in enumerate(symbols, 1):
         print(f"[{lbl[:3]} {i:3}/{len(symbols)}] {sym:14}", end=" ", flush=True)
-        df = fetch_ohlc(sym, timeframe)
+        df = ohlc_dict.get(sym)
         if df is None:
             print("skip")
             continue
+
+        # Override the in-progress bar's close with Dhan's live LTP (if available).
+        # Historical bars (past closed days) are untouched. This makes the
+        # current_close = real-time price, so entry-line crossings detect
+        # within seconds instead of yfinance's 15-25 min delay.
+        ltp = live_ltps.get(sym)
+        if ltp is not None and ltp > 0:
+            df.iloc[-1, df.columns.get_loc("Close")] = ltp
+            df.iloc[-1, df.columns.get_loc("High")]  = max(df["High"].iloc[-1], ltp)
+            df.iloc[-1, df.columns.get_loc("Low")]   = min(df["Low"].iloc[-1], ltp)
 
         close_now = float(df["Close"].iloc[-1])
         zones = detect_zones(df)
@@ -716,9 +789,23 @@ def main() -> int:
     print(f"Entry pct:  {ALERT_ENTRY_PCT}%")
     print(f"Min score:  {ALERT_MIN_SCORE}")
 
+    # Fetch live LTPs once from Dhan (used by both timeframes for current bar)
+    secid_map = load_dhan_security_ids()
+    live_ltps: dict[str, float] = {}
+    if DHAN_TOKEN and DHAN_CLIENT_ID and secid_map:
+        print(f"Dhan live: fetching LTPs for {len(secid_map)} mapped symbols...")
+        live_ltps = fetch_dhan_ltps(symbols, secid_map)
+        print(f"  got {len(live_ltps)} live prices")
+    else:
+        missing = []
+        if not DHAN_TOKEN:     missing.append("DHAN_ACCESS_TOKEN")
+        if not DHAN_CLIENT_ID: missing.append("DHAN_CLIENT_ID")
+        if not secid_map:      missing.append("dhan_security_ids.json")
+        print(f"Dhan live: OFF (missing: {', '.join(missing)}). Using yfinance closes.")
+
     all_alerts: list[tuple[str, str]] = []
     for tf in TIMEFRAMES:
-        all_alerts.extend(scan_one_tf(tf, symbols))
+        all_alerts.extend(scan_one_tf(tf, symbols, live_ltps))
 
     print()
     print(f"━━━ Alerts to send: {len(all_alerts)} ━━━")

@@ -33,13 +33,15 @@ jobs:
 
       - name: Run scanner
         env:
-          TG_TOKEN:        ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
-          TIMEFRAMES:      '1d,1wk'    # both Daily and Weekly zones
-          ALERT_ENTRY_PCT: '1.0'        # entry line = proximal +/- 1%
-          ALERT_MIN_SCORE: '7.0'
-          STRICT_FILTER:   'true'       # demand: trend HTF up + price closer to zone HTF demand
-                                        # supply: trend HTF down + price closer to zone HTF supply
+          TG_TOKEN:           ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+          DHAN_ACCESS_TOKEN:  ${{ secrets.DHAN_ACCESS_TOKEN }}
+          DHAN_CLIENT_ID:     ${{ secrets.DHAN_CLIENT_ID }}
+          TIMEFRAMES:         '1d,1wk'    # both Daily and Weekly zones
+          ALERT_ENTRY_PCT:    '1.0'        # entry line = proximal +/- 1%
+          ALERT_MIN_SCORE:    '7.0'
+          STRICT_FILTER:      'true'       # demand: trend HTF up + price closer to zone HTF demand
+                                           # supply: trend HTF down + price closer to zone HTF supply
         run: python scanner.py
 
       - name: Commit updated state

@@ -1,0 +1,44 @@
+name: Refresh Dhan Token
+
+# Triggered by cron-job.org POST once a day before market open (8:55 AM IST).
+# GitHub's native cron is unreliable on free public repos, so we rely on
+# cron-job.org (same external trigger we use for the main scanner).
+# Manual "Run workflow" button also works for one-off testing.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read   # minimum: needed for actions/checkout to clone code.
+                   # Secrets API calls use GH_REPO_PAT exclusively
+                   # (GITHUB_TOKEN cannot write secrets even with full perms).
+
+concurrency:
+  group: refresh-dhan
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyotp PyNaCl requests
+
+      - name: Refresh token
+        env:
+          DHAN_CLIENT_ID:   ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PIN:         ${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET: ${{ secrets.DHAN_TOTP_SECRET }}
+          GH_REPO_PAT:      ${{ secrets.GH_REPO_PAT }}
+          GH_OWNER:         ${{ github.repository_owner }}
+          GH_REPO:          ${{ github.event.repository.name }}
+        run: python refresh_dhan_token.py
