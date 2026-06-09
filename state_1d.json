@@ -8,5 +8,10 @@
     "cmp_at_alert": 762.5,
     "first_alerted": "2026-06-09T07:21:52.985920+00:00",
     "score": 7.0
+  },
+  "KIRLOSENG_demand_1830.0_1821.9": {
+    "cmp_at_alert": 1846.5,
+    "first_alerted": "2026-06-09T07:31:54.651000+00:00",
+    "score": 7.0
   }
 }
