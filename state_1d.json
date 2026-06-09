@@ -9,14 +9,14 @@
     "first_alerted": "2026-06-09T09:41:37.091398+00:00",
     "score": 7.0
   },
+  "JSWINFRA_supply_286.95_295.8": {
+    "cmp_at_alert": 284.5,
+    "first_alerted": "2026-06-09T09:52:24.258587+00:00",
+    "score": 7.0
+  },
   "JUBLFOOD_supply_427.2_437.4": {
     "cmp_at_alert": 423.79998779296875,
     "first_alerted": "2026-06-09T09:41:46.557590+00:00",
-    "score": 7.0
-  },
-  "PRESTIGE_supply_1368.9_1409.5": {
-    "cmp_at_alert": 1356.699951171875,
-    "first_alerted": "2026-06-09T09:42:19.095940+00:00",
     "score": 7.0
   },
   "SBICARD_supply_589.5_597.05": {
