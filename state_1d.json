@@ -1,7 +1,7 @@
 {
-  "KIRLOSENG_demand_1830.0_1821.9": {
-    "cmp_at_alert": 1845.5,
-    "first_alerted": "2026-06-09T05:51:49.667259+00:00",
+  "HINDPETRO_supply_382.8_390.9": {
+    "cmp_at_alert": 379.20001220703125,
+    "first_alerted": "2026-06-09T06:21:30.187352+00:00",
     "score": 7.0
   }
 }
