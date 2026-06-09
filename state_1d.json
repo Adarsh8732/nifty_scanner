@@ -1,7 +1,7 @@
 {
-  "CRAFTSMAN_demand_8978.0_8613.5": {
-    "cmp_at_alert": 9065.0,
-    "first_alerted": "2026-06-08T19:02:12.224282+00:00",
+  "HDFCLIFE_supply_572.85_590.0": {
+    "cmp_at_alert": 570.7999877929688,
+    "first_alerted": "2026-06-09T04:01:43.322322+00:00",
     "score": 7.0
   }
 }
