@@ -45,8 +45,6 @@ jobs:
           TF_125M_CLOSENESS_PCT: '0.30'           # 30% rule for 125m / Weekly confluence
           POLL_SECONDS:         '30'             # Dhan LTP poll cadence
           CACHE_REFRESH_MINS:   '60'             # yfinance refresh interval
-          END_HOUR_IST:         '15'             # session ends at 15:15 IST
-          END_MINUTE_IST:       '15'
           PYTHONUNBUFFERED:     '1'              # stream stdout in real-time (no buffering)
         run: python -u loop_scan.py
 

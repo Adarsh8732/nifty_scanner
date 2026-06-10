@@ -41,8 +41,9 @@ from symbols import ALL_SYMBOLS
 IST                  = timezone(timedelta(hours=5, minutes=30))
 POLL_SECONDS         = int(os.environ.get("POLL_SECONDS",   "30"))   # how often to fetch Dhan LTPs
 CACHE_REFRESH_MINS   = int(os.environ.get("CACHE_REFRESH_MINS", "60"))  # refresh yfinance every N min
-END_HOUR_IST         = int(os.environ.get("END_HOUR_IST",   "15"))   # session end hour (24h)
-END_MINUTE_IST       = int(os.environ.get("END_MINUTE_IST", "15"))   # session end minute
+# Session naturally ends when GitHub Actions kills the job at its
+# timeout-minutes limit (360 min = 6 h). The SIGTERM handler below
+# catches the kill signal and saves state cleanly before exit.
 
 
 def now_ist() -> datetime:
@@ -193,12 +194,7 @@ def main() -> int:
     print(f"Timeframes:     {', '.join(TIMEFRAMES)}")
     print(f"Poll cadence:   {POLL_SECONDS}s")
     print(f"Cache refresh:  every {CACHE_REFRESH_MINS} min")
-    print(f"Session ends:   {END_HOUR_IST:02d}:{END_MINUTE_IST:02d} IST")
-
-    # End-of-session time (today)
-    end_time = now_ist().replace(
-        hour=END_HOUR_IST, minute=END_MINUTE_IST, second=0, microsecond=0
-    )
+    print(f"Session ends:   when GitHub Actions kills the job at its 6h limit")
 
     # Initial setup
     print(f"\n[{now_ist()}] Loading Dhan security IDs + initial caches...")
@@ -218,7 +214,7 @@ def main() -> int:
     total_alerts_sent = 0
     iteration = 0
 
-    while now_ist() < end_time and not graceful.requested:
+    while not graceful.requested:
         iteration += 1
         loop_start = time.time()
 
@@ -248,7 +244,7 @@ def main() -> int:
 
         # Sleep, accounting for processing time. Wake early if exit requested.
         sleep_left = max(0.0, POLL_SECONDS - loop_time)
-        while sleep_left > 0 and not graceful.requested and now_ist() < end_time:
+        while sleep_left > 0 and not graceful.requested:
             chunk = min(1.0, sleep_left)
             time.sleep(chunk)
             sleep_left -= chunk
