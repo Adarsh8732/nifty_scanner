@@ -66,7 +66,13 @@ def generate_dhan_token() -> str:
         raise RuntimeError(f"Dhan auth: non-JSON response (HTTP {r.status_code})")
     token = data.get("accessToken")
     if not token:
-        raise RuntimeError("Dhan auth: response had no accessToken (body redacted)")
+        # DEBUG (temporary): show Dhan's error to identify rate-limit vs auth issue.
+        # Dhan's error responses do NOT echo credentials — safe to log briefly.
+        status = data.get("status", "?")
+        err   = data.get("data", "?")
+        raise RuntimeError(
+            f"Dhan auth: no accessToken | status={status} | dhan_response={err}"
+        )
     expiry = data.get("expiryTime", "unknown")
     print(f"  ✓ Got token ({len(token)} chars), expires: {expiry}")
     return token
