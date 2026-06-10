@@ -52,15 +52,24 @@ def state_path(tf: str) -> Path:
     return Path(f"state_{tf}.json")
 
 def period_for(tf: str) -> str:
-    return {"1d": "1y", "1wk": "5y", "1mo": "10y", "3mo": "15y"}.get(tf, "5y")
+    return {
+        "5m": "60d", "125m": "60d",        # intraday: yfinance max history is 60 days
+        "1d": "1y", "1wk": "5y", "1mo": "10y", "3mo": "15y"
+    }.get(tf, "5y")
 
 def trend_tf_for(tf: str) -> str:
-    """HTF used for trend (one level up): mirrors scanner.pine htfTrendDir."""
-    return {"1d": "1wk", "1wk": "1mo"}.get(tf, tf)
+    """HTF used for trend (one level up): mirrors scanner.pine htfTrendDir.
+
+    For 125m: trend uses Daily.
+    """
+    return {"125m": "1d", "1d": "1wk", "1wk": "1mo"}.get(tf, tf)
 
 def zone_tf_for(tf: str) -> str:
-    """HTF used for confluence zones (two levels up): mirrors scanner.pine htfDP/htfSP."""
-    return {"1d": "1mo", "1wk": "3mo"}.get(tf, tf)
+    """HTF used for confluence zones (two levels up): mirrors scanner.pine htfDP/htfSP.
+
+    For 125m: zones use Weekly.
+    """
+    return {"125m": "1wk", "1d": "1mo", "1wk": "3mo"}.get(tf, tf)
 
 # Backwards-compat: legacy callers used htf_for() expecting ONE HTF.
 # Default to the zone HTF since that's what richer alert messages show.
@@ -68,7 +77,10 @@ def htf_for(tf: str) -> str:
     return zone_tf_for(tf)
 
 def tf_label(tf: str) -> str:
-    return {"1d": "Daily", "1wk": "Weekly", "1mo": "Monthly", "3mo": "Quarterly"}.get(tf, tf)
+    return {
+        "5m": "5-min", "125m": "125-min",
+        "1d": "Daily", "1wk": "Weekly", "1mo": "Monthly", "3mo": "Quarterly"
+    }.get(tf, tf)
 
 # Detection params (match Pine defaults)
 BASE_PCT         = 0.50
@@ -162,6 +174,66 @@ def passes_strict_filter(zone_type: str, trend_htf: int,
         if zone_dem is None:
             return True
         return zone_sup["dist_pct"] < zone_dem["dist_pct"]
+
+    return False
+
+
+# 30% threshold of the inter-zone gap. Configurable via env if needed.
+TF_125M_CLOSENESS_PCT = float(os.environ.get("TF_125M_CLOSENESS_PCT", "0.30"))
+
+
+def passes_125m_strict_filter(zone_type: str,
+                              ltf_zone: dict,
+                              trend_htf_daily: int,
+                              w_dem: dict | None,
+                              w_sup: dict | None,
+                              w_score_threshold: float = 7.0) -> bool:
+    """Stricter filter applied to 125-min alert candidates.
+
+    Demand passes when ALL true:
+      - Daily trend is Up
+      - Weekly Demand zone exists AND score >= 7
+      - Either (W supply doesn't exist)  OR  (125m prox within [W_dem_dist, W_dem_prox + 30% × gap])
+        where gap = W_sup_prox - W_dem_prox.
+
+    Supply passes when ALL true (mirror):
+      - Daily trend is Down
+      - Weekly Supply zone exists AND score >= 7
+      - Either (W demand doesn't exist)  OR  (125m prox within [W_sup_prox - 30% × gap, W_sup_dist])
+
+    Note: the 125m zone score check (>=7) is done OUTSIDE this function via
+    the standard ALERT_MIN_SCORE gate.
+    """
+    if zone_type == "demand":
+        if trend_htf_daily != 1:
+            return False
+        if w_dem is None or w_dem.get("score", 0.0) < w_score_threshold:
+            return False
+        # If no W supply reference, skip closeness — just trend + W demand score is enough
+        if w_sup is None:
+            return True
+        gap = w_sup["proximal"] - w_dem["proximal"]
+        if gap <= 0:
+            return False
+        threshold = TF_125M_CLOSENESS_PCT * gap
+        lo = w_dem["distal"]
+        hi = w_dem["proximal"] + threshold
+        return lo <= ltf_zone["proximal"] <= hi
+
+    if zone_type == "supply":
+        if trend_htf_daily != -1:
+            return False
+        if w_sup is None or w_sup.get("score", 0.0) < w_score_threshold:
+            return False
+        if w_dem is None:
+            return True
+        gap = w_sup["proximal"] - w_dem["proximal"]
+        if gap <= 0:
+            return False
+        threshold = TF_125M_CLOSENESS_PCT * gap
+        lo = w_sup["proximal"] - threshold
+        hi = w_sup["distal"]
+        return lo <= ltf_zone["proximal"] <= hi
 
     return False
 
@@ -270,17 +342,85 @@ def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
         return None
 
 
+def aggregate_to_125m(df_5m: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate 5-min bars to 125-min bars, NSE-session-aligned.
+
+    NSE trades 9:15 AM - 3:30 PM IST = 375 min = exactly 3 × 125-min bars per day:
+        Bar 1:  9:15 -> 11:20
+        Bar 2: 11:20 -> 13:25
+        Bar 3: 13:25 -> 15:30
+
+    Uses bar start time as the anchor (first 5m bar of each 125m window starts
+    at minute = 0, 25, or 50 within the window). We bucket by absolute-minute
+    offset from each session's first bar (9:15 IST).
+    """
+    if df_5m is None or df_5m.empty:
+        return pd.DataFrame()
+
+    # yfinance returns intraday data with timezone-aware index (Asia/Calcutta).
+    # If naive, assume IST.
+    idx = df_5m.index
+    if getattr(idx, "tz", None) is None:
+        try:
+            df_5m = df_5m.tz_localize("Asia/Kolkata")
+            idx = df_5m.index
+        except Exception:
+            pass
+    elif str(idx.tz) != "Asia/Kolkata":
+        try:
+            df_5m = df_5m.tz_convert("Asia/Kolkata")
+            idx = df_5m.index
+        except Exception:
+            pass
+
+    # Minutes since 9:15 AM IST of each bar's date
+    session_start_min = 9 * 60 + 15        # 555
+    minute_of_day = idx.hour * 60 + idx.minute
+    minutes_from_open = minute_of_day - session_start_min
+    bucket = (minutes_from_open // 125).astype("int64")   # 0, 1, or 2
+
+    # Group key: (calendar date, bucket index 0/1/2)
+    date_key = idx.tz_convert("Asia/Kolkata").date if hasattr(idx, "tz_convert") else idx.date
+    # Build the key array
+    keys = pd.MultiIndex.from_arrays(
+        [pd.Index([d for d in date_key]), bucket],
+        names=["date", "bucket"],
+    )
+
+    grouped = df_5m.groupby(keys)
+    agg = grouped.agg(
+        Open=("Open",  "first"),
+        High=("High",  "max"),
+        Low =("Low",   "min"),
+        Close=("Close","last"),
+    ).dropna()
+    # Index by the first 5-min bar timestamp of each bucket for clarity
+    starts = grouped.apply(lambda g: g.index[0])
+    agg.index = pd.DatetimeIndex(starts.values).tz_localize(None)
+    agg = agg.sort_index()
+    return agg
+
+
 def fetch_ohlc_batch(symbols: list[str], timeframe: str,
                      chunk_size: int = 100) -> dict[str, pd.DataFrame]:
     """Batch-fetch OHLC for many symbols at once. Returns {symbol: DataFrame}.
 
     yfinance accepts a list of tickers and fetches them in parallel internally.
-    Much faster than sequential fetch_ohlc per symbol — typical 500-stock scan
-    drops from ~4 min to ~30-60 sec.
+    For "125m" we fetch 5m and aggregate (yfinance has no native 125m interval).
 
     Chunks of 100 to handle individual ticker failures without losing the whole
     batch. Failed tickers are silently dropped (not in the returned dict).
     """
+    # 125m has no native yfinance interval — fetch 5m, aggregate to 125m
+    if timeframe == "125m":
+        raw_5m = fetch_ohlc_batch(symbols, "5m", chunk_size)
+        out: dict[str, pd.DataFrame] = {}
+        for sym, df in raw_5m.items():
+            agg = aggregate_to_125m(df)
+            if len(agg) >= 20:
+                out[sym] = agg
+        return out
+
     out: dict[str, pd.DataFrame] = {}
     for i in range(0, len(symbols), chunk_size):
         chunk_syms = symbols[i:i + chunk_size]

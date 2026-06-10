@@ -25,6 +25,7 @@ import pandas as pd
 from scanner import (
     # Detection + filters
     detect_zones, compute_trend, htf_status, passes_strict_filter,
+    passes_125m_strict_filter,
     is_approaching, zone_key, build_alert_msg,
     # Fetching
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
@@ -143,8 +144,20 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 if STRICT_FILTER:
                     trend_htf = htf_cache.get_trend(sym, trend_tf_for(tf))
                     htf_z     = htf_cache.get_zones(sym, zone_tf_for(tf))
-                    if not passes_strict_filter(z["type"], trend_htf, htf_z["demand"], htf_z["supply"]):
-                        continue
+
+                    if tf == "125m":
+                        # Custom 30%-closeness rule + W zone score >= 7
+                        if not passes_125m_strict_filter(
+                            z["type"], z, trend_htf,
+                            htf_z["demand"], htf_z["supply"],
+                            w_score_threshold=ALERT_MIN_SCORE,
+                        ):
+                            continue
+                    else:
+                        # Existing rule for 1d/1wk: closer HTF + matching trend
+                        if not passes_strict_filter(z["type"], trend_htf,
+                                                    htf_z["demand"], htf_z["supply"]):
+                            continue
                 else:
                     trend_htf = 0
                     htf_z     = {"demand": None, "supply": None}
