@@ -46,7 +46,8 @@ jobs:
           CACHE_REFRESH_MINS: '60'      # yfinance refresh interval
           END_HOUR_IST:       '15'      # session ends at 15:15 IST
           END_MINUTE_IST:     '15'
-        run: python loop_scan.py
+          PYTHONUNBUFFERED:   '1'       # stream stdout in real-time (no buffering)
+        run: python -u loop_scan.py
 
       - name: Commit updated state
         if: always()                # commit state even if scanner exited via SIGTERM
