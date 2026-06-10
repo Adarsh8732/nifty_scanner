@@ -1,15 +1,16 @@
 name: Nifty Zone Scanner (Live)
 
+# Triggered ONCE per trading day by cron-job.org at 9:14 AM IST.
+# Runs an internal infinite loop for ~6 hours, polling Dhan LTPs every 30 sec.
+# Ends gracefully at 3:15 PM IST (well within GitHub's 6-hour job limit).
+
 on:
-  # Scheduling is handled by an EXTERNAL service (cron-job.org) that POSTs to
-  # the workflow_dispatch endpoint on a real schedule. GitHub Actions' own
-  # cron is unreliable on free public repos, so it's removed here.
   workflow_dispatch:
 
 permissions:
-  contents: write      # needed to commit updated state.json back to repo
+  contents: write      # needed to commit state_*.json at end of session
 
-# Cancel an in-progress run if a new one is queued (avoids overlap)
+# Only one session in flight at a time; new triggers wait for current to finish
 concurrency:
   group: scanner
   cancel-in-progress: false
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 9   # safety net; should never exceed the 10-min window
+    timeout-minutes: 360       # 6 h hard ceiling — GitHub kills after this
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,23 +32,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Run scanner loop
         env:
           TG_TOKEN:           ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
           DHAN_ACCESS_TOKEN:  ${{ secrets.DHAN_ACCESS_TOKEN }}
           DHAN_CLIENT_ID:     ${{ secrets.DHAN_CLIENT_ID }}
-          TIMEFRAMES:         '1d,1wk'    # both Daily and Weekly zones
-          ALERT_ENTRY_PCT:    '1.0'        # entry line = proximal +/- 1%
+          TIMEFRAMES:         '1d,1wk'
+          ALERT_ENTRY_PCT:    '1.0'
           ALERT_MIN_SCORE:    '7.0'
-          STRICT_FILTER:      'true'       # demand: trend HTF up + price closer to zone HTF demand
-                                           # supply: trend HTF down + price closer to zone HTF supply
-        run: python scanner.py
+          STRICT_FILTER:      'true'
+          POLL_SECONDS:       '30'      # Dhan LTP poll cadence
+          CACHE_REFRESH_MINS: '60'      # yfinance refresh interval
+          END_HOUR_IST:       '15'      # session ends at 15:15 IST
+          END_MINUTE_IST:     '15'
+        run: python loop_scan.py
 
       - name: Commit updated state
+        if: always()                # commit state even if scanner exited via SIGTERM
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state_*.json
-          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git diff --cached --quiet || git commit -m "loop scan: update state [skip ci]"
           git push || echo "nothing to push"
