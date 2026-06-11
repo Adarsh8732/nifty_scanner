@@ -572,7 +572,14 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
     payload = {
         "systemInstruction": {"parts": [{"text": IDEAL_SYSTEM_PROMPT}]},
         "contents":          [{"parts": [{"text": user_prompt}]}],
-        "generationConfig":  {"temperature": 0.4, "maxOutputTokens": 350},
+        "generationConfig":  {
+            "temperature":     0.4,
+            "maxOutputTokens": 600,
+            # Gemini 2.5 models reserve some output tokens for internal
+            # "thinking". Disable thinking so the budget goes entirely to
+            # the visible trade thesis. Ignored by 2.0/older models.
+            "thinkingConfig":  {"thinkingBudget": 0},
+        },
     }
     try:
         r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
@@ -608,24 +615,44 @@ def send_telegram(text: str) -> None:
         print(f"  TG exception: {e}")
 
 
+def _drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter out yfinance placeholder bars for NSE holidays / weekends.
+
+    yfinance fills non-trading days with prev_close as O=H=L=C and Volume=0.
+    These phantom bars get treated as valid base candles by detect_zones
+    (zero range → body% = 0 → qualifies as base), creating fake zones.
+
+    A real NSE trading bar always has Volume > 0. We use that as the filter.
+    """
+    if "Volume" in df.columns:
+        df = df[df["Volume"] > 0]
+    return df
+
+
 def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
     """Fetch OHLC for an NSE symbol at the given timeframe. None on failure.
 
-    auto_adjust=True → split-adjusted OHLC (clean for zone detection).
-    actions=False    → skip dividends/splits events (avoids yfinance
-                       "Dividends out-of-range" crash on weekly fetches).
+    auto_adjust=False → RAW unadjusted OHLC, matches TradingView and broker
+                        terminals exactly. (auto_adjust=True back-shifts
+                        historical bars by dividend amount → zone prices
+                        diverge from chart by ~div_amount.)
+    actions=False     → skip dividends/splits events (avoids yfinance
+                        "Dividends out-of-range" crash on weekly fetches).
+    Volume filter     → strip phantom bars (NSE holidays/weekends where
+                        yfinance fills O=H=L=C with prev close, Volume=0).
     """
     yf_sym = symbol + ".NS"
     try:
         df = yf.download(
             yf_sym, period=period_for(timeframe), interval=timeframe,
-            progress=False, auto_adjust=True, actions=False, threads=False,
+            progress=False, auto_adjust=False, actions=False, threads=False,
         )
         if df is None or df.empty:
             return None
         # Flatten multi-level columns if yfinance returned them
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        df = _drop_phantom_bars(df)
         df = df[["Open", "High", "Low", "Close"]].dropna()
         return df if len(df) >= 20 else None
     except Exception as e:
@@ -724,7 +751,7 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
             all_df = yf.download(
                 yf_chunk,
                 period=period_for(timeframe), interval=timeframe,
-                progress=False, auto_adjust=True, actions=False,
+                progress=False, auto_adjust=False, actions=False,
                 threads=True, group_by="ticker",
             )
         except Exception as e:
@@ -741,6 +768,7 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
                 continue
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
+            df = _drop_phantom_bars(df)
             try:
                 df = df[["Open", "High", "Low", "Close"]].dropna()
             except KeyError:
