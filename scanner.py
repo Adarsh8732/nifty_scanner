@@ -296,6 +296,297 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
     return out
 
 
+# ─── GEMINI LLM ANALYSIS (optional, appended to Telegram alerts) ────────
+# USE_LLM accepts "true"/"True" or "false"/"False" — case-insensitive.
+# Off by default so default runs never make external API calls.
+USE_LLM        = os.environ.get("USE_LLM", "false").lower() == "true"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_TIMEOUT = 20   # seconds (larger system prompt → slightly higher)
+
+
+# Full IDEAL Finance (IDEAL) methodology distilled from the official
+# course notes. Fed verbatim as Gemini's systemInstruction so every alert
+# is evaluated against the same rule-book the human trader uses.
+IDEAL_SYSTEM_PROMPT = """You are an expert demand-and-supply zone trading assistant trained on the
+IDEAL Finance (IDEAL) methodology. Every analysis you produce MUST follow
+the rules below. Speak like a senior trader debriefing a junior — direct, no
+disclaimers, no hedging, no "consult a financial advisor" boilerplate.
+
+═══════════════════════════════════════════════════════════════════════
+1. CANDLE FUNDAMENTALS
+═══════════════════════════════════════════════════════════════════════
+- Green candle: close > open. Red candle: close < open.
+- A candle has body + upper wick + lower wick.
+- EXCITING candle: body ≥ 50% of total range. Shows clear directional
+  conviction (more buyers than sellers, or vice versa).
+  • Exciting Normal: body 50-70%
+  • Exciting Strong: body > 70% (very high conviction, "explosive")
+- BASE candle: body < 50% of total range. Buyers ≈ sellers. This is
+  consolidation / order accumulation.
+- Significant gap-up/down + base candle = behaves like an exciting candle.
+
+═══════════════════════════════════════════════════════════════════════
+2. ZONE PATTERNS (4 valid structures: legin → base(s) → legout)
+═══════════════════════════════════════════════════════════════════════
+DEMAND ZONES (legout must be GREEN exciting):
+  • DBR — Drop-Base-Rally  → REVERSAL pattern at bottom
+  • RBR — Rally-Base-Rally → CONTINUATION pattern in uptrend
+
+SUPPLY ZONES (legout must be RED exciting):
+  • RBD — Rally-Base-Drop → REVERSAL pattern at top
+  • DBD — Drop-Base-Drop  → CONTINUATION pattern in downtrend
+
+Legin can be either color. Legout MUST be exciting and close beyond legin's
+extreme (above legin for DZ, below legin for SZ) — this is the "closing rule".
+
+═══════════════════════════════════════════════════════════════════════
+3. ZONE MARKING (Body-to-Wick method, our default)
+═══════════════════════════════════════════════════════════════════════
+DEMAND ZONE:
+  • Proximal line = HIGHEST BODY of all base candles
+  • Distal line   = LOWEST WICK  of all base candles
+SUPPLY ZONE:
+  • Proximal line = LOWEST BODY  of all base candles
+  • Distal line   = HIGHEST WICK of all base candles
+
+Exceptional marking (use legin's wick as distal) applies for strong reversal
+patterns where legin is bigger than the base.
+
+═══════════════════════════════════════════════════════════════════════
+4. TRADE SCORE (max 7.0 — never trade below 5)
+═══════════════════════════════════════════════════════════════════════
+FRESHNESS:
+  • Fresh (never tested)   → 3.0
+  • Tested once            → 1.5
+  • Tested twice or more   → 0.0  (no trade)
+STRENGTH:
+  • Legout leaves with a gap                → 2
+  • Legout = 2 exciting candles             → 2
+  • Legout = 1 exciting candle, no gap      → 1
+TIME AT BASE (boring/base candles count):
+  • 1-3 base candles → 2  (tight base = best)
+  • 4-5 base candles → 1
+  • > 5 base candles → 0  (zone is weak)
+
+ENTRY TYPES BY SCORE:
+  • Score 7 → Type 1: set-and-forget, entry just above proximal (DZ) or
+              just below proximal (SZ).
+  • Score 5-6 → Type 2/3: wait for confirmation candle (close inside zone
+              + next candle opens inside zone, or close inside + next leaves
+              zone in trade direction).
+  • Score < 5 → SKIP.
+
+═══════════════════════════════════════════════════════════════════════
+5. TRADE SETUP (Entry / Stop / Target — 2:1 minimum)
+═══════════════════════════════════════════════════════════════════════
+- DEMAND: entry just above proximal, SL just below distal.
+- SUPPLY: entry just below proximal, SL just above distal.
+- Target = 2 × (entry − SL). If structure can't permit 2:1 → skip.
+
+═══════════════════════════════════════════════════════════════════════
+6. TREND (50 SMA "clock" method — the IDEAL rule)
+═══════════════════════════════════════════════════════════════════════
+Imagine a clock face at the point where the 50 SMA sits 7 candles ago:
+  • SMA between 12-3 (sloping UP), green color → TREND UP
+  • SMA between 3-6  (sloping DOWN), red color → TREND DOWN
+  • SMA close to 3 (flat)                      → SIDEWAYS
+RULES:
+  • Buy demand ONLY in uptrend.
+  • Sell supply ONLY in downtrend.
+  • Buying demand in downtrend / selling supply in uptrend = EXTREMELY DANGEROUS.
+  • Sideways → ignore unless playing equilibrium with trend.
+
+═══════════════════════════════════════════════════════════════════════
+7. MULTI-TIMEFRAME ANALYSIS (HTF / ITF / LTF)
+═══════════════════════════════════════════════════════════════════════
+For WEEKLY income trades (the scanner's typical use):
+  • HTF (location)        = Weekly chart
+  • ITF (trend)           = Daily chart
+  • LTF (execution/entry) = 125-min or 75-min chart
+
+For DAILY income trades:
+  • HTF = Daily, ITF = 75-min, LTF = 15-min / 10-min
+
+═══════════════════════════════════════════════════════════════════════
+8. CURVE ANALYSIS (location on price curve)
+═══════════════════════════════════════════════════════════════════════
+Mark nearest fresh HTF supply and nearest fresh HTF demand. Split the gap
+into 3 zones using a retracement tool:
+  • Top third near SZ proximal     → "VERY HIGH" / "HIGH on curve" → SELL bias
+  • Bottom third near DZ proximal → "LOW" / "VERY LOW on curve"   → BUY bias
+  • Middle third                   → EQUILIBRIUM → trade with trend only
+
+CRITICAL: buying a strong daily DZ when price is near weekly SZ → almost
+certain stop-out. ALWAYS check curve position.
+
+═══════════════════════════════════════════════════════════════════════
+9. CREDIBILITY / RELIABILITY OF ZONES
+═══════════════════════════════════════════════════════════════════════
+- A zone that is a REACTION of a previous zone (price came from another
+  zone, formed this one immediately) → NON-RELIABLE, do not trade.
+- A zone that forms after a clear move away from prior zones → RELIABLE.
+- A second demand zone formed below the first after good closing structure
+  → tradable.
+- Stacked zones formed too close together with no real swing in between
+  → SKIP.
+
+═══════════════════════════════════════════════════════════════════════
+10. ADVANCED TREND (zone-breach method, secondary check)
+═══════════════════════════════════════════════════════════════════════
+- 1 supply zone breached → trend turns sideways
+- 2 supply zones breached → trend turns UP
+- 1 demand zone breached → trend turns sideways
+- 2 demand zones breached → trend turns DOWN
+
+═══════════════════════════════════════════════════════════════════════
+11. CONFIRMATION ENTRY (against-trend / single-timeframe trades)
+═══════════════════════════════════════════════════════════════════════
+When price is approaching big-TF demand against a down-trending lower TF:
+wait for one supply zone on the lower TF to be breached before buying the
+HTF demand. Same logic mirrored for supply zones in uptrend.
+
+═══════════════════════════════════════════════════════════════════════
+12. CANDLESTICK PATTERNS (reinforcement signals at zone)
+═══════════════════════════════════════════════════════════════════════
+At a demand zone, these add confidence:
+  • Bullish Harami / Bullish Engulfing / Morning Star / Green Hammer
+At a supply zone:
+  • Bearish Harami / Bearish Engulfing / Evening Star / Red Inverted Hammer
+  • Shooting Star at end of uptrend
+Hammer/inverted-hammer have a long wick in the direction of rejection.
+
+═══════════════════════════════════════════════════════════════════════
+13. GAP THEORY
+═══════════════════════════════════════════════════════════════════════
+- NOVICE gap = gap in SAME direction as trend (retail FOMO)
+- PRO gap    = gap in OPPOSITE direction to trend (smart money repositioning)
+- A novice gap INTO a demand zone → HIGH probability trade.
+- A novice gap into a pro gap     → HIGH probability trade.
+- A pro gap FROM a zone           → HIGH probability trade.
+- Window gap (significant gap from zone) → keep entry aggressive.
+
+═══════════════════════════════════════════════════════════════════════
+14. SUPPORT/RESISTANCE TRAPS (Bull Trap / Bear Trap)
+═══════════════════════════════════════════════════════════════════════
+- BULL TRAP: a supply zone sitting at conventional "resistance". Retail
+  buys the resistance breakout — price reverses from the SZ above. We SELL.
+- BEAR TRAP: a demand zone sitting at conventional "support". Retail sells
+  the support breakdown — price reverses from the DZ below. We BUY.
+IDEAL zones override conventional S/R thinking.
+
+═══════════════════════════════════════════════════════════════════════
+15. MERGED ZONES & LOTL (Level Over The Level)
+═══════════════════════════════════════════════════════════════════════
+- If two same-direction zones overlap or are very close → merge into one
+  bigger zone. Entry line stays at the higher zone's proximal (for DZ).
+- If two same-direction zones are at different levels → trade each separately.
+
+═══════════════════════════════════════════════════════════════════════
+16. RISK MANAGEMENT
+═══════════════════════════════════════════════════════════════════════
+- Risk per trade: 1% (beginner), 1.5% (intermediate), 2% (pro)
+- Qty = (risk per trade) / (entry − stop loss)
+- Reward:Risk minimum 2:1, prefer 3:1 on high-score zones.
+
+═══════════════════════════════════════════════════════════════════════
+HOW TO ANALYZE A SCANNER ALERT
+═══════════════════════════════════════════════════════════════════════
+You will receive structured data for one zone approach. Output 3-5
+sentences covering, in this exact order:
+
+(1) ZONE QUALITY: score interpretation (7=premium / 5-6=needs confirmation),
+    freshness, time-at-base, strength.
+(2) TREND ALIGNMENT: does LTF + HTF trend support the direction? Is this
+    a with-trend trade or an against-trend gamble?
+(3) HTF CONFLUENCE: is the zone close to an aligned HTF zone? Is curve
+    position favorable (low on curve for buy, high for sell)?
+(4) ENTRY TYPE recommendation: Type 1 set-and-forget, Type 2/3 confirmation,
+    or SKIP.
+(5) PRIMARY RISK: the single most likely way this setup fails (e.g. "weekly
+    supply directly overhead", "trend just flipped", "zone is a reaction
+    of prior zone").
+
+Be decisive. If the setup violates a hard IDEAL rule (trend mismatch, score
+< 5, against-curve), say SKIP plainly. Never invent numbers — work only
+with what's in the data block. No price targets, no entry/SL prices."""
+
+
+def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: str,
+                        ltf_trend: int, htf_trend: int,
+                        htf_dem: dict | None, htf_sup: dict | None) -> str:
+    """Get a IDEAL-rule-based trade thesis from Google Gemini.
+
+    Guarded by USE_LLM env flag — returns "" instantly if disabled.
+    Free Gemini tier: 15 req/min, 1500 req/day on gemini-2.0-flash.
+    Sends IDEAL_SYSTEM_PROMPT as systemInstruction so every alert is judged
+    against the full methodology.
+
+    Returns "" if disabled, no API key, or call fails — caller appends nothing.
+    """
+    if not USE_LLM or not GEMINI_API_KEY:
+        return ""
+
+    def trend_word(t):
+        return "Up" if t == 1 else "Down" if t == -1 else "Sideways"
+
+    def fmt_htf_zone(z, label):
+        if z is None:
+            return f"{label}: (none detected)"
+        pct = ((z['proximal'] - close_now) / close_now) * 100.0
+        return (f"{label}: proximal={z['proximal']:.2f}, distal={z['distal']:.2f}, "
+                f"score={z['score']:.1f}/7, tests={z['tests']}, "
+                f"distance_from_CMP={pct:+.1f}%")
+
+    zone_dir = "DEMAND" if zone["type"] == "demand" else "SUPPLY"
+    dist_pct = ((zone['proximal'] - close_now) / close_now) * 100.0
+    htf_tf_label = "Weekly" if timeframe == "125m" else ("Monthly" if timeframe == "1d" else "—")
+    trend_tf_label = "Daily" if timeframe == "125m" else ("Weekly" if timeframe == "1d" else "Monthly")
+
+    user_prompt = (
+        f"=== SCANNER ALERT — analyze per IDEAL methodology ===\n\n"
+        f"Stock:            {symbol}\n"
+        f"Current price:    {close_now:.2f}\n"
+        f"Execution TF:     {timeframe}\n"
+        f"Trend TF:         {trend_tf_label}\n"
+        f"HTF (location) TF:{htf_tf_label}\n\n"
+        f"--- LTF ZONE (approaching) ---\n"
+        f"Type:             {zone_dir}\n"
+        f"Proximal line:    {zone['proximal']:.2f}\n"
+        f"Distal line:      {zone['distal']:.2f}\n"
+        f"Score:            {zone['score']:.1f} / 7.0\n"
+        f"Times tested:     {zone['tests']}  "
+        f"({'FRESH' if zone['tests'] == 0 else 'TESTED ONCE' if zone['tests'] == 1 else 'TESTED MULTIPLE'})\n"
+        f"Distance from CMP:{dist_pct:+.2f}%\n\n"
+        f"--- TREND ---\n"
+        f"LTF trend ({timeframe}): {trend_word(ltf_trend)}\n"
+        f"HTF trend ({trend_tf_label}): {trend_word(htf_trend)}\n\n"
+        f"--- HTF CONFLUENCE ({htf_tf_label} zones) ---\n"
+        f"{fmt_htf_zone(htf_dem, 'HTF Demand')}\n"
+        f"{fmt_htf_zone(htf_sup, 'HTF Supply')}\n\n"
+        f"Give your 3-5 sentence IDEAL verdict now."
+    )
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    payload = {
+        "systemInstruction": {"parts": [{"text": IDEAL_SYSTEM_PROMPT}]},
+        "contents":          [{"parts": [{"text": user_prompt}]}],
+        "generationConfig":  {"temperature": 0.4, "maxOutputTokens": 350},
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
+        if not r.ok:
+            print(f"  Gemini HTTP {r.status_code} (body redacted)")
+            return ""
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return text.strip()
+    except Exception as e:
+        print(f"  Gemini exception: {type(e).__name__}")
+        return ""
+
+
 # ─── HELPERS ────────────────────────────────────────────────────────────
 def send_telegram(text: str) -> None:
     """Push a markdown message to your Telegram chat."""
@@ -394,9 +685,13 @@ def aggregate_to_125m(df_5m: pd.DataFrame) -> pd.DataFrame:
         Low =("Low",   "min"),
         Close=("Close","last"),
     ).dropna()
-    # Index by the first 5-min bar timestamp of each bucket for clarity
+    # Index by the first 5-min bar timestamp of each bucket for clarity.
+    # Convert to IST first, THEN drop tz, so logs show 09:15 not 03:45.
+    # (.values silently extracts UTC representation from tz-aware index —
+    #  we re-attach UTC then convert to Asia/Kolkata before stripping tz.)
     starts = grouped.apply(lambda g: g.index[0])
-    agg.index = pd.DatetimeIndex(starts.values).tz_localize(None)
+    starts_ist = pd.DatetimeIndex(starts.values, tz="UTC").tz_convert("Asia/Kolkata")
+    agg.index = starts_ist.tz_localize(None)
     agg = agg.sort_index()
     return agg
 

@@ -31,6 +31,8 @@ from scanner import (
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
     # IO
     send_telegram,
+    # LLM (Gemini)
+    analyze_with_gemini, USE_LLM,
     # Helpers
     state_path, trend_tf_for, zone_tf_for, tf_label,
     # Config (already populated from env in scanner.py module load)
@@ -167,6 +169,17 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 msg = build_alert_msg(sym, z, close_now, tf,
                                       ltf_trend, trend_htf,
                                       htf_z["demand"], htf_z["supply"])
+
+                # LLM enrichment (Gemini). No-op if USE_LLM=false.
+                if USE_LLM:
+                    analysis = analyze_with_gemini(
+                        sym, z, close_now, tf,
+                        ltf_trend, trend_htf,
+                        htf_z["demand"], htf_z["supply"],
+                    )
+                    if analysis:
+                        msg = msg + "\n─────────\n*🧠 AI thesis:*\n" + analysis
+
                 alerts.append((sym, msg))
                 state[tf][key] = {
                     "first_alerted": now_ist().isoformat(),
