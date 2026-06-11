@@ -40,10 +40,13 @@ jobs:
           DHAN_CLIENT_ID:     ${{ secrets.DHAN_CLIENT_ID }}
           # Gemini LLM enrichment of Telegram alerts (optional).
           # Set USE_LLM='true' AND add GEMINI_API_KEY secret to enable.
-          # Free tier: 15 req/min, 1500/day on gemini-2.0-flash.
+          # gemini-2.5-flash-lite: cheapest current-gen model (~$0.75/mo for
+          # 60 alerts/day). gemini-2.5-flash gives slightly better quality at
+          # ~$3/mo. gemini-2.0-flash is being phased out — newer billing-
+          # enabled projects return HTTP 404 for it.
           USE_LLM:              'true'            # 'true' to enable LLM analysis
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL:         'gemini-2.0-flash'
+          GEMINI_MODEL:         'gemini-2.5-flash-lite'
           TIMEFRAMES:           '1d,1wk,125m'   # Daily, Weekly, and 125-min intraday
           ALERT_ENTRY_PCT:      '1.0'
           ALERT_MIN_SCORE:      '7.0'
