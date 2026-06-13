@@ -65,3 +65,21 @@ jobs:
           git add state_*.json
           git diff --cached --quiet || git commit -m "loop scan: update state [skip ci]"
           git push || echo "nothing to push"
+
+      - name: Notify Telegram on workflow failure
+        # Triggers on any failed step (including the scanner crashing, OOM
+        # kill, or runner errors). Python-level errors also surface via the
+        # in-process alert_once() — this is the outer safety net.
+        if: failure()
+        run: |
+          ICON="🚨"
+          MSG="${ICON} *CRITICAL: Scanner workflow FAILED*"
+          MSG="${MSG}%0A_Run:_ ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG="${MSG}%0A_Job:_ ${GITHUB_JOB}  _Time:_ $(date -u +%H:%M)Z"
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d parse_mode=Markdown \
+            -d text="${MSG}" > /dev/null || true
+        env:
+          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}

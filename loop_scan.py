@@ -30,7 +30,7 @@ from scanner import (
     # Fetching
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
     # IO
-    send_telegram,
+    send_telegram, alert_once,
     # LLM (Gemini)
     analyze_with_gemini, USE_LLM,
     # Helpers
@@ -89,30 +89,45 @@ def save_states(state: dict[str, dict]) -> None:
 
 # ─── HTF fetch with mini-cache to avoid repeat calls within same iteration ──
 class HtfCache:
-    """Tiny dict-based cache of HTF DataFrames + zones. TTL = session lifetime
-    (cleared per cache-refresh tick along with main cache)."""
+    """Cache HTF DataFrames + trend; recompute zones per call with live LTP.
+
+    Why cache the df but NOT the zones: detect_zones() depends on close_now
+    (for dist_pct, best-zone selection, and the in-zone filter), and we now
+    pass the live Dhan LTP as close_now_override on every call. Same HTF df
+    + different LTP → different "best" zone, so a static zone cache would
+    return stale results.
+
+    The df itself doesn't change between cache refreshes, so caching it
+    avoids the expensive yfinance call.
+    """
 
     def __init__(self):
-        self._trend: dict[tuple, int]            = {}
-        self._zones: dict[tuple, dict]           = {}
+        self._trend: dict[tuple, int]                       = {}
+        self._df:    dict[tuple, "pd.DataFrame | None"]    = {}
+
+    def _get_df(self, sym: str, tf: str):
+        key = (sym, tf)
+        if key not in self._df:
+            self._df[key] = fetch_ohlc(sym, tf)
+        return self._df[key]
 
     def get_trend(self, sym: str, tf: str) -> int:
         key = (sym, tf)
         if key not in self._trend:
-            df = fetch_ohlc(sym, tf)
+            df = self._get_df(sym, tf)
             self._trend[key] = compute_trend(df) if df is not None else 0
         return self._trend[key]
 
-    def get_zones(self, sym: str, tf: str) -> dict:
-        key = (sym, tf)
-        if key not in self._zones:
-            df = fetch_ohlc(sym, tf)
-            self._zones[key] = detect_zones(df) if df is not None else {"demand": None, "supply": None}
-        return self._zones[key]
+    def get_zones(self, sym: str, tf: str,
+                  close_now_override: float | None = None) -> dict:
+        df = self._get_df(sym, tf)
+        if df is None:
+            return {"demand": None, "supply": None}
+        return detect_zones(df, close_now_override=close_now_override)
 
     def clear(self):
         self._trend.clear()
-        self._zones.clear()
+        self._df.clear()
 
 
 def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
@@ -126,12 +141,22 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
             if df is None:
                 continue
 
+            # Current-price reference (single source of truth for this symbol).
+            # Priority: live Dhan LTP > last CLOSED bar's close.
+            # We never use df["Close"].iloc[-1] directly — that's the in-progress
+            # bar (partial close) and contaminates zone detection (see Leak 1/2).
             ltp = live_ltps.get(sym)
             if ltp is not None and ltp > 0:
-                df = patch_live_close(df, ltp)
+                close_now = float(ltp)
+            elif len(df) > 1:
+                close_now = float(df["Close"].iloc[-2])   # last closed bar
+            else:
+                close_now = float(df["Close"].iloc[-1])   # only-1-bar edge case
 
-            close_now = float(df["Close"].iloc[-1])
-            zones = detect_zones(df)
+            # Detect zones on this df. IGNORE_INPROGRESS_BAR is on by default
+            # inside detect_zones, so the in-progress bar is excluded from
+            # legout/test-walk regardless of what we pass here.
+            zones = detect_zones(df, close_now_override=close_now)
             dem, sup = zones["demand"], zones["supply"]
 
             for z in (dem, sup):
@@ -143,10 +168,13 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 if key in state[tf]:
                     continue  # already alerted in this or prior session
 
-                # Strict filter — fetch HTF lazily through the cache
+                # Strict filter — fetch HTF lazily through the cache.
+                # Pass close_now so HTF zones are evaluated against the live
+                # LTP (best HTF zone + dist_pct displayed in alert).
                 if STRICT_FILTER:
                     trend_htf = htf_cache.get_trend(sym, trend_tf_for(tf))
-                    htf_z     = htf_cache.get_zones(sym, zone_tf_for(tf))
+                    htf_z     = htf_cache.get_zones(sym, zone_tf_for(tf),
+                                                    close_now_override=close_now)
 
                     if tf == "125m":
                         # Custom 30%-closeness rule + W zone score >= 7
@@ -270,4 +298,24 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Top-level guard: any uncaught exception in main() gets surfaced to
+    # Telegram BEFORE the process exits, so a code bug or rare runtime
+    # error doesn't fail silently in CI logs.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        try:
+            alert_once(
+                tag      = "scanner_crash",
+                severity = "CRITICAL",
+                title    = f"Scanner crashed: {type(e).__name__}",
+                detail   = f"{e}\n\n{tb}",
+            )
+        except Exception:
+            pass  # If TG itself is down, we tried — exit anyway
+        sys.exit(1)

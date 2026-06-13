@@ -91,6 +91,22 @@ LOOKBACK_BARS    = 50
 MAX_ZONE_TESTS   = 1
 ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles between legin & legout)
 
+# Treat the most recent bar as in-progress and exclude it from ALL uses,
+# not just legout selection.
+#
+# What's already on closed bars (regardless of this flag):
+#   - Legout candidate: start_bar >= 1, so C[0] is never the legout
+#   - Base walk + legin: walk goes back in time, never touches C[0]
+#
+# What this flag fixes (currently leaks the in-progress bar):
+#   - close_now reference: was C[0] (partial close), becomes C[1] or live LTP
+#   - Forward-walk INVALIDATION: in-progress bar's intra-period low/high can
+#     permanently kill the zone before the bar even closes
+#   - Forward-walk TEST COUNT: same low/high can tick freshness down 3.0→1.5
+#
+# Same principle applied uniformly to all timeframes (5m / 125m / D / W / M).
+IGNORE_INPROGRESS_BAR = os.environ.get("IGNORE_INPROGRESS_BAR", "true").lower() == "true"
+
 # Small-body override: a candle with bodyPct >= BASE_PCT can still qualify as a
 # base if its ABSOLUTE body is tiny compared to both the legout and legin bodies.
 # Catches spike-top reversal candles (doji-like inside fast reversals).
@@ -282,6 +298,18 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
             if not r.ok:
                 # Don't log r.text — Dhan errors may echo headers or token snippets.
                 print(f"  Dhan LTP failed: HTTP {r.status_code} (body redacted)")
+                # 401/403 almost always = expired or revoked access token.
+                # Surface immediately so user can refresh the token.
+                if r.status_code in (401, 403):
+                    alert_once(
+                        tag      = "dhan_auth_fail",
+                        severity = "CRITICAL",
+                        title    = f"Dhan auth rejected (HTTP {r.status_code})",
+                        detail   = ("Access token likely expired or revoked. "
+                                    "LTPs are now unavailable — scanner falling "
+                                    "back to yfinance close prices. "
+                                    "Run the refresh-token workflow."),
+                    )
                 continue
             data = r.json().get("data", {}).get("NSE_EQ", {})
             # Invert sid → ltp into sym → ltp using sym_to_sid
@@ -585,6 +613,18 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
         if not r.ok:
             print(f"  Gemini HTTP {r.status_code} (body redacted)")
+            # 404=wrong model, 401/403=bad key, 429=quota.  All "config-level"
+            # failures that won't fix themselves — surface immediately.
+            if r.status_code in (400, 401, 403, 404, 429):
+                alert_once(
+                    tag      = f"gemini_http_{r.status_code}",
+                    severity = "CRITICAL" if r.status_code in (401, 403, 404) else "WARNING",
+                    title    = f"Gemini API HTTP {r.status_code}",
+                    detail   = ("LLM enrichment is broken. Alerts still send "
+                                "without AI thesis (graceful degrade). "
+                                f"Model: {GEMINI_MODEL}. "
+                                "Check API key, model name, and quota."),
+                )
             return ""
         data = r.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -613,6 +653,29 @@ def send_telegram(text: str) -> None:
             print(f"  TG failed: HTTP {r.status_code} (body redacted)")
     except Exception as e:
         print(f"  TG exception: {e}")
+
+
+# ─── OPERATIONAL ALERTS ─────────────────────────────────────────────────
+# Anti-spam: each error tag fires at most ONCE per scanner session, so a
+# Dhan auth failure or Gemini quota event doesn't flood your chat.
+_alerted_tags: set[str] = set()
+
+def alert_once(tag: str, severity: str, title: str, detail: str = "") -> None:
+    """Send a Telegram alert for an operational failure, deduped by tag.
+
+    severity: "CRITICAL" → 🚨, "WARNING" → ⚠, "INFO" → ℹ
+    tag:      unique key per error type (e.g. "dhan_auth_fail"). First call
+              with a given tag sends, subsequent calls are silent.
+    """
+    if tag in _alerted_tags:
+        return
+    _alerted_tags.add(tag)
+    icon = "🚨" if severity == "CRITICAL" else ("⚠" if severity == "WARNING" else "ℹ")
+    msg = f"{icon} *{severity}: {title}*"
+    if detail:
+        msg += f"\n```\n{detail[:500]}\n```"
+    msg += f"\n_Session tag:_ `{tag}`"
+    send_telegram(msg)
 
 
 def _drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -779,12 +842,17 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
 
 
 # ─── ZONE DETECTION (Pine port) ─────────────────────────────────────────
-def detect_zones(df: pd.DataFrame) -> dict:
+def detect_zones(df: pd.DataFrame, close_now_override: float | None = None) -> dict:
     """Detect best (closest to current price) demand and supply zones.
 
     Mirrors scanner.pine f_scanZones(). Returns:
         {"demand": {...} | None, "supply": {...} | None}
     where each zone dict has: proximal, distal, score, tests, dist_pct, type.
+
+    close_now_override: if provided, used as the current-price reference (for
+        dist_pct + best-zone selection). Pass the live LTP from Dhan here.
+        If None: when IGNORE_INPROGRESS_BAR is True, falls back to the last
+        CLOSED bar's close (C[1]); otherwise uses C[0] (in-progress bar).
     """
     # Reverse so index 0 = latest bar (matches Pine's [N] indexing)
     df_rev = df.iloc[::-1].reset_index(drop=True)
@@ -794,7 +862,20 @@ def detect_zones(df: pd.DataFrame) -> dict:
     C = df_rev["Close"].values
     n = len(df_rev)
 
-    close_now = float(C[0])
+    # Current-price reference (Leak 1 fix).
+    # Priority: caller-supplied LTP > last-closed-bar close > in-progress close
+    if close_now_override is not None:
+        close_now = float(close_now_override)
+    elif IGNORE_INPROGRESS_BAR and n > 1:
+        close_now = float(C[1])
+    else:
+        close_now = float(C[0])
+
+    # Forward-walk lower bound (Leak 2 fix).
+    # walk_low = 1 means walks stop at C[1] (last closed bar), never visiting
+    # C[0] (in-progress). Both invalidation and test counting are protected.
+    walk_low = 1 if IGNORE_INPROGRESS_BAR else 0
+
     best_dem = None
     best_sup = None
 
@@ -894,7 +975,7 @@ def detect_zones(df: pd.DataFrame) -> dict:
                 zone_valid = lo_c > legin_bdy_high or confirm_close > legin_bdy_high
                 if zone_valid and close_now > prox:
                     valid, tc, was_in = True, 0, False
-                    for v in range(start_bar - 1, -1, -1):
+                    for v in range(start_bar - 1, walk_low - 1, -1):
                         v_low = L[v]
                         if v_low < dist:
                             valid = False
@@ -927,7 +1008,7 @@ def detect_zones(df: pd.DataFrame) -> dict:
                 zone_valid = lo_c < legin_bdy_low or confirm_close < legin_bdy_low
                 if zone_valid and close_now < prox:
                     valid, tc, was_in = True, 0, False
-                    for v in range(start_bar - 1, -1, -1):
+                    for v in range(start_bar - 1, walk_low - 1, -1):
                         v_high = H[v]
                         if v_high > dist:
                             valid = False
@@ -979,7 +1060,7 @@ def detect_zones(df: pd.DataFrame) -> dict:
 
             # Walk forward from legout-1 to current; check breach + count tests
             valid, tc, was_in = True, 0, False
-            for v in range(start_bar - 1, -1, -1):
+            for v in range(start_bar - 1, walk_low - 1, -1):
                 v_low = L[v]
                 if v_low < dist:
                     valid = False
@@ -1019,7 +1100,7 @@ def detect_zones(df: pd.DataFrame) -> dict:
                 continue
 
             valid, tc, was_in = True, 0, False
-            for v in range(start_bar - 1, -1, -1):
+            for v in range(start_bar - 1, walk_low - 1, -1):
                 v_high = H[v]
                 if v_high > dist:
                     valid = False

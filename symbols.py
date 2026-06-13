@@ -74,7 +74,8 @@ ALL_SYMBOLS = [
     "PHOENIXLTD", "PWL", "PIDILITIND", "PINELABS", "PIRAMALFIN", "PPLPHARMA",
     "POLYMED", "POLYCAB", "POONAWALLA", "PFC", "POWERGRID", "PREMIERENE",
     "PRESTIGE", "PNB", "RRKABEL", "RBLBANK", "RECLTD", "RHIM", "RITES",
-    "RADICO", "RVNL", "RAILTEL", "RAINBOW", "RKFORGE", "REDINGTON",
+    "RADICO", "RVNL", "RAILTEL", "RAINBOW", "RAYMOND", "RAYMONDLSL",
+    "RKFORGE", "REDINGTON",
     "RELIANCE", "RPOWER", "SBFC", "SBICARD", "SBILIFE", "SJVN", "SRF",
     "SAGILITY", "SAILIFE", "SAMMAANCAP", "MOTHERSON", "SAPPHIRE", "SARDAEN",
     "SAREGAMA", "SCHAEFFLER", "SCHNEIDER", "SCI", "SHREECEM", "SHRIRAMFIN",
@@ -92,6 +93,26 @@ ALL_SYMBOLS = [
     "VOLTAS", "WAAREEENER", "WELCORP", "WELSPUNLIV", "WHIRLPOOL", "WIPRO",
     "WOCKPHARMA", "YESBANK", "ZFCVINDIA", "ZEEL", "ZENTEC", "ZENSARTECH",
     "ZYDUSLIFE", "ZYDUSWELL", "ECLERX",
+
+    # ── High-momentum additions beyond Nifty 500 (June 2026) ──
+    # Curated mid/small/microcap names with sustained 2025-2026 momentum.
+    # All verified to return yfinance data. Score 7 + strict filter remains
+    # in place, so only the strongest setups on these names will alert.
+    #
+    # Defense / aerospace
+    "MIDHANI", "ASTRAMICRO",
+    # Capital goods / engineering
+    "TDPOWERSYS", "SANSERA", "INOXINDIA", "POWERMECH", "KIRLOSBROS",
+    # Tech / IT / fintech
+    "TANLA", "ZAGGLE", "ROUTE", "HAPPSTMNDS",
+    # Healthcare
+    "HCG", "KRSNAA", "MEDIASSIST", "ARTEMISMED", "AARTIPHARM",
+    # Consumer / dairy / QSR
+    "DODLA", "RBA",
+    # Specialty chem / materials
+    "STLTECH", "RATNAMANI", "AVANTIFEED", "LXCHEM", "FINEORG", "POLYPLEX", "BSL",
+    # Banks / financials
+    "DCBBANK",
 ]
 
 # Backwards-compat alias
