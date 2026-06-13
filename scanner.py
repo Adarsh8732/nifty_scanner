@@ -29,6 +29,20 @@ TG_CHAT_ID        = os.environ.get("TG_CHAT_ID", "")
 # Comma-separated list of yfinance intervals to scan: "1d,1wk"
 TIMEFRAMES        = [tf.strip() for tf in os.environ.get("TIMEFRAMES", "1d,1wk").split(",") if tf.strip()]
 ALERT_ENTRY_PCT   = float(os.environ.get("ALERT_ENTRY_PCT", "1.0"))
+
+# Per-timeframe alert-entry distance (overrides ALERT_ENTRY_PCT above).
+# Fires when current price is within this % of the zone's proximal.
+ALERT_ENTRY_PCT_PER_TF = {
+    "1d":   float(os.environ.get("ALERT_ENTRY_PCT_1D",   "2.0")),
+    "1wk":  float(os.environ.get("ALERT_ENTRY_PCT_1WK",  "2.0")),
+    "125m": float(os.environ.get("ALERT_ENTRY_PCT_125M", "1.5")),
+}
+
+def entry_pct_for(timeframe: str | None) -> float:
+    """Resolve the alert-entry % for a given timeframe (falls back to default)."""
+    if timeframe and timeframe in ALERT_ENTRY_PCT_PER_TF:
+        return ALERT_ENTRY_PCT_PER_TF[timeframe]
+    return ALERT_ENTRY_PCT
 ALERT_MIN_SCORE   = float(os.environ.get("ALERT_MIN_SCORE", "7.0"))
 SCAN_DEMAND       = os.environ.get("SCAN_DEMAND", "true").lower() == "true"
 SCAN_SUPPLY       = os.environ.get("SCAN_SUPPLY", "true").lower() == "true"
@@ -842,7 +856,8 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
 
 
 # ─── ZONE DETECTION (Pine port) ─────────────────────────────────────────
-def detect_zones(df: pd.DataFrame, close_now_override: float | None = None) -> dict:
+def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
+                 use_close_beyond_legin: bool = False) -> dict:
     """Detect best (closest to current price) demand and supply zones.
 
     Mirrors scanner.pine f_scanZones(). Returns:
@@ -853,6 +868,13 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None) -> d
         dist_pct + best-zone selection). Pass the live LTP from Dhan here.
         If None: when IGNORE_INPROGRESS_BAR is True, falls back to the last
         CLOSED bar's close (C[1]); otherwise uses C[0] (in-progress bar).
+
+    use_close_beyond_legin: REVERSAL-only stricter rule for ALL LTF.
+        When True: instead of the legout-body >= 0.8*legin-body ratio, the
+        legout candle's CLOSE must close beyond the legin candle's CLOSE
+        (above for demand DBR, below for supply RBD). Pass True for all
+        LTF (D / W / 125m); keep False for HTF (MTF) detection — HTF
+        retains the body-ratio rule.
     """
     # Reverse so index 0 = latest bar (matches Pine's [N] indexing)
     df_rev = df.iloc[::-1].reset_index(drop=True)
@@ -962,8 +984,16 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None) -> d
                 continue
             if leg2_body == 0 or leg2_bpct < EXCITE_PCT:
                 continue
-            if lo_body < LEGOUT_MIN_RATIO * leg2_body:
-                continue
+            if use_close_beyond_legin:
+                # LTF rule (D/W/125m): legout close must close beyond legin close.
+                if zb_demand and lo_c < leg2_c:
+                    continue
+                if zb_supply and lo_c > leg2_c:
+                    continue
+            else:
+                # HTF rule (MTF): legout body must be >= 80% of legin body.
+                if lo_body < LEGOUT_MIN_RATIO * leg2_body:
+                    continue
 
             confirm_close = C[start_bar - 1] if start_bar >= 1 else lo_c
 
@@ -1046,8 +1076,19 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None) -> d
         legin_red = leg_c < leg_o
         legin_grn = leg_c > leg_o
         is_reversal = (lo_grn and legin_red) or (lo_red and legin_grn)
-        if is_reversal and lo_body < LEGOUT_MIN_RATIO * leg_body:
-            continue
+        if is_reversal:
+            if use_close_beyond_legin:
+                # LTF rule (D/W/125m): legout close must close beyond legin close.
+                # Demand (DBR): legout green must close ABOVE (or equal to) legin red close.
+                # Supply (RBD): legout red must close BELOW (or equal to) legin green close.
+                if lo_grn and lo_c < leg_c:
+                    continue
+                if lo_red and lo_c > leg_c:
+                    continue
+            else:
+                # HTF rule (MTF): legout body must be >= 80% of legin body.
+                if lo_body < LEGOUT_MIN_RATIO * leg_body:
+                    continue
 
         # ─── Demand zone (green legout) ──────────────────────────
         if lo_grn and SCAN_DEMAND:
@@ -1139,25 +1180,141 @@ def zone_key(symbol: str, zone: dict) -> str:
     return f"{symbol}_{zone['type']}_{round(zone['proximal'], 2)}_{round(zone['distal'], 2)}"
 
 
-def is_approaching(close_now: float, zone: dict) -> bool:
-    """True if price has crossed the entry line and is heading into the zone."""
+# ─── SWING ORIGIN (where did price come from before this alert) ────────
+# When a demand alert fires (price falling into demand), trace back through
+# recent LTF bars to find the highest high (the peak it reversed from).
+# Then check whether that peak sits inside an HTF SUPPLY zone (W / M / 3M).
+# Mirror for supply alerts: find the lowest low, check HTF DEMAND zones.
+#
+# This tells you whether the move into your zone was rejected from a
+# structural HTF level (high-conviction) or from random noise (lower).
+
+ORIGIN_LOOKBACK_BARS = int(os.environ.get("ORIGIN_LOOKBACK_BARS", "20"))
+_ORIGIN_HTFS         = ("1wk", "1mo", "3mo")
+_ORIGIN_TF_LBL       = {"1wk": "W", "1mo": "M", "3mo": "3M"}
+
+
+def find_swing_origin(df: "pd.DataFrame | None", zone_type: str,
+                      lookback: int = ORIGIN_LOOKBACK_BARS) -> float | None:
+    """Recent peak (for demand alert) or trough (for supply alert) on the LTF.
+
+    Uses CLOSED bars only (in-progress bar excluded). Returns None if not
+    enough data.
+    """
+    if df is None or len(df) < 2:
+        return None
+    closed = df.iloc[:-1] if IGNORE_INPROGRESS_BAR else df
+    if len(closed) < 2:
+        return None
+    recent = closed.iloc[-lookback:] if len(closed) > lookback else closed
+    if zone_type == "demand":
+        return float(recent["High"].max())
+    if zone_type == "supply":
+        return float(recent["Low"].min())
+    return None
+
+
+def find_origin_htf_match(origin_price: float | None,
+                          ltf_zone_type: str,
+                          htf_zones_by_tf: dict,
+                          ltf_timeframe: str | None = None) -> tuple[str, dict] | None:
+    """Find the nearest HTF zone that contains the swing origin price.
+
+    For LTF demand alert → search HTF SUPPLY zones (price rejected from supply).
+    For LTF supply alert → search HTF DEMAND zones (price bounced off demand).
+
+    htf_zones_by_tf: {"1wk": {"demand": ..., "supply": ...}, "1mo": ..., "3mo": ...}
+    Priority: 1wk first, then 1mo, then 3mo (closer HTF wins).
+    Skips the HTF that matches the LTF (avoid self-comparison).
+    Returns (htf_tf, zone_dict) or None.
+    """
+    if origin_price is None:
+        return None
+    target_type = "supply" if ltf_zone_type == "demand" else "demand"
+    for htf_tf in _ORIGIN_HTFS:
+        if ltf_timeframe and htf_tf == ltf_timeframe:
+            continue  # skip self-comparison (e.g., LTF=W skips W HTF)
+        zones = htf_zones_by_tf.get(htf_tf) or {}
+        z = zones.get(target_type)
+        if z is None:
+            continue
+        lo = min(z["proximal"], z["distal"])
+        hi = max(z["proximal"], z["distal"])
+        if lo <= origin_price <= hi:
+            return (htf_tf, z)
+    return None
+
+
+# ─── EMA20 CONFLUENCE (D / W / M / 3M lines inside zone) ───────────────
+# For each timeframe, computes the latest EMA20 value on CLOSED bars only.
+# At alert time, the scanner counts how many EMA20 lines fall within the
+# alerted zone's [distal, proximal] range — high count = strong confluence.
+
+EMA20_TFS  = ("1d", "1wk", "1mo", "3mo")
+_EMA20_LBL = {"1d": "D", "1wk": "W", "1mo": "M", "3mo": "3M"}
+
+
+def compute_ema20(df: pd.DataFrame) -> float | None:
+    """Latest EMA20 value, computed on CLOSED bars only.
+    Returns None if fewer than 20 closed bars are available.
+    """
+    if df is None or len(df) < 21:
+        return None
+    closed = df.iloc[:-1] if IGNORE_INPROGRESS_BAR else df
+    if len(closed) < 20:
+        return None
+    return float(closed["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+
+
+def emas_in_zone(zone: dict, emas: dict) -> tuple[int, list[str]]:
+    """Count which EMA20 values fall within the zone's [distal, proximal] band.
+    Returns (count, [tf labels like 'D', 'W']) for the EMAs that hit.
+    """
+    lo = min(zone["proximal"], zone["distal"])
+    hi = max(zone["proximal"], zone["distal"])
+    hits: list[str] = []
+    for tf in EMA20_TFS:
+        v = emas.get(tf)
+        if v is not None and lo <= v <= hi:
+            hits.append(_EMA20_LBL[tf])
+    return len(hits), hits
+
+
+def is_approaching(close_now: float, zone: dict, timeframe: str | None = None) -> bool:
+    """True if price has crossed the entry line and is heading into the zone.
+
+    Entry distance is timeframe-specific (entry_pct_for).
+    """
+    pct = entry_pct_for(timeframe)
     if zone["type"] == "demand":
-        entry = zone["proximal"] * (1 + ALERT_ENTRY_PCT / 100.0)
+        entry = zone["proximal"] * (1 + pct / 100.0)
         return close_now <= entry and close_now > zone["distal"]
     else:
-        entry = zone["proximal"] * (1 - ALERT_ENTRY_PCT / 100.0)
+        entry = zone["proximal"] * (1 - pct / 100.0)
         return close_now >= entry and close_now < zone["distal"]
 
 
 def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
                     ltf_trend: int, htf_trend: int, htf_dem: dict | None,
-                    htf_sup: dict | None) -> str:
-    """Builds Telegram alert message mirroring Pine scanner table fields."""
+                    htf_sup: dict | None,
+                    ema20s: dict | None = None,
+                    origin_price: float | None = None,
+                    origin_match: tuple | None = None) -> str:
+    """Builds Telegram alert message mirroring Pine scanner table fields.
+
+    ema20s: optional dict {"1d": 4500.0, "1wk": 4520.0, ...} of EMA20 values
+            across D/W/M/3M timeframes. Adds a confluence line to the alert
+            showing how many of those EMA20 lines pass through this zone.
+    origin_price: optional swing-origin price (recent peak/trough on LTF).
+    origin_match: optional (htf_tf, htf_zone_dict) — the HTF zone that
+            contains origin_price, if any. If None, no origin line is shown.
+    """
+    pct = entry_pct_for(timeframe)
     if zone["type"] == "demand":
-        entry = zone["proximal"] * (1 + ALERT_ENTRY_PCT / 100.0)
+        entry = zone["proximal"] * (1 + pct / 100.0)
         direction = "🟢 *DEMAND* zone approach (↓)"
     else:
-        entry = zone["proximal"] * (1 - ALERT_ENTRY_PCT / 100.0)
+        entry = zone["proximal"] * (1 - pct / 100.0)
         direction = "🔴 *SUPPLY* zone approach (↑)"
 
     trend_lbl = tf_label(trend_tf_for(timeframe))   # weekly when LTF=daily
@@ -1172,6 +1329,27 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
             d_pct = (z["proximal"] - close_now) / close_now * 100.0
         return f"HTF {ztype}: {d_pct:+.1f}% / score {z['score']:.1f}"
 
+    # EMA20 confluence: count how many D/W/M/3M EMA20 lines sit inside zone
+    ema_line = ""
+    if ema20s:
+        count, hits = emas_in_zone(zone, ema20s)
+        if count > 0:
+            ema_line = f"\nEMA20 in zone: *{count}* ({', '.join(hits)})"
+        else:
+            ema_line = f"\nEMA20 in zone: 0"
+
+    # Swing-origin line: only shown if the recent peak/trough sits inside
+    # an HTF supply (for demand alerts) or demand (for supply alerts) zone.
+    # If origin_match is None, the line is skipped entirely.
+    origin_line = ""
+    if origin_match is not None and origin_price is not None:
+        htf_tf, htf_zone = origin_match
+        origin_side = "supply" if zone["type"] == "demand" else "demand"
+        origin_line = (
+            f"\nOrigin: From {_ORIGIN_TF_LBL.get(htf_tf, htf_tf)} {origin_side} "
+            f"@ `{origin_price:.2f}` (score {htf_zone['score']:.1f})"
+        )
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
@@ -1183,6 +1361,8 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{_htf_zone_line(htf_dem, f'{zone_lbl} Dem')}\n"
         f"{_htf_zone_line(htf_sup, f'{zone_lbl} Sup')}\n"
         f"{zone_lbl} Position: {htf_status(close_now, htf_dem, htf_sup)}"
+        f"{ema_line}"
+        f"{origin_line}"
     )
 
 

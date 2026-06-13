@@ -27,6 +27,10 @@ from scanner import (
     detect_zones, compute_trend, htf_status, passes_strict_filter,
     passes_125m_strict_filter,
     is_approaching, zone_key, build_alert_msg,
+    # EMA20 confluence
+    compute_ema20, EMA20_TFS,
+    # Swing origin (W/M/3M)
+    find_swing_origin, find_origin_htf_match,
     # Fetching
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
     # IO
@@ -104,6 +108,7 @@ class HtfCache:
     def __init__(self):
         self._trend: dict[tuple, int]                       = {}
         self._df:    dict[tuple, "pd.DataFrame | None"]    = {}
+        self._ema20: dict[tuple, "float | None"]           = {}
 
     def _get_df(self, sym: str, tf: str):
         key = (sym, tf)
@@ -125,9 +130,22 @@ class HtfCache:
             return {"demand": None, "supply": None}
         return detect_zones(df, close_now_override=close_now_override)
 
+    def get_ema20(self, sym: str, tf: str,
+                  prefer_df: "pd.DataFrame | None" = None) -> float | None:
+        """EMA20 for symbol+tf. If prefer_df is provided (already-fetched main
+        batch cache), uses it directly without a separate yfinance call."""
+        key = (sym, tf)
+        if key in self._ema20:
+            return self._ema20[key]
+        df = prefer_df if prefer_df is not None else self._get_df(sym, tf)
+        val = compute_ema20(df) if df is not None else None
+        self._ema20[key] = val
+        return val
+
     def clear(self):
         self._trend.clear()
         self._df.clear()
+        self._ema20.clear()
 
 
 def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
@@ -156,13 +174,22 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
             # Detect zones on this df. IGNORE_INPROGRESS_BAR is on by default
             # inside detect_zones, so the in-progress bar is excluded from
             # legout/test-walk regardless of what we pass here.
-            zones = detect_zones(df, close_now_override=close_now)
+            #
+            # All LTF detection (D / W / 125m) uses the stricter REVERSAL
+            # rule: legout close must close beyond legin close (instead of
+            # the standard body-ratio check). HTF/MTF detection keeps the
+            # standard ratio rule (flag defaults False in HtfCache call).
+            zones = detect_zones(
+                df,
+                close_now_override=close_now,
+                use_close_beyond_legin=True,
+            )
             dem, sup = zones["demand"], zones["supply"]
 
             for z in (dem, sup):
                 if z is None or z["score"] < ALERT_MIN_SCORE:
                     continue
-                if not is_approaching(close_now, z):
+                if not is_approaching(close_now, z, tf):
                     continue
                 key = zone_key(sym, z)
                 if key in state[tf]:
@@ -194,9 +221,33 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     htf_z     = {"demand": None, "supply": None}
 
                 ltf_trend = compute_trend(df)
+
+                # EMA20 confluence: D / W / M / 3M. Re-use main-cache dfs
+                # when available (cheaper than HtfCache's per-symbol fetch).
+                ema20s = {}
+                for ema_tf in EMA20_TFS:
+                    prefer = caches.get(ema_tf, {}).get(sym)
+                    ema20s[ema_tf] = htf_cache.get_ema20(sym, ema_tf, prefer_df=prefer)
+
+                # Swing origin: where did price come from before this alert?
+                # Find recent peak (demand) or trough (supply) on the LTF,
+                # then check if it sits inside a W/M/3M opposite-type zone.
+                origin_price = find_swing_origin(df, z["type"])
+                origin_htf_zones = {
+                    "1wk": htf_cache.get_zones(sym, "1wk", close_now_override=close_now),
+                    "1mo": htf_cache.get_zones(sym, "1mo", close_now_override=close_now),
+                    "3mo": htf_cache.get_zones(sym, "3mo", close_now_override=close_now),
+                }
+                origin_match = find_origin_htf_match(
+                    origin_price, z["type"], origin_htf_zones, ltf_timeframe=tf,
+                )
+
                 msg = build_alert_msg(sym, z, close_now, tf,
                                       ltf_trend, trend_htf,
-                                      htf_z["demand"], htf_z["supply"])
+                                      htf_z["demand"], htf_z["supply"],
+                                      ema20s=ema20s,
+                                      origin_price=origin_price,
+                                      origin_match=origin_match)
 
                 # LLM enrichment (Gemini). No-op if USE_LLM=false.
                 if USE_LLM:
