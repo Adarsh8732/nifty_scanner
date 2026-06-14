@@ -55,6 +55,43 @@ ENTRY_BUFFER_PCT    = float(os.environ.get("ENTRY_BUFFER_PCT",    "0.3"))
 SL_BUFFER_PCT       = float(os.environ.get("SL_BUFFER_PCT",       "0.3"))
 TARGET_RR_MULTIPLE  = float(os.environ.get("TARGET_RR_MULTIPLE",  "2.6"))
 
+# ─── LEGOUT VOLUME STRENGTH ─────────────────────────────────────────────
+# Ratio of the legout candle's Volume to the average of the 20 bars
+# preceding it. A higher ratio = stronger institutional conviction at
+# zone formation = more reliable zone on the return.
+#   >= VOL_STRONG_RATIO → "STRONG" (institutional commitment)
+#   >= VOL_WEAK_RATIO   → "NORMAL"
+#   <  VOL_WEAK_RATIO   → "WEAK"   (likely retail-driven, zone suspect)
+VOL_STRENGTH_LOOKBACK = int(os.environ.get("VOL_STRENGTH_LOOKBACK", "20"))
+VOL_STRONG_RATIO      = float(os.environ.get("VOL_STRONG_RATIO",    "1.5"))
+VOL_WEAK_RATIO        = float(os.environ.get("VOL_WEAK_RATIO",      "0.8"))
+
+
+def legout_volume_strength(V, legout_idx: int) -> tuple[str, float] | None:
+    """Verdict on legout-candle volume vs the 20 prior bars' average.
+
+    V: reversed Volume numpy array (index 0 = latest bar, 1 = last closed, etc.)
+    legout_idx: the start_bar index where the legout sits in the reversed array.
+
+    Returns (label, ratio) or None if not enough prior bars or no volume data.
+    """
+    if V is None:
+        return None
+    prior_lo = legout_idx + 1
+    prior_hi = legout_idx + 1 + VOL_STRENGTH_LOOKBACK
+    if prior_hi > len(V):
+        return None
+    legout_vol = float(V[legout_idx])
+    prior_avg  = float(V[prior_lo:prior_hi].mean())
+    if prior_avg <= 0 or legout_vol < 0:
+        return None
+    ratio = legout_vol / prior_avg
+    if ratio >= VOL_STRONG_RATIO:
+        return ("STRONG", ratio)
+    if ratio >= VOL_WEAK_RATIO:
+        return ("NORMAL", ratio)
+    return ("WEAK", ratio)
+
 
 def calc_trade_levels(zone: dict) -> dict:
     """Compute actual order levels (Entry / SL / Target) for a zone.
@@ -736,6 +773,20 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"R:R: {tl['rr']:.1f}:1  (locked by scanner — no cap)\n"
     )
 
+    # ─── Legout-volume block ────────────────────────────────────────
+    vol_block = "--- LEGOUT VOLUME STRENGTH (institutional commitment) ---\n"
+    vlab = zone.get("vol_label")
+    vrat = zone.get("vol_ratio")
+    if vlab and vrat is not None:
+        vol_block += (
+            f"Legout volume / 20-bar avg: {vrat:.2f}×\n"
+            f"Verdict: {vlab}  "
+            f"(STRONG ≥{VOL_STRONG_RATIO}, NORMAL ≥{VOL_WEAK_RATIO}, WEAK <{VOL_WEAK_RATIO})\n"
+            f"Note: informational only — scanner does NOT filter on volume.\n"
+        )
+    else:
+        vol_block += "(not available — insufficient prior bars or missing volume data)\n"
+
     user_prompt = (
         f"=== SCANNER ALERT — analyze per IDEAL methodology ===\n\n"
         f"Stock:            {symbol}\n"
@@ -760,6 +811,7 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"{ema_block}\n"
         f"{origin_block}\n"
         f"{trade_block}\n"
+        f"{vol_block}\n"
         f"Give your 3-5 sentence IDEAL verdict now. Use the EMA20 confluence "
         f"and swing-origin info to judge structural strength. Mention the "
         f"R:R briefly in your verdict but DO NOT auto-skip on R:R alone."
@@ -902,7 +954,7 @@ def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = _drop_phantom_bars(df)
-        df = df[["Open", "High", "Low", "Close"]].dropna()
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return df if len(df) >= 20 else None
     except Exception as e:
         print(f"  fetch error: {e}")
@@ -1019,7 +1071,7 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
                 df.columns = df.columns.get_level_values(0)
             df = _drop_phantom_bars(df)
             try:
-                df = df[["Open", "High", "Low", "Close"]].dropna()
+                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
             except KeyError:
                 continue
             if len(df) >= 20:
@@ -1054,6 +1106,7 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
     H = df_rev["High"].values
     L = df_rev["Low"].values
     C = df_rev["Close"].values
+    V = df_rev["Volume"].values if "Volume" in df_rev.columns else None
     n = len(df_rev)
 
     # Current-price reference (Leak 1 fix).
@@ -1084,6 +1137,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
 
         if lo_body == 0 or lo_bpct < EXCITE_PCT or not (lo_grn or lo_red):
             continue
+
+        # Volume strength at the legout candle (vs 20 prior bars' average).
+        # Phantom (market-closed) bars are already excluded by fetch_ohlc via
+        # the Volume>0 filter, so this average is on real trading days only.
+        vs = legout_volume_strength(V, start_bar)
 
         # Walk back through base candles. Each candle qualifies if EITHER:
         #   (a) standard rule: bodyPct < BASE_PCT, OR
@@ -1200,6 +1258,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                                 "score":     float(score),
                                 "tests":     int(tc),
                                 "dist_pct":  float(dist_pct),
+                                "vol_label": vs[0] if vs else None,
+                                "vol_ratio": vs[1] if vs else None,
                             }
 
             # Supply: prox = min(legin body-high, legout open); dist = highest wick
@@ -1233,6 +1293,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                                 "score":     float(score),
                                 "tests":     int(tc),
                                 "dist_pct":  float(dist_pct),
+                                "vol_label": vs[0] if vs else None,
+                                "vol_ratio": vs[1] if vs else None,
                             }
             continue   # zero-base path complete for this start_bar
 
@@ -1301,6 +1363,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         "score":     float(score),
                         "tests":     int(tc),
                         "dist_pct":  float(dist_pct),
+                        "vol_label": vs[0] if vs else None,
+                        "vol_ratio": vs[1] if vs else None,
                     }
 
         # ─── Supply zone (red legout) ────────────────────────────
@@ -1341,6 +1405,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         "score":     float(score),
                         "tests":     int(tc),
                         "dist_pct":  float(dist_pct),
+                        "vol_label": vs[0] if vs else None,
+                        "vol_ratio": vs[1] if vs else None,
                     }
 
     return {"demand": best_dem, "supply": best_sup}
@@ -1527,6 +1593,12 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
     trade_line = (f"\nTrade: E `{tl['entry']:.2f}` | SL `{tl['sl']:.2f}` | "
                   f"T `{tl['target']:.2f}` (R:R {tl['rr']:.1f}:1)")
 
+    # Volume strength at the legout candle (informational only, no filtering)
+    vol_line = ""
+    if zone.get("vol_label") and zone.get("vol_ratio") is not None:
+        vol_line = (f"\nVol: legout {zone['vol_ratio']:.2f}× avg → "
+                    f"*{zone['vol_label']}*")
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
@@ -1541,6 +1613,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{ema_line}"
         f"{origin_line}"
         f"{trade_line}"
+        f"{vol_line}"
     )
 
 
