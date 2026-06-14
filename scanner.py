@@ -43,6 +43,58 @@ def entry_pct_for(timeframe: str | None) -> float:
     if timeframe and timeframe in ALERT_ENTRY_PCT_PER_TF:
         return ALERT_ENTRY_PCT_PER_TF[timeframe]
     return ALERT_ENTRY_PCT
+
+
+# ─── ACTUAL TRADE LEVELS (Entry / SL / Target) ──────────────────────────
+# Distinct from ALERT_ENTRY_PCT (the alert-trigger distance from proximal):
+# these are the actual ORDER levels for placing the trade.
+#   Entry  = proximal ± ENTRY_BUFFER_PCT%
+#   SL     = distal   ∓ SL_BUFFER_PCT%
+#   Target = entry projected by TARGET_RR_MULTIPLE × (entry − SL)
+ENTRY_BUFFER_PCT    = float(os.environ.get("ENTRY_BUFFER_PCT",    "0.3"))
+SL_BUFFER_PCT       = float(os.environ.get("SL_BUFFER_PCT",       "0.3"))
+TARGET_RR_MULTIPLE  = float(os.environ.get("TARGET_RR_MULTIPLE",  "2.6"))
+
+
+def calc_trade_levels(zone: dict) -> dict:
+    """Compute actual order levels (Entry / SL / Target) for a zone.
+
+    DEMAND (proximal > distal — zone sits BELOW current price):
+      entry  = proximal × (1 + ENTRY_BUFFER_PCT/100)   slightly above proximal
+      sl     = distal   × (1 - SL_BUFFER_PCT/100)      slightly below distal
+      risk   = entry - sl                              (> 0)
+      target = entry + TARGET_RR_MULTIPLE × risk       above entry
+    SUPPLY (proximal < distal — zone sits ABOVE current price):
+      entry  = proximal × (1 - ENTRY_BUFFER_PCT/100)   slightly below proximal
+      sl     = distal   × (1 + SL_BUFFER_PCT/100)      slightly above distal
+      risk   = sl - entry                              (> 0)
+      target = entry - TARGET_RR_MULTIPLE × risk       below entry
+
+    R:R is always TARGET_RR_MULTIPLE by construction (no cap).
+    Returns {"entry", "sl", "target", "risk", "reward", "rr"}.
+    """
+    prox = float(zone["proximal"])
+    dist = float(zone["distal"])
+    if zone["type"] == "demand":
+        entry  = prox * (1.0 + ENTRY_BUFFER_PCT / 100.0)
+        sl     = dist * (1.0 - SL_BUFFER_PCT    / 100.0)
+        risk   = entry - sl
+        target = entry + TARGET_RR_MULTIPLE * risk
+        reward = target - entry
+    else:  # supply
+        entry  = prox * (1.0 - ENTRY_BUFFER_PCT / 100.0)
+        sl     = dist * (1.0 + SL_BUFFER_PCT    / 100.0)
+        risk   = sl - entry
+        target = entry - TARGET_RR_MULTIPLE * risk
+        reward = entry - target
+    return {
+        "entry":  float(entry),
+        "sl":     float(sl),
+        "target": float(target),
+        "risk":   float(risk),
+        "reward": float(reward),
+        "rr":     float(TARGET_RR_MULTIPLE),
+    }
 ALERT_MIN_SCORE   = float(os.environ.get("ALERT_MIN_SCORE", "7.0"))
 SCAN_DEMAND       = os.environ.get("SCAN_DEMAND", "true").lower() == "true"
 SCAN_SUPPLY       = os.environ.get("SCAN_SUPPLY", "true").lower() == "true"
@@ -580,6 +632,11 @@ sentences covering, in this exact order:
     2+ EMA20s stacking inside the zone.
 (5) ENTRY TYPE recommendation: Type 1 set-and-forget, Type 2/3 confirmation,
     or SKIP.
+(5b) TRADE LEVELS / R:R: the scanner pre-computes Entry, SL, Target at a
+    fixed R:R (typically 2.6:1). Briefly mention the R:R in your verdict
+    ("R:R 2.6:1 acceptable" or similar). DO NOT auto-skip on R:R alone —
+    R:R is locked by formula here; trade-quality decisions stay with IDEAL
+    structure (score / trend / curve / origin / EMA stack).
 (6) PRIMARY RISK: the single most likely way this setup fails (e.g. "weekly
     supply directly overhead", "trend just flipped", "free reversal so
     no structural support backing the zone").
@@ -667,6 +724,18 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
                          f"({htf_zone['proximal']:.2f} → {htf_zone['distal']:.2f}, "
                          f"score {htf_zone['score']:.1f}). High-conviction structural origin.\n")
 
+    # ─── Trade levels block ─────────────────────────────────────────
+    tl = calc_trade_levels(zone)
+    trade_block = (
+        f"--- TRADE LEVELS (computed at fixed R:R) ---\n"
+        f"Entry:  {tl['entry']:.2f}   (proximal ± {ENTRY_BUFFER_PCT}%)\n"
+        f"SL:     {tl['sl']:.2f}      (distal ± {SL_BUFFER_PCT}%)\n"
+        f"Target: {tl['target']:.2f}  (entry projected by {tl['rr']}× risk)\n"
+        f"Risk per unit:   {tl['risk']:.2f}\n"
+        f"Reward per unit: {tl['reward']:.2f}\n"
+        f"R:R: {tl['rr']:.1f}:1  (locked by scanner — no cap)\n"
+    )
+
     user_prompt = (
         f"=== SCANNER ALERT — analyze per IDEAL methodology ===\n\n"
         f"Stock:            {symbol}\n"
@@ -690,8 +759,10 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"{fmt_htf_zone(htf_sup, 'HTF Supply')}\n\n"
         f"{ema_block}\n"
         f"{origin_block}\n"
+        f"{trade_block}\n"
         f"Give your 3-5 sentence IDEAL verdict now. Use the EMA20 confluence "
-        f"and swing-origin info to judge structural strength."
+        f"and swing-origin info to judge structural strength. Mention the "
+        f"R:R briefly in your verdict but DO NOT auto-skip on R:R alone."
     )
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1451,11 +1522,16 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
             f"@ `{origin_price:.2f}` (score {htf_zone['score']:.1f})"
         )
 
+    # Trade levels: Entry / SL / Target (R:R locked at TARGET_RR_MULTIPLE)
+    tl = calc_trade_levels(zone)
+    trade_line = (f"\nTrade: E `{tl['entry']:.2f}` | SL `{tl['sl']:.2f}` | "
+                  f"T `{tl['target']:.2f}` (R:R {tl['rr']:.1f}:1)")
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
         f"Zone: prox `{zone['proximal']:.2f}` → dist `{zone['distal']:.2f}`\n"
-        f"Entry line: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
+        f"Alert at: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
         f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
         f"─────────\n"
         f"{trend_lbl} Trend: {trend_label(htf_trend)}\n"
@@ -1464,6 +1540,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{zone_lbl} Position: {htf_status(close_now, htf_dem, htf_sup)}"
         f"{ema_line}"
         f"{origin_line}"
+        f"{trade_line}"
     )
 
 
