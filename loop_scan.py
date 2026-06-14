@@ -250,11 +250,16 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                                       origin_match=origin_match)
 
                 # LLM enrichment (Gemini). No-op if USE_LLM=false.
+                # Pass EMA20 confluence + swing origin so the model can use
+                # the same structural signals shown in the Telegram alert.
                 if USE_LLM:
                     analysis = analyze_with_gemini(
                         sym, z, close_now, tf,
                         ltf_trend, trend_htf,
                         htf_z["demand"], htf_z["supply"],
+                        ema20s=ema20s,
+                        origin_price=origin_price,
+                        origin_match=origin_match,
                     )
                     if analysis:
                         msg = msg + "\n─────────\n*🧠 AI thesis:*\n" + analysis

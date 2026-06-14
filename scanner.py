@@ -312,17 +312,29 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
             if not r.ok:
                 # Don't log r.text — Dhan errors may echo headers or token snippets.
                 print(f"  Dhan LTP failed: HTTP {r.status_code} (body redacted)")
-                # 401/403 almost always = expired or revoked access token.
-                # Surface immediately so user can refresh the token.
+                # Always alert (deduped by tag) so we never silently lose LTPs.
+                # 401/403 = auth = CRITICAL (need token refresh).
+                # 429 = rate limit, 5xx = Dhan outage → WARNING.
+                # Anything else (400/etc.) → also WARNING.
                 if r.status_code in (401, 403):
                     alert_once(
                         tag      = "dhan_auth_fail",
                         severity = "CRITICAL",
                         title    = f"Dhan auth rejected (HTTP {r.status_code})",
                         detail   = ("Access token likely expired or revoked. "
-                                    "LTPs are now unavailable — scanner falling "
-                                    "back to yfinance close prices. "
-                                    "Run the refresh-token workflow."),
+                                    "LTPs unavailable — scanner falling back "
+                                    "to yfinance close prices. Run the "
+                                    "refresh-token workflow."),
+                    )
+                else:
+                    alert_once(
+                        tag      = f"dhan_http_{r.status_code}",
+                        severity = "WARNING",
+                        title    = f"Dhan LTP failed (HTTP {r.status_code})",
+                        detail   = (f"LTPs unavailable — scanner falling back "
+                                    f"to yfinance close prices. "
+                                    f"Likely cause: rate limit (429), Dhan "
+                                    f"outage (5xx), or request shape change."),
                     )
                 continue
             data = r.json().get("data", {}).get("NSE_EQ", {})
@@ -333,7 +345,18 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
                 if sid in sid_to_ltp:
                     out[sym] = float(sid_to_ltp[sid])
         except Exception as e:
-            print(f"  Dhan LTP exception: {e}")
+            # Network timeout, DNS, JSON parse, connection refused, etc.
+            # Single dedup tag → only one alert per session per outage.
+            print(f"  Dhan LTP exception: {type(e).__name__}: {e}")
+            alert_once(
+                tag      = "dhan_ltp_exception",
+                severity = "WARNING",
+                title    = f"Dhan LTP call failed: {type(e).__name__}",
+                detail   = (f"Reason: {e}\n\n"
+                            "LTPs unavailable — scanner falling back to "
+                            "yfinance close prices. Common causes: network "
+                            "timeout, Dhan outage, or unexpected response."),
+            )
         time.sleep(1.1)   # respect 1 req/sec rate limit
     return out
 
@@ -543,11 +566,23 @@ sentences covering, in this exact order:
     a with-trend trade or an against-trend gamble?
 (3) HTF CONFLUENCE: is the zone close to an aligned HTF zone? Is curve
     position favorable (low on curve for buy, high for sell)?
-(4) ENTRY TYPE recommendation: Type 1 set-and-forget, Type 2/3 confirmation,
+(4) STRUCTURAL ORIGIN + EMA20 STACK: the alert data includes two extra
+    signals you MUST use:
+    - SWING ORIGIN: tells you where price reversed from. "REJECTED from
+      HTF Weekly/Monthly/Quarterly supply (for demand) or demand (for
+      supply)" = high-conviction structural origin. "FREE reversal" =
+      no HTF level was responsible → lower conviction.
+    - EMA20 CONFLUENCE: how many of D/W/M/3M EMA20 lines sit IN ZONE.
+      0/4 = purely structural zone (no mean confluence). 1/4 = one
+      mean line aligned. 2-3/4 = strong mean-reversion target. 4/4 =
+      maximum confluence (all timeframes' means stack at this zone).
+    Combine these: best setup = structural HTF rejection origin AND
+    2+ EMA20s stacking inside the zone.
+(5) ENTRY TYPE recommendation: Type 1 set-and-forget, Type 2/3 confirmation,
     or SKIP.
-(5) PRIMARY RISK: the single most likely way this setup fails (e.g. "weekly
-    supply directly overhead", "trend just flipped", "zone is a reaction
-    of prior zone").
+(6) PRIMARY RISK: the single most likely way this setup fails (e.g. "weekly
+    supply directly overhead", "trend just flipped", "free reversal so
+    no structural support backing the zone").
 
 Be decisive. If the setup violates a hard IDEAL rule (trend mismatch, score
 < 5, against-curve), say SKIP plainly. Never invent numbers — work only
@@ -556,13 +591,21 @@ with what's in the data block. No price targets, no entry/SL prices."""
 
 def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: str,
                         ltf_trend: int, htf_trend: int,
-                        htf_dem: dict | None, htf_sup: dict | None) -> str:
+                        htf_dem: dict | None, htf_sup: dict | None,
+                        ema20s: dict | None = None,
+                        origin_price: float | None = None,
+                        origin_match: tuple | None = None) -> str:
     """Get a IDEAL-rule-based trade thesis from Google Gemini.
 
     Guarded by USE_LLM env flag — returns "" instantly if disabled.
     Free Gemini tier: 15 req/min, 1500 req/day on gemini-2.0-flash.
     Sends IDEAL_SYSTEM_PROMPT as systemInstruction so every alert is judged
     against the full methodology.
+
+    Optional extra signals passed straight to the model:
+      ema20s:        {"1d": 4500.0, "1wk": 4520.0, "1mo": 4450.0, "3mo": 4400.0}
+      origin_price:  recent peak/trough price the swing came from
+      origin_match:  (htf_tf, htf_zone_dict) if origin lies in an HTF zone
 
     Returns "" if disabled, no API key, or call fails — caller appends nothing.
     """
@@ -585,6 +628,45 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
     htf_tf_label = "Weekly" if timeframe == "125m" else ("Monthly" if timeframe == "1d" else "—")
     trend_tf_label = "Daily" if timeframe == "125m" else ("Weekly" if timeframe == "1d" else "Monthly")
 
+    # ─── EMA20 confluence block ─────────────────────────────────────
+    ema_block = "--- EMA20 CONFLUENCE (D / W / M / 3M lines vs zone) ---\n"
+    if ema20s:
+        zone_lo = min(zone["proximal"], zone["distal"])
+        zone_hi = max(zone["proximal"], zone["distal"])
+        for tf_key in ("1d", "1wk", "1mo", "3mo"):
+            v = ema20s.get(tf_key)
+            lbl = {"1d": "D", "1wk": "W", "1mo": "M", "3mo": "3M"}[tf_key]
+            if v is None:
+                ema_block += f"EMA20 {lbl}: (n/a)\n"
+                continue
+            inside = zone_lo <= v <= zone_hi
+            rel = "IN ZONE" if inside else ("above" if v > zone_hi else "below")
+            ema_block += f"EMA20 {lbl}: {v:.2f}  ({rel})\n"
+        count = sum(1 for tf_key in ("1d","1wk","1mo","3mo")
+                    if ema20s.get(tf_key) is not None
+                    and zone_lo <= ema20s[tf_key] <= zone_hi)
+        ema_block += f"Total EMA20 lines IN ZONE: {count}/4\n"
+    else:
+        ema_block += "(not computed)\n"
+
+    # ─── Swing-origin block ─────────────────────────────────────────
+    origin_block = "--- SWING ORIGIN (where price came from) ---\n"
+    if origin_price is None:
+        origin_block += "(no origin computed)\n"
+    elif origin_match is None:
+        side = "high" if zone["type"] == "demand" else "low"
+        origin_block += (f"Recent swing-{side} on LTF: {origin_price:.2f}\n"
+                         f"HTF rejection zone: NONE — this was a FREE reversal "
+                         f"(no W/M/3M structural level). Lower conviction.\n")
+    else:
+        htf_tf, htf_zone = origin_match
+        origin_side = "supply" if zone["type"] == "demand" else "demand"
+        tf_label_short = {"1wk": "Weekly", "1mo": "Monthly", "3mo": "Quarterly"}.get(htf_tf, htf_tf)
+        origin_block += (f"Recent swing point on LTF: {origin_price:.2f}\n"
+                         f"REJECTED from HTF {tf_label_short} {origin_side} zone "
+                         f"({htf_zone['proximal']:.2f} → {htf_zone['distal']:.2f}, "
+                         f"score {htf_zone['score']:.1f}). High-conviction structural origin.\n")
+
     user_prompt = (
         f"=== SCANNER ALERT — analyze per IDEAL methodology ===\n\n"
         f"Stock:            {symbol}\n"
@@ -606,7 +688,10 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"--- HTF CONFLUENCE ({htf_tf_label} zones) ---\n"
         f"{fmt_htf_zone(htf_dem, 'HTF Demand')}\n"
         f"{fmt_htf_zone(htf_sup, 'HTF Supply')}\n\n"
-        f"Give your 3-5 sentence IDEAL verdict now."
+        f"{ema_block}\n"
+        f"{origin_block}\n"
+        f"Give your 3-5 sentence IDEAL verdict now. Use the EMA20 confluence "
+        f"and swing-origin info to judge structural strength."
     )
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -627,24 +712,40 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
         if not r.ok:
             print(f"  Gemini HTTP {r.status_code} (body redacted)")
-            # 404=wrong model, 401/403=bad key, 429=quota.  All "config-level"
-            # failures that won't fix themselves — surface immediately.
-            if r.status_code in (400, 401, 403, 404, 429):
-                alert_once(
-                    tag      = f"gemini_http_{r.status_code}",
-                    severity = "CRITICAL" if r.status_code in (401, 403, 404) else "WARNING",
-                    title    = f"Gemini API HTTP {r.status_code}",
-                    detail   = ("LLM enrichment is broken. Alerts still send "
-                                "without AI thesis (graceful degrade). "
-                                f"Model: {GEMINI_MODEL}. "
-                                "Check API key, model name, and quota."),
-                )
+            # Config-level failures (won't fix themselves) → CRITICAL.
+            # Transient (quota/server) → WARNING.
+            # Anything else (5xx, unexpected) → also alerted so we don't go silent.
+            if r.status_code in (401, 403, 404):
+                sev = "CRITICAL"
+            else:
+                sev = "WARNING"
+            alert_once(
+                tag      = f"gemini_http_{r.status_code}",
+                severity = sev,
+                title    = f"Gemini API HTTP {r.status_code}",
+                detail   = ("LLM enrichment is broken. Alerts still send "
+                            "without AI thesis (graceful degrade). "
+                            f"Model: {GEMINI_MODEL}. "
+                            "Check API key, model name, and quota."),
+            )
             return ""
         data = r.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return text.strip()
     except Exception as e:
-        print(f"  Gemini exception: {type(e).__name__}")
+        # Network timeouts, DNS, JSON parse errors, missing candidates, etc.
+        # Single dedup tag means a long outage produces only ONE alert.
+        print(f"  Gemini exception: {type(e).__name__}: {e}")
+        alert_once(
+            tag      = "gemini_exception",
+            severity = "WARNING",
+            title    = f"Gemini call failed: {type(e).__name__}",
+            detail   = (f"Reason: {e}\n\n"
+                        "LLM enrichment is broken. Alerts still send "
+                        "without AI thesis (graceful degrade). "
+                        "Common causes: network timeout, Google outage, "
+                        "or unexpected response shape."),
+        )
         return ""
 
 
