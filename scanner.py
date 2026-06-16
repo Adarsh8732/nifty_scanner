@@ -489,12 +489,17 @@ def fetch_dhan_ltps(symbols: list[str], secid_map: dict[str, int]) -> dict[str, 
         except Exception as e:
             # Network timeout, DNS, JSON parse, connection refused, etc.
             # Single dedup tag → only one alert per session per outage.
-            print(f"  Dhan LTP exception: {type(e).__name__}: {e}")
+            # NOTE: Dhan URL has no token (it uses headers), so {e} leak risk
+            # is lower than Gemini/TG — but follow the same redaction policy
+            # for consistency. requests exceptions could include the URL +
+            # possibly other request artifacts.
+            print(f"  Dhan LTP exception: {type(e).__name__} (details redacted)")
             alert_once(
                 tag      = "dhan_ltp_exception",
                 severity = "WARNING",
                 title    = f"Dhan LTP call failed: {type(e).__name__}",
-                detail   = (f"Reason: {e}\n\n"
+                detail   = ("Exception details omitted to avoid leaking any "
+                            "request artifacts.\n\n"
                             "LTPs unavailable — scanner falling back to "
                             "yfinance close prices. Common causes: network "
                             "timeout, Dhan outage, or unexpected response."),

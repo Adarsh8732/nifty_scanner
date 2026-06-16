@@ -55,14 +55,19 @@ FORWARD_BARS = {"1d": 120, "1wk": 26, "125m": 60}
 
 
 def walk_forward_with_dates(df, cutoff, zone, max_forward, levels):
-    """Same as backtest_scanner.walk_forward but ALSO returns resolution info."""
+    """Same as backtest_scanner.walk_forward but ALSO returns resolution info.
+
+    Starts AT cutoff (not cutoff+1) to capture same-bar resolution — trades
+    that fill and hit SL/target within the alert bar itself. Mirrors the
+    same-bar fix in backtest_scanner.walk_forward.
+    """
     entry, sl, target = levels["entry"], levels["sl"], levels["target"]
     end_idx = min(cutoff + 1 + max_forward, len(df))
     tested = False
     fill_date = None
 
     if zone["type"] == "demand":
-        for i in range(cutoff + 1, end_idx):
+        for i in range(cutoff, end_idx):
             low  = float(df["Low"].iloc[i])
             high = float(df["High"].iloc[i])
             date = df.index[i]
@@ -78,7 +83,7 @@ def walk_forward_with_dates(df, cutoff, zone, max_forward, levels):
                     return ("WIN", date, fill_date, f"high={high:.2f} ≥ T={target:.2f}")
         return ("LIVE" if tested else "UNTESTED", None, fill_date, "")
     else:  # supply
-        for i in range(cutoff + 1, end_idx):
+        for i in range(cutoff, end_idx):
             low  = float(df["Low"].iloc[i])
             high = float(df["High"].iloc[i])
             date = df.index[i]
