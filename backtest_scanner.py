@@ -258,8 +258,10 @@ def evaluate_snapshot(sym: str, tf: str, cutoff: int,
 
         # Annotations (always computed for analysis)
         ema_count, _ = emas_in_zone(z, ema20s)
-        vol_label = z.get("vol_label") or "UNKNOWN"
-        vol_ratio = z.get("vol_ratio")
+        vol_label   = z.get("vol_label")   or "UNKNOWN"
+        vol_ratio   = z.get("vol_ratio")
+        close_label = z.get("close_label") or "UNKNOWN"
+        close_pct   = z.get("close_pct")
 
         # Swing-origin match: would need HTF zones across W/M/3M.
         # Reuse the htf_snaps we already have.
@@ -286,6 +288,8 @@ def evaluate_snapshot(sym: str, tf: str, cutoff: int,
             "tests":          z["tests"],
             "vol_label":      vol_label,
             "vol_ratio":      vol_ratio,
+            "close_label":    close_label,
+            "close_pct":      close_pct,
             "ema_count":      ema_count,
             "origin_hit":     origin_match_for_z is not None,
             "ltf_trend":      ltf_trend,
@@ -520,28 +524,32 @@ def main(symbols: list[str]):
     print("\n" + "═" * 84)
     print("FULL SET — every detected zone, regardless of alert filters")
     print("═" * 84)
-    crosstab(all_rows, "vol_label", "By Volume verdict")
-    crosstab(all_rows, "ema_count", "By EMA20 count in zone")
+    crosstab(all_rows, "vol_label",   "By Volume verdict")
+    crosstab(all_rows, "close_label", "By Close-in-range verdict")
+    crosstab(all_rows, "ema_count",   "By EMA20 count in zone")
     crosstab(all_rows, "passes_strict", "By Strict filter pass")
-    crosstab(all_rows, "passes_score", "By Score >= threshold")
-    crosstab(all_rows, "origin_hit", "By HTF origin found")
-    crosstab(all_rows, "tf", "By Timeframe")
+    crosstab(all_rows, "passes_score",  "By Score >= threshold")
+    crosstab(all_rows, "origin_hit",  "By HTF origin found")
+    crosstab(all_rows, "tf",          "By Timeframe")
 
     # ─── Reports on the ALERTED set (real alerts) ───
     if alerted:
         print("\n" + "═" * 84)
         print(f"ALERTED SET — {len(alerted)} zones that passed all alert filters")
         print("═" * 84)
-        crosstab(alerted, "vol_label", "Alerted — By Volume verdict")
-        crosstab(alerted, "ema_count", "Alerted — By EMA20 count in zone")
-        crosstab(alerted, "origin_hit", "Alerted — By HTF origin found")
-        crosstab(alerted, "tf",        "Alerted — By Timeframe")
-        crosstab(alerted, "sym",       "Alerted — By Symbol")
+        crosstab(alerted, "vol_label",   "Alerted — By Volume verdict")
+        crosstab(alerted, "close_label", "Alerted — By Close-in-range verdict")
+        crosstab(alerted, "ema_count",   "Alerted — By EMA20 count in zone")
+        crosstab(alerted, "origin_hit",  "Alerted — By HTF origin found")
+        crosstab(alerted, "tf",          "Alerted — By Timeframe")
+        crosstab(alerted, "sym",         "Alerted — By Symbol")
 
         double_crosstab(alerted, "vol_label", "ema_count",
                          "Alerted — Volume × EMA20 count")
         double_crosstab(alerted, "vol_label", "origin_hit",
                          "Alerted — Volume × HTF origin")
+        double_crosstab(alerted, "vol_label", "close_label",
+                         "Alerted — Volume × Close-in-range")
         double_crosstab(alerted, "ema_count", "origin_hit",
                          "Alerted — EMA20 × HTF origin")
 

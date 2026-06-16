@@ -136,6 +136,54 @@ def legout_volume_strength(V, legout_idx: int) -> tuple[str, float] | None:
     return ("WEAK", ratio)
 
 
+# ─── LEGOUT CLOSE-IN-RANGE STRENGTH ─────────────────────────────────────
+# Where did the legout candle CLOSE within its high-low range? A green
+# legout closing near its HIGH means buyers absorbed all intra-bar selling
+# and held the rally into the close — strong conviction. A green legout
+# closing in the middle of its range means sellers pushed back; the rally
+# stalled. Same idea inverted for red legout candles (close near LOW =
+# strong selling).
+#
+# Computed direction-aware so "1.0" always means "extreme close in legout's
+# trade direction" and "0.0" means "extreme rejection":
+#   demand legout (green): pos = (close - low) / range
+#   supply legout (red):   pos = (high - close) / range
+#
+# Thresholds: note that any legout passing EXCITE_PCT (body ≥ 50% of range)
+# mathematically has `pos ≥ 0.50` (pos = body + same-side wick, both ≥ 0).
+# So the practical range is 0.50-1.00 and thresholds must sit inside it.
+#   pos >= 0.85 → STRONG  (close in top 15% — buyers/sellers held strongly)
+#   pos >= 0.70 → NORMAL  (good direction, modest pushback)
+#   pos <  0.70 → WEAK    (mid-range close — opposite side defended)
+CLOSE_STRONG_PCT = float(os.environ.get("CLOSE_STRONG_PCT", "0.85"))
+CLOSE_WEAK_PCT   = float(os.environ.get("CLOSE_WEAK_PCT",   "0.70"))
+
+
+def legout_close_strength(o: float, h: float, l: float,
+                          c: float) -> tuple[str, float] | None:
+    """How decisively did the legout candle close in its trade direction?
+
+    Returns (label, pos) where pos ∈ [0,1]: higher = stronger directional
+    close. None if range is degenerate (no high-low spread) or candle is
+    flat (close == open).
+    """
+    rng = h - l
+    if rng <= 0:
+        return None
+    if c > o:               # green / demand-side legout
+        pos = (c - l) / rng
+    elif c < o:             # red / supply-side legout
+        pos = (h - c) / rng
+    else:
+        return None         # flat candle — no direction
+    if pos >= CLOSE_STRONG_PCT:
+        return ("STRONG", pos)
+    if pos >= CLOSE_WEAK_PCT:
+        return ("NORMAL", pos)
+    return ("WEAK", pos)
+
+
+
 def calc_trade_levels(zone: dict) -> dict:
     """Compute actual order levels (Entry / SL / Target) for a zone.
 
@@ -845,6 +893,25 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
     else:
         vol_block += "(not available — insufficient prior bars or missing volume data)\n"
 
+    close_block = "--- LEGOUT CLOSE-IN-RANGE STRENGTH (conviction at the close) ---\n"
+    clab = zone.get("close_label")
+    cpct = zone.get("close_pct")
+    if clab and cpct is not None:
+        close_block += (
+            f"Close position in legout's range: {cpct*100:.0f}% from the "
+            f"{'low (toward high)' if zone['type']=='demand' else 'high (toward low)'}\n"
+            f"Verdict: {clab}  "
+            f"(STRONG ≥{CLOSE_STRONG_PCT*100:.0f}%, NORMAL ≥{CLOSE_WEAK_PCT*100:.0f}%, "
+            f"WEAK <{CLOSE_WEAK_PCT*100:.0f}%)\n"
+            f"STRONG = buyers/sellers held the move into the close. "
+            f"WEAK = mid-range close, rejection from the opposite side. "
+            f"Combine with volume: high vol + WEAK close = institutional fade, "
+            f"often a failed breakout disguised as a zone.\n"
+            f"Note: informational only — scanner does NOT filter on this.\n"
+        )
+    else:
+        close_block += "(not available — degenerate bar with no range)\n"
+
     user_prompt = (
         f"=== SCANNER ALERT — analyze per IDEAL methodology ===\n\n"
         f"Stock:            {symbol}\n"
@@ -870,9 +937,12 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"{origin_block}\n"
         f"{trade_block}\n"
         f"{vol_block}\n"
+        f"{close_block}\n"
         f"Give your 3-5 sentence IDEAL verdict now. Use the EMA20 confluence "
-        f"and swing-origin info to judge structural strength. Mention the "
-        f"R:R briefly in your verdict but DO NOT auto-skip on R:R alone."
+        f"and swing-origin info to judge structural strength. Weigh the "
+        f"legout volume AND close-in-range together — a STRONG-vol/WEAK-close "
+        f"combo is a classic failed-breakout fade. Mention the R:R briefly "
+        f"in your verdict but DO NOT auto-skip on R:R alone."
     )
 
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1282,6 +1352,12 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         # the Volume>0 filter, so this average is on real trading days only.
         vs = legout_volume_strength(V, start_bar)
 
+        # Close-in-range strength: did the legout close at the extreme of its
+        # range (strong conviction) or mid-range (rejected)? Independent of
+        # volume — high volume + weak close = institutional fade, not a real
+        # zone. Both signals together give a fuller picture of legout quality.
+        cs = legout_close_strength(lo_o, lo_h, lo_l, lo_c)
+
         # Walk back through base candles. Each candle qualifies if EITHER:
         #   (a) standard rule: bodyPct < BASE_PCT, OR
         #   (b) small-body override: absolute body tiny vs BOTH legout body AND
@@ -1415,6 +1491,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                                 "dist_pct":  float(dist_pct),
                                 "vol_label": vs[0] if vs else None,
                                 "vol_ratio": vs[1] if vs else None,
+                                "close_label": cs[0] if cs else None,
+                                "close_pct":   cs[1] if cs else None,
                             }
 
             # Supply: prox = min(legin body-high, legout open); dist = highest wick
@@ -1456,6 +1534,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                                 "dist_pct":  float(dist_pct),
                                 "vol_label": vs[0] if vs else None,
                                 "vol_ratio": vs[1] if vs else None,
+                                "close_label": cs[0] if cs else None,
+                                "close_pct":   cs[1] if cs else None,
                             }
             continue   # zero-base path complete for this start_bar
 
@@ -1535,6 +1615,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         "dist_pct":  float(dist_pct),
                         "vol_label": vs[0] if vs else None,
                         "vol_ratio": vs[1] if vs else None,
+                        "close_label": cs[0] if cs else None,
+                        "close_pct":   cs[1] if cs else None,
                     }
 
         # ─── Supply zone (red legout) ────────────────────────────
@@ -1584,6 +1666,8 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         "dist_pct":  float(dist_pct),
                         "vol_label": vs[0] if vs else None,
                         "vol_ratio": vs[1] if vs else None,
+                        "close_label": cs[0] if cs else None,
+                        "close_pct":   cs[1] if cs else None,
                     }
 
     return {"demand": best_dem, "supply": best_sup}
@@ -1780,6 +1864,13 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         vol_line = (f"\nVol: legout {zone['vol_ratio']:.2f}× avg → "
                     f"*{zone['vol_label']}*")
 
+    # Legout close-in-range strength: did the legout close at the extreme
+    # (strong conviction) or mid-range (rejected)?
+    close_line = ""
+    if zone.get("close_label") and zone.get("close_pct") is not None:
+        close_line = (f"\nClose: legout @ {zone['close_pct']*100:.0f}% of range "
+                      f"→ *{zone['close_label']}*")
+
     return (
         f"{direction}\n"
         f"*{symbol}*  {strategy_tag(symbol)}  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
@@ -1795,6 +1886,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{origin_line}"
         f"{trade_line}"
         f"{vol_line}"
+        f"{close_line}"
     )
 
 
