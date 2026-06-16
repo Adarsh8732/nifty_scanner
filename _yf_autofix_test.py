@@ -20,40 +20,32 @@ import yfinance as yf
 
 from scanner_dhan import fetch_ohlc as fetch_dhan
 from scanner import _drop_phantom_bars
+from scanner import auto_adjust_missed_corp_actions as _prod_autofix
 
 
 def auto_adjust_missed_corp_actions(df: pd.DataFrame, threshold: float = 0.30):
-    """Detect un-tracked corp actions in yfinance data and rescale.
+    """Test wrapper: applies the PRODUCTION auto-fix from scanner.py and also
+    reports which corp actions were detected (for human-readable diagnostics).
 
-    Walks the dataframe backward (newest → oldest). For each bar where the
-    ex-date OPEN gaps from the prior CLOSE by more than `threshold` (default
-    30%), treat it as a missed corp action and multiply all PRIOR bars' OHLC
-    by the gap ratio (ex_date_open / prev_close).
-
-    Why open vs close: on a corp-action ex-date, the OPEN reflects the clean
-    post-corp-action level (NSE re-priced overnight), while the CLOSE has
-    the day's normal price movement layered on top. Using open-vs-prev-close
-    isolates the pure corp-action adjustment ratio. Close-to-close mixes
-    the corp action with intraday price drift, causing ~5-8% residual
-    divergence on the rescaled history.
-
-    Volume is left as-is (correct for demergers; for splits, vol scaling
-    would matter but those typically don't trigger this threshold on a
-    properly-fetched dataset anyway).
+    Single source of truth for the algorithm: scanner.auto_adjust_missed_corp_actions.
+    We call it for the actual fix, then re-walk the input separately to log the
+    detection events so the test output stays informative.
 
     Returns (corrected_df, list_of_adjustments_applied).
     """
-    df = df.copy()
+    # 1. Run the PRODUCTION fix — this is what we're validating
+    corrected = _prod_autofix(df, threshold=threshold)
+
+    # 2. Re-detect (informational only) so we can print which dates triggered
     adjustments = []
     for i in range(len(df) - 1, 0, -1):
         prev_close = float(df["Close"].iloc[i - 1])
         curr_open  = float(df["Open"].iloc[i])
         if prev_close <= 0:
             continue
-        # Compare prev close → THIS bar's open (the corp action gap)
         change = (curr_open - prev_close) / prev_close
         if abs(change) > threshold:
-            ratio = curr_open / prev_close   # true corp-action multiplier
+            ratio = curr_open / prev_close
             adjustments.append({
                 "date":        df.index[i],
                 "prev_close":  prev_close,
@@ -61,9 +53,10 @@ def auto_adjust_missed_corp_actions(df: pd.DataFrame, threshold: float = 0.30):
                 "change_pct":  change * 100,
                 "ratio":       ratio,
             })
-            idx = df.columns.get_indexer(["Open", "High", "Low", "Close"])
-            df.iloc[:i, idx] = df.iloc[:i, idx] * ratio
-    return df, adjustments
+            # NOTE: we do NOT mutate df here. The production scanner.auto_adjust_missed_corp_actions
+            # already produced `corrected` above; this loop is detection-only
+            # so we can report which dates were adjusted.
+    return corrected, adjustments
 
 
 def fetch_yf_5y_daily(sym: str, auto_adjust: bool = True) -> pd.DataFrame | None:
