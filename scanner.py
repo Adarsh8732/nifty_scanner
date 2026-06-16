@@ -1027,6 +1027,133 @@ def send_telegram(text: str) -> None:
         print(f"  TG exception: {type(e).__name__} (details redacted — TG URL contains bot token)")
 
 
+# ─── CHART SNAPSHOT (mplfinance) ────────────────────────────────────────
+# Telegram sendPhoto caption limit
+TG_CAPTION_MAX = 1024
+
+# Chart layout
+CHART_BARS       = int(os.environ.get("CHART_BARS", "60"))   # bars to plot
+CHART_SHOW_EMA20 = os.environ.get("CHART_SHOW_EMA20", "true").lower() == "true"
+
+
+def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
+                      timeframe: str, levels: dict | None = None) -> bytes | None:
+    """Render an OHLC chart with the zone box + entry/SL/target lines.
+
+    Returns PNG bytes (suitable for Telegram sendPhoto) or None on error.
+    The image is NOT cached — every alert gets a fresh render with the
+    latest bars. Failure to render is non-fatal: the caller falls back
+    to text-only.
+    """
+    try:
+        import mplfinance as mpf
+        import matplotlib.pyplot as plt
+        from io import BytesIO
+    except ImportError:
+        # Library not installed — silently skip charting; text alert still fires
+        return None
+
+    if df is None or len(df) < 5:
+        return None
+
+    # Slice to the last CHART_BARS bars so the chart isn't cluttered with
+    # ancient history irrelevant to the current setup.
+    df_plot = df.iloc[-CHART_BARS:].copy()
+
+    # Build the levels we want as horizontal lines
+    prox = float(zone["proximal"])
+    dist = float(zone["distal"])
+    hlines_levels = [prox, dist]
+    hlines_colors = ["#2e7d32" if zone["type"] == "demand" else "#c62828",
+                     "#2e7d32" if zone["type"] == "demand" else "#c62828"]
+    hlines_styles = ["-", "-"]
+    if levels is not None:
+        # Add entry / SL / target dashed lines for trade context
+        hlines_levels += [levels["entry"], levels["sl"], levels["target"]]
+        hlines_colors += ["#1976d2", "#d32f2f", "#388e3c"]   # blue / red / green
+        hlines_styles += ["--", "--", "--"]
+
+    # Add EMA20 overlay if enabled and enough bars
+    addplots = []
+    if CHART_SHOW_EMA20 and len(df_plot) >= 20:
+        ema20 = df_plot["Close"].rolling(20).mean()
+        addplots.append(mpf.make_addplot(ema20, color="#9e9e9e", width=1.0))
+
+    # Title: SYMBOL — Timeframe — last bar date
+    last_date = df_plot.index[-1]
+    if hasattr(last_date, "strftime"):
+        date_str = last_date.strftime("%Y-%m-%d")
+    else:
+        date_str = str(last_date)
+    title = f"{symbol} — {tf_label(timeframe)} — {date_str}"
+
+    # Render to memory
+    buf = BytesIO()
+    try:
+        mpf.plot(
+            df_plot,
+            type     = "candle",
+            style    = "yahoo",
+            volume   = True,
+            addplot  = addplots if addplots else None,
+            hlines   = dict(hlines=hlines_levels,
+                            colors=hlines_colors,
+                            linestyle=hlines_styles,
+                            linewidths=[1.5, 1.5] + [1.0] * (len(hlines_levels) - 2)),
+            title    = title,
+            ylabel   = "Price",
+            ylabel_lower = "Volume",
+            figsize  = (10, 6),
+            tight_layout = True,
+            savefig  = dict(fname=buf, format="png", dpi=110, bbox_inches="tight"),
+        )
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        # Charting failure is non-fatal — fall back to text-only alert.
+        print(f"  Chart render failed: {type(e).__name__}")
+        return None
+    finally:
+        # Close any figures matplotlib left open (memory leak guard)
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
+    """Send a PNG with caption to Telegram. Returns True on success.
+
+    Caption is auto-truncated to TG_CAPTION_MAX if too long. Caller should
+    have already trimmed (e.g., dropped LLM analysis) before this point.
+    Returns False on any failure so caller can fall back to text-only.
+    """
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("  [no TG creds — would send chart]:", caption.split('\n')[0])
+        return False
+    if image_bytes is None or len(image_bytes) == 0:
+        return False
+
+    # Telegram caption limit is 1024 chars. If still over (shouldn't happen
+    # if caller trimmed), hard-truncate as a safety net.
+    if len(caption) > TG_CAPTION_MAX:
+        caption = caption[:TG_CAPTION_MAX - 4] + "\n..."
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", image_bytes, "image/png")}
+    data  = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, data=data, files=files, timeout=20)
+        if not r.ok:
+            print(f"  TG sendPhoto failed: HTTP {r.status_code} (body redacted)")
+            return False
+        return True
+    except Exception as e:
+        # NEVER print {e} verbatim — URL contains bot token.
+        print(f"  TG sendPhoto exception: {type(e).__name__} (details redacted)")
+        return False
+
+
 # ─── OPERATIONAL ALERTS ─────────────────────────────────────────────────
 # Anti-spam: each error tag fires at most ONCE per scanner session, so a
 # Dhan auth failure or Gemini quota event doesn't flood your chat.

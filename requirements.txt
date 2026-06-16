@@ -3,3 +3,4 @@ pandas>=2.0
 requests>=2.31
 pyotp>=2.9
 PyNaCl>=1.5
+mplfinance>=0.12.10
