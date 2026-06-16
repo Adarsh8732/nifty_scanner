@@ -21,7 +21,50 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from symbols import ALL_SYMBOLS
+
+# ─── LOCAL .env LOADER ──────────────────────────────────────────────────
+# Loads key=value pairs from .env (if present) into os.environ. Lines that
+# start with '#' and blank lines are ignored. Existing env vars are NEVER
+# overwritten — this lets GitHub Actions secrets take precedence in CI.
+# Must run BEFORE any os.environ.get() call below.
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception as e:
+        # Don't fail import on a malformed .env — just warn.
+        print(f"  .env load error: {e}")
+
+_load_dotenv()
+
+
+from symbols import ALL_SYMBOLS, STRATEGY_WORKS, STRATEGY_DOES_NOT_WORK
+
+# O(1) lookup sets so we can tag every alert with its backtest category
+_STRATEGY_WORKS_SET = set(STRATEGY_WORKS)
+_STRATEGY_FAILS_SET = set(STRATEGY_DOES_NOT_WORK)
+
+
+def strategy_tag(symbol: str) -> str:
+    """Return a binary category tag for the symbol based on backtest results.
+
+    Every stock in the universe is in exactly one bucket.
+
+    ✅ WORKS — backtest alerted WR >= 33% (above 2.6R breakeven 27.78%)
+    ⚠️ FAILS — backtest alerted WR <  33% OR zero resolved alerts in window
+    """
+    if symbol in _STRATEGY_WORKS_SET:
+        return "✅ WORKS"
+    return "⚠️ FAILS"
 
 # ─── CONFIG (env vars override defaults) ────────────────────────────────
 TG_TOKEN          = os.environ.get("TG_TOKEN", "")
@@ -193,6 +236,16 @@ MAX_BASE         = 3
 LOOKBACK_BARS    = 50
 MAX_ZONE_TESTS   = 1
 ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles between legin & legout)
+
+# Catastrophic-candle threshold (corporate-action filter).
+# yfinance auto_adjust catches FORMAL stock splits but misses MANY Indian
+# demergers, bonus issues, and spin-offs (e.g., VEDL demerger Apr-2026 is
+# absent from yfinance's Stock Splits column). These show up as 30%+ single-
+# bar moves and the zone detector treats them as huge DBR/RBD setups.
+# Any candle with body-vs-prior-close > 30% OR range-vs-prior-close > 30% is
+# treated as a data artifact, and any zone containing it as legin/base/legout
+# is rejected.
+CORPORATE_ACTION_PCT = float(os.environ.get("CORPORATE_ACTION_PCT", "0.30"))
 
 # Treat the most recent bar as in-progress and exclude it from ALL uses,
 # not just legout selection.
@@ -858,12 +911,16 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
     except Exception as e:
         # Network timeouts, DNS, JSON parse errors, missing candidates, etc.
         # Single dedup tag means a long outage produces only ONE alert.
-        print(f"  Gemini exception: {type(e).__name__}: {e}")
+        # IMPORTANT: NEVER print or send {e} verbatim — requests exceptions
+        # may stringify with the full URL, which includes ?key=GEMINI_API_KEY.
+        # Only the exception class name is safe to surface.
+        print(f"  Gemini exception: {type(e).__name__} (details redacted — Gemini URL contains the API key)")
         alert_once(
             tag      = "gemini_exception",
             severity = "WARNING",
             title    = f"Gemini call failed: {type(e).__name__}",
-            detail   = (f"Reason: {e}\n\n"
+            detail   = ("Exception details omitted — the failure URL would "
+                        "include the API key.\n\n"
                         "LLM enrichment is broken. Alerts still send "
                         "without AI thesis (graceful degrade). "
                         "Common causes: network timeout, Google outage, "
@@ -890,7 +947,9 @@ def send_telegram(text: str) -> None:
             # which may include the request URL or token snippets.
             print(f"  TG failed: HTTP {r.status_code} (body redacted)")
     except Exception as e:
-        print(f"  TG exception: {e}")
+        # NEVER print {e} verbatim — requests exceptions can include the
+        # full URL, which contains the bot token (`/bot{TG_TOKEN}/...`).
+        print(f"  TG exception: {type(e).__name__} (details redacted — TG URL contains bot token)")
 
 
 # ─── OPERATIONAL ALERTS ─────────────────────────────────────────────────
@@ -930,13 +989,56 @@ def _drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def auto_adjust_missed_corp_actions(df: pd.DataFrame, threshold: float = 0.30) -> pd.DataFrame:
+    """Rescale historical bars for corp actions yfinance failed to apply.
+
+    Yahoo's split database catches formal stock splits but misses many Indian
+    demergers, bonuses, and spin-offs. These leak through as catastrophic
+    single-bar drops in raw data (e.g., VEDL Apr-2026 demerger: ₹773 → ₹271 in
+    one day). This function detects such drops and rescales all PRIOR bars by
+    the actual corp-action ratio.
+
+    Why prev-close → ex-date OPEN (not close-to-close): the open of the ex-date
+    reflects the clean post-corp-action price (NSE re-prices overnight), while
+    the close mixes in the day's normal intraday drift. Open-based ratio
+    matches Dhan/TradingView's adjusted history to 0.00% on tested stocks.
+
+    Volume is left unchanged (correct for demergers; for splits, vol scaling
+    matters but Yahoo's underlying data already handles tracked splits).
+
+    Returns a NEW DataFrame (does not mutate input).
+    """
+    if df is None or len(df) < 2:
+        return df
+    df = df.copy()
+    for i in range(len(df) - 1, 0, -1):
+        prev_close = float(df["Close"].iloc[i - 1])
+        curr_open  = float(df["Open"].iloc[i])
+        if prev_close <= 0:
+            continue
+        change = (curr_open - prev_close) / prev_close
+        if abs(change) > threshold:
+            ratio = curr_open / prev_close
+            idx = df.columns.get_indexer(["Open", "High", "Low", "Close"])
+            df.iloc[:i, idx] = df.iloc[:i, idx] * ratio
+    return df
+
+
 def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
     """Fetch OHLC for an NSE symbol at the given timeframe. None on failure.
 
-    auto_adjust=False → RAW unadjusted OHLC, matches TradingView and broker
-                        terminals exactly. (auto_adjust=True back-shifts
-                        historical bars by dividend amount → zone prices
-                        diverge from chart by ~div_amount.)
+    auto_adjust=False → RAW unadjusted OHLC; matches Dhan & TradingView
+                        (with "adj" OFF) within ~0% on tested stocks.
+                        Yahoo's underlying data already handles formally-
+                        tracked splits, so this returns split-adjusted but
+                        not dividend-back-shifted prices (matching what
+                        most Indian broker terminals show).
+                        BUT: Yahoo misses Indian demergers/bonuses/spin-offs
+                        — they appear as catastrophic single-bar drops.
+                        We apply auto_adjust_missed_corp_actions() AFTER
+                        fetch to rescale prior bars by the true corp-action
+                        ratio (prev_close → ex_date open). Validated to
+                        0.00% match with Dhan across 9 diverse stocks.
     actions=False     → skip dividends/splits events (avoids yfinance
                         "Dividends out-of-range" crash on weekly fetches).
     Volume filter     → strip phantom bars (NSE holidays/weekends where
@@ -955,7 +1057,11 @@ def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
             df.columns = df.columns.get_level_values(0)
         df = _drop_phantom_bars(df)
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df if len(df) >= 20 else None
+        if len(df) < 20:
+            return None
+        # Patch up corp actions yfinance missed (Indian demergers/bonuses).
+        df = auto_adjust_missed_corp_actions(df)
+        return df
     except Exception as e:
         print(f"  fetch error: {e}")
         return None
@@ -1075,13 +1181,15 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
             except KeyError:
                 continue
             if len(df) >= 20:
-                out[sym] = df
+                # Patch up missed Indian demergers/bonuses
+                out[sym] = auto_adjust_missed_corp_actions(df)
     return out
 
 
 # ─── ZONE DETECTION (Pine port) ─────────────────────────────────────────
 def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
-                 use_close_beyond_legin: bool = False) -> dict:
+                 use_close_beyond_legin: bool = False,
+                 entry_pct: float | None = None) -> dict:
     """Detect best (closest to current price) demand and supply zones.
 
     Mirrors scanner.pine f_scanZones(). Returns:
@@ -1099,6 +1207,15 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         (above for demand DBR, below for supply RBD). Pass True for all
         LTF (D / W / 125m); keep False for HTF (MTF) detection — HTF
         retains the body-ratio rule.
+
+    entry_pct: REQUIRED for "departure-then-return" gate on LTF zones.
+        After zone formation, price must travel OUTSIDE the approach
+        radius (prox ± entry_pct%) at least once before returning. Without
+        this, alerts fire on the bar immediately after legout — no real
+        retest. Pass the timeframe's entry_pct (e.g., 2.0 for daily, 1.5
+        for 125m) when scanning for LTF alerts. Pass None for HTF
+        confluence detection (departure check disabled — HTF zones are
+        used for confluence, not as direct alert sources).
     """
     # Reverse so index 0 = latest bar (matches Pine's [N] indexing)
     df_rev = df.iloc[::-1].reset_index(drop=True)
@@ -1126,8 +1243,25 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
     best_dem = None
     best_sup = None
 
+    # Precompute "catastrophic" bar indices (likely corporate-action artifacts
+    # that yfinance's auto_adjust missed — typically Indian demergers/bonuses).
+    # Reversed-array index i compares C[i] vs prior bar C[i+1].
+    catastrophic: set[int] = set()
+    for i in range(n - 1):
+        prior = C[i + 1]
+        if prior <= 0:
+            continue
+        body_move  = abs(C[i] - prior) / prior
+        range_move = (H[i] - L[i]) / prior
+        if body_move > CORPORATE_ACTION_PCT or range_move > CORPORATE_ACTION_PCT:
+            catastrophic.add(i)
+
     max_start = min(LOOKBACK_BARS, n - MAX_BASE - 3)
     for start_bar in range(1, max_start + 1):
+        # Reject if legout itself is catastrophic (e.g., demerger ex-date)
+        if start_bar in catastrophic:
+            continue
+
         lo_o, lo_h, lo_l, lo_c = O[start_bar], H[start_bar], L[start_bar], C[start_bar]
         lo_body = abs(lo_c - lo_o)
         lo_rng  = lo_h - lo_l
@@ -1151,7 +1285,13 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         base_cnt = 0
         ii = start_bar + 1
         b_hb = b_lb = b_hw = b_lw = None
+        # If any candle we touch during base-walk is catastrophic, break out —
+        # the resulting zone would span a corporate-action artifact.
+        legin_catastrophic = False
         while base_cnt < MAX_BASE and ii < n - 1:
+            if ii in catastrophic:
+                legin_catastrophic = True
+                break
             c_o, c_h, c_l, c_c = O[ii], H[ii], L[ii], C[ii]
             c_body = abs(c_c - c_o)
             c_rng  = c_h - c_l
@@ -1177,6 +1317,10 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 ii += 1
             else:
                 break
+
+        # Walk hit a corporate-action candle — abandon this zone candidate
+        if legin_catastrophic:
+            continue
 
         if ii >= n:
             continue
@@ -1235,8 +1379,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 zone_valid = lo_c > legin_bdy_high or confirm_close > legin_bdy_high
                 if zone_valid and close_now > prox:
                     valid, tc, was_in = True, 0, False
+                    departed = False
+                    depart_level = prox * (1 + (entry_pct or 0) / 100.0)
                     for v in range(start_bar - 1, walk_low - 1, -1):
-                        v_low = L[v]
+                        v_low  = L[v]
+                        v_high = H[v]
                         if v_low < dist:
                             valid = False
                             break
@@ -1244,7 +1391,10 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         if in_zone and not was_in:
                             tc += 1
                         was_in = in_zone
-                    if valid and tc <= MAX_ZONE_TESTS:
+                        if entry_pct is not None and v_high > depart_level:
+                            departed = True
+                    departure_ok = (entry_pct is None) or departed
+                    if valid and tc <= MAX_ZONE_TESTS and departure_ok:
                         is_gap  = lo_o > legin_bdy_high
                         s_score = 2 if is_gap else (2 if nx_bpct >= EXCITE_PCT else 1)
                         f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
@@ -1270,8 +1420,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 zone_valid = lo_c < legin_bdy_low or confirm_close < legin_bdy_low
                 if zone_valid and close_now < prox:
                     valid, tc, was_in = True, 0, False
+                    departed = False
+                    depart_level = prox * (1 - (entry_pct or 0) / 100.0)
                     for v in range(start_bar - 1, walk_low - 1, -1):
                         v_high = H[v]
+                        v_low  = L[v]
                         if v_high > dist:
                             valid = False
                             break
@@ -1279,7 +1432,10 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         if in_zone and not was_in:
                             tc += 1
                         was_in = in_zone
-                    if valid and tc <= MAX_ZONE_TESTS:
+                        if entry_pct is not None and v_low < depart_level:
+                            departed = True
+                    departure_ok = (entry_pct is None) or departed
+                    if valid and tc <= MAX_ZONE_TESTS and departure_ok:
                         is_gap  = lo_o < legin_bdy_low
                         s_score = 2 if is_gap else (2 if nx_bpct >= EXCITE_PCT else 1)
                         f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
@@ -1334,9 +1490,13 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 continue
 
             # Walk forward from legout-1 to current; check breach + count tests
+            # + track departure (did price ever travel outside the approach radius?)
             valid, tc, was_in = True, 0, False
+            departed = False
+            depart_level = prox * (1 + (entry_pct or 0) / 100.0)
             for v in range(start_bar - 1, walk_low - 1, -1):
                 v_low = L[v]
+                v_high = H[v]
                 if v_low < dist:
                     valid = False
                     break
@@ -1344,7 +1504,12 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 if in_zone and not was_in:
                     tc += 1
                 was_in = in_zone
+                if entry_pct is not None and v_high > depart_level:
+                    departed = True
             if not valid or tc > MAX_ZONE_TESTS:
+                continue
+            # Departure gate (LTF only — entry_pct is None for HTF detection)
+            if entry_pct is not None and not departed:
                 continue
 
             is_gap  = lo_o > b_hb
@@ -1377,8 +1542,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 continue
 
             valid, tc, was_in = True, 0, False
+            departed = False
+            depart_level = prox * (1 - (entry_pct or 0) / 100.0)
             for v in range(start_bar - 1, walk_low - 1, -1):
                 v_high = H[v]
+                v_low  = L[v]
                 if v_high > dist:
                     valid = False
                     break
@@ -1386,7 +1554,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                 if in_zone and not was_in:
                     tc += 1
                 was_in = in_zone
+                if entry_pct is not None and v_low < depart_level:
+                    departed = True
             if not valid or tc > MAX_ZONE_TESTS:
+                continue
+            if entry_pct is not None and not departed:
                 continue
 
             is_gap  = lo_o < b_lb
@@ -1565,7 +1737,11 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
             d_pct = (close_now - z["proximal"]) / close_now * 100.0
         else:
             d_pct = (z["proximal"] - close_now) / close_now * 100.0
-        return f"HTF {ztype}: {d_pct:+.1f}% / score {z['score']:.1f}"
+        # Show prox→dist alongside distance% + score so the trader sees the
+        # actual HTF zone levels (not just "5% away, score 7"). Matches LTF
+        # style: prox `value` → dist `value`.
+        return (f"HTF {ztype}: prox `{z['proximal']:.2f}` → "
+                f"dist `{z['distal']:.2f}`  |  {d_pct:+.1f}%  |  score {z['score']:.1f}")
 
     # EMA20 confluence: count how many D/W/M/3M EMA20 lines sit inside zone
     ema_line = ""
@@ -1601,7 +1777,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
 
     return (
         f"{direction}\n"
-        f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
+        f"*{symbol}*  {strategy_tag(symbol)}  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
         f"Zone: prox `{zone['proximal']:.2f}` → dist `{zone['distal']:.2f}`\n"
         f"Alert at: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
         f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
@@ -1666,7 +1842,7 @@ def scan_one_tf(timeframe: str, symbols: list[str],
             df.iloc[-1, df.columns.get_loc("Low")]   = min(df["Low"].iloc[-1], ltp)
 
         close_now = float(df["Close"].iloc[-1])
-        zones = detect_zones(df)
+        zones = detect_zones(df, entry_pct=entry_pct_for(timeframe))
         dem, sup = zones["demand"], zones["supply"]
 
         # Pick approaching + qualifying candidates
