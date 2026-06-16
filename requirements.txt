@@ -3,4 +3,8 @@ pandas>=2.0
 requests>=2.31
 pyotp>=2.9
 PyNaCl>=1.5
-mplfinance>=0.12.10
+# mplfinance has never declared a stable release — their latest is a beta
+# (e.g., 0.12.10b0). pip excludes pre-releases for `>=` constraints, so we
+# must specify the exact beta version. Library is mature & widely used despite
+# the version label.
+mplfinance==0.12.10b0
