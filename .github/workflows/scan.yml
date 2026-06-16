@@ -34,27 +34,51 @@ jobs:
 
       - name: Run scanner loop
         env:
+          # ─── ALERT CHANNEL ROUTING ────────────────────────────────────
+          # ALERT_CHANNEL selects where alerts go. Options:
+          #   'telegram'  → Telegram only (default; restore after Aug-22 ban lift)
+          #   'email'     → SMTP email only (use this during the India Telegram ban)
+          #   'both'      → Send to both channels in parallel (paranoid mode)
+          # To switch back after the ban lifts: edit this single line.
+          ALERT_CHANNEL:      'email'
+
+          # ─── TELEGRAM CREDS (used when ALERT_CHANNEL includes telegram) ─
           TG_TOKEN:           ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+
+          # ─── EMAIL CREDS (used when ALERT_CHANNEL includes email) ──────
+          # Required GH secrets when email is enabled:
+          #   SMTP_USER  — your Gmail (or other) sending address
+          #   SMTP_PASS  — Gmail App Password (NOT your regular password)
+          #                Get one at: https://myaccount.google.com/apppasswords
+          #   EMAIL_TO   — recipient address (can be the same as SMTP_USER)
+          # SMTP_HOST / SMTP_PORT default to Gmail (smtp.gmail.com:587)
+          SMTP_USER:          ${{ secrets.SMTP_USER }}
+          SMTP_PASS:          ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+
+          # ─── DHAN (live LTP) ──────────────────────────────────────────
           DHAN_ACCESS_TOKEN:  ${{ secrets.DHAN_ACCESS_TOKEN }}
           DHAN_CLIENT_ID:     ${{ secrets.DHAN_CLIENT_ID }}
-          # Gemini LLM enrichment of Telegram alerts (optional).
-          # Set USE_LLM='true' AND add GEMINI_API_KEY secret to enable.
+
+          # ─── GEMINI LLM ENRICHMENT (optional) ─────────────────────────
           # gemini-2.5-flash-lite: cheapest current-gen model (~$0.75/mo for
           # 60 alerts/day). gemini-2.5-flash gives slightly better quality at
           # ~$3/mo. gemini-2.0-flash is being phased out — newer billing-
           # enabled projects return HTTP 404 for it.
-          USE_LLM:              'true'            # 'true' to enable LLM analysis
+          USE_LLM:              'true'
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL:         'gemini-2.5-flash-lite'
-          TIMEFRAMES:           '1d,1wk,125m'   # Daily, Weekly, and 125-min intraday
+
+          # ─── SCANNER CONFIG ───────────────────────────────────────────
+          TIMEFRAMES:           '1d,1wk,125m'
           ALERT_ENTRY_PCT:      '1.0'
           ALERT_MIN_SCORE:      '7.0'
           STRICT_FILTER:        'true'
-          TF_125M_CLOSENESS_PCT: '0.30'           # 30% rule for 125m / Weekly confluence
-          POLL_SECONDS:         '30'             # Dhan LTP poll cadence
-          CACHE_REFRESH_MINS:   '60'             # yfinance refresh interval
-          PYTHONUNBUFFERED:     '1'              # stream stdout in real-time (no buffering)
+          TF_125M_CLOSENESS_PCT: '0.30'
+          POLL_SECONDS:         '30'
+          CACHE_REFRESH_MINS:   '60'
+          PYTHONUNBUFFERED:     '1'
         run: python -u loop_scan.py
 
       - name: Commit updated state
@@ -66,20 +90,30 @@ jobs:
           git diff --cached --quiet || git commit -m "loop scan: update state [skip ci]"
           git push || echo "nothing to push"
 
-      - name: Notify Telegram on workflow failure
-        # Triggers on any failed step (including the scanner crashing, OOM
-        # kill, or runner errors). Python-level errors also surface via the
-        # in-process alert_once() — this is the outer safety net.
+      - name: Notify on workflow failure
+        # Triggers on any failed step (scanner crash, OOM, runner errors).
+        # Python-level errors surface via alert_once() inside the scanner —
+        # this is the OUTER safety net for failures that prevent the loop
+        # from running at all.
+        # Dispatches via Python so the same ALERT_CHANNEL routing applies.
         if: failure()
-        run: |
-          ICON="🚨"
-          MSG="${ICON} *CRITICAL: Scanner workflow FAILED*"
-          MSG="${MSG}%0A_Run:_ ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MSG="${MSG}%0A_Job:_ ${GITHUB_JOB}  _Time:_ $(date -u +%H:%M)Z"
-          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d parse_mode=Markdown \
-            -d text="${MSG}" > /dev/null || true
         env:
-          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ALERT_CHANNEL:      ${{ env.ALERT_CHANNEL || 'email' }}
+          TG_TOKEN:           ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+          SMTP_USER:          ${{ secrets.SMTP_USER }}
+          SMTP_PASS:          ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: |
+          python -c "
+          import os
+          from scanner import dispatch_alert
+          msg = (
+              '🚨 *CRITICAL: Scanner workflow FAILED*\n'
+              f'_Run:_ {os.environ[\"GITHUB_SERVER_URL\"]}/'
+              f'{os.environ[\"GITHUB_REPOSITORY\"]}/actions/runs/'
+              f'{os.environ[\"GITHUB_RUN_ID\"]}\n'
+              f'_Job:_ {os.environ[\"GITHUB_JOB\"]}'
+          )
+          dispatch_alert(msg)
+          " || true

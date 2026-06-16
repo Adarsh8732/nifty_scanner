@@ -43,19 +43,30 @@ jobs:
           GH_REPO:          ${{ github.event.repository.name }}
         run: python refresh_dhan_token.py
 
-      - name: Notify Telegram on refresh failure
+      - name: Notify on refresh failure
         # If this step ever runs, the daily token rotation broke. Scanner
         # will read an expired access token tomorrow and lose live LTPs.
+        # Routes through dispatch_alert so the same ALERT_CHANNEL toggle
+        # (Telegram vs email vs both) applies here too.
         if: failure()
-        run: |
-          MSG="🚨 *CRITICAL: Dhan token refresh FAILED*"
-          MSG="${MSG}%0AScanner will lose live LTPs at next session."
-          MSG="${MSG}%0A_Run:_ ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MSG="${MSG}%0A_Time:_ $(date -u +%H:%M)Z"
-          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d parse_mode=Markdown \
-            -d text="${MSG}" > /dev/null || true
         env:
-          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ALERT_CHANNEL:      'email'         # match scan.yml during ban
+          TG_TOKEN:           ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+          SMTP_USER:          ${{ secrets.SMTP_USER }}
+          SMTP_PASS:          ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: |
+          pip install -r requirements.txt
+          python -c "
+          import os
+          from scanner import dispatch_alert
+          msg = (
+              '🚨 *CRITICAL: Dhan token refresh FAILED*\n'
+              'Scanner will lose live LTPs at next session.\n'
+              f'_Run:_ {os.environ[\"GITHUB_SERVER_URL\"]}/'
+              f'{os.environ[\"GITHUB_REPOSITORY\"]}/actions/runs/'
+              f'{os.environ[\"GITHUB_RUN_ID\"]}'
+          )
+          dispatch_alert(msg)
+          " || true

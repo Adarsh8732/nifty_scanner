@@ -27,8 +27,8 @@ from scanner import (
     detect_zones, compute_trend, htf_status, passes_strict_filter,
     passes_125m_strict_filter,
     is_approaching, zone_key, build_alert_msg,
-    build_chart_image, send_telegram_photo, calc_trade_levels,
-    TG_CAPTION_MAX,
+    build_chart_image, calc_trade_levels,
+    dispatch_alert,
     # EMA20 confluence
     compute_ema20, EMA20_TFS,
     # Swing origin (W/M/3M)
@@ -36,7 +36,7 @@ from scanner import (
     # Fetching
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
     # IO
-    send_telegram, alert_once,
+    alert_once,
     # LLM (Gemini)
     analyze_with_gemini, USE_LLM,
     # Helpers
@@ -342,26 +342,18 @@ def main() -> int:
         # Detect crossings + collect alerts
         alerts = scan_iteration(ALL_SYMBOLS, caches, live_ltps, state, htf_cache)
 
-        # Send Telegram alerts.
-        # Strategy per alert:
-        #   1. If chart rendered AND full message (alert + LLM) ≤ 1024 chars
-        #      → send chart with full caption (one Telegram message).
-        #   2. If chart rendered BUT full message > 1024 chars
-        #      → send chart with msg_short (alert only, no LLM). LLM is
-        #        sacrificed to keep the chart attached.
-        #   3. If chart failed to render (mplfinance missing, error, etc.)
-        #      → fall back to text-only send_telegram with full message.
+        # Dispatch alerts to the configured channel(s).
+        # ALERT_CHANNEL env var controls routing:
+        #   "telegram"  → Telegram only (default; chart attached if it fits)
+        #   "email"     → SMTP email only (no caption limit, full thesis goes)
+        #   "both"      → Both channels (independent fails)
+        # The dispatcher handles all per-channel quirks: caption truncation,
+        # chart-vs-text fallback, missing creds. Per-alert logic is unchanged
+        # — just one function call instead of inline branching.
         for a in alerts:
-            sent_with_chart = False
-            if a["chart_bytes"]:
-                caption = a["msg_full"] if len(a["msg_full"]) <= TG_CAPTION_MAX \
-                                        else a["msg_short"]
-                sent_with_chart = send_telegram_photo(a["chart_bytes"], caption)
-            if not sent_with_chart:
-                # Fall back to text-only (full message — 4096 char limit applies)
-                send_telegram(a["msg_full"])
+            dispatch_alert(a["msg_full"], a["msg_short"], a["chart_bytes"])
             total_alerts_sent += 1
-            time.sleep(0.4)  # respect TG rate limit
+            time.sleep(0.4)  # respect TG / SMTP rate limits
 
         loop_time = time.time() - loop_start
         print(f"[{now_ist().strftime('%H:%M:%S')}] iter {iteration:4d} "

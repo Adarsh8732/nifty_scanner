@@ -486,3 +486,50 @@ All from `scan.yml` env vars:
 | `TF_125M_CLOSENESS_PCT` | `0.30` | 30% rule threshold for 125m/W confluence |
 | `POLL_SECONDS` | `30` | How often to fetch Dhan LTPs |
 | `CACHE_REFRESH_MINS` | `60` | How often to refresh yfinance cache |
+| `ALERT_CHANNEL` | `telegram` | Where alerts go: `telegram` / `email` / `both` |
+
+---
+
+## 11. Alert channels (Telegram + Email)
+
+The scanner can deliver alerts via Telegram, email, or both. Switching is a
+single env-var change in `scan.yml`:
+
+```yaml
+ALERT_CHANNEL: 'email'      # SMTP only (use during Telegram restrictions)
+ALERT_CHANNEL: 'telegram'   # Telegram only (default)
+ALERT_CHANNEL: 'both'       # Send to both in parallel (paranoid mode)
+```
+
+The `dispatch_alert()` function in `scanner.py` routes each alert to the
+configured channel(s). Telegram + email logic is independent — if one fails,
+the other still goes.
+
+### Telegram setup (existing — no change)
+
+Requires GH Actions secrets `TG_TOKEN`, `TG_CHAT_ID`. Telegram caption cap is
+1024 chars; when chart is attached, the Gemini LLM thesis is dropped if the
+combined caption would exceed that cap.
+
+### Email setup (Gmail SMTP)
+
+One-time setup:
+
+1. **Enable 2FA on your Google account** (required for App Passwords).
+2. **Generate a Gmail App Password** at
+   <https://myaccount.google.com/apppasswords>. This 16-char password is
+   separate from your regular Gmail password — use it only here.
+3. **Add three GH Actions secrets**:
+   | Secret | Value |
+   |--------|-------|
+   | `SMTP_USER` | Your Gmail address, e.g. `yourname@gmail.com` |
+   | `SMTP_PASS` | The 16-char App Password from step 2 |
+   | `EMAIL_TO`  | Recipient address (can be the same as `SMTP_USER`) |
+4. **Flip `ALERT_CHANNEL` to `email`** in `scan.yml` and push.
+
+Defaults: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587` (TLS). Override via env
+if using a different provider.
+
+Email has no caption-length limit, so the FULL alert (zone details + LLM
+thesis) is always sent. The chart PNG is attached inline so it renders in the
+email body.

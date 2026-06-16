@@ -1121,6 +1121,133 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
             pass
 
 
+# ─── EMAIL DELIVERY (SMTP, no external deps) ────────────────────────────
+# Alternate alert channel — useful when Telegram is blocked (e.g., India ban).
+# Uses Python stdlib smtplib + email.mime — no extra requirements needed.
+#
+# Required env vars when ALERT_CHANNEL includes "email":
+#   SMTP_HOST       (default: smtp.gmail.com)
+#   SMTP_PORT       (default: 587 — TLS)
+#   SMTP_USER       (your sending account, e.g., yourname@gmail.com)
+#   SMTP_PASS       (Gmail App Password — NOT your regular password)
+#   EMAIL_TO        (recipient address — can be the same as SMTP_USER)
+#
+# Gmail App Password setup: https://myaccount.google.com/apppasswords
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+EMAIL_TO  = os.environ.get("EMAIL_TO",  "")
+
+
+def _email_subject_from_msg(msg: str) -> str:
+    """Extract a one-line subject from the alert markdown body.
+
+    Picks the first non-empty line, strips markdown chars, caps at ~120 chars.
+    """
+    for line in msg.splitlines():
+        line = line.strip()
+        if line:
+            cleaned = (line.replace("*", "").replace("`", "")
+                          .replace("_", "").replace("#", "").strip())
+            return cleaned[:120] if len(cleaned) > 120 else cleaned
+    return "Zone scanner alert"
+
+
+def send_email(subject: str, body: str,
+               image_bytes: bytes | None = None) -> bool:
+    """Send an email with optional inline PNG attachment. Returns True on success.
+
+    Body is sent as plain text (markdown shows as-is — still readable). No
+    caption length limit, so the full alert + Gemini thesis fits.
+
+    Failure modes are caught — caller can fall back to another channel.
+    """
+    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
+        print("  [no SMTP creds — would email]:", subject)
+        return False
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text  import MIMEText
+    from email.mime.image import MIMEImage
+
+    msg = MIMEMultipart()
+    msg["From"]    = SMTP_USER
+    msg["To"]      = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", _charset="utf-8"))
+
+    if image_bytes:
+        try:
+            img = MIMEImage(image_bytes, _subtype="png")
+            img.add_header("Content-Disposition", "inline", filename="chart.png")
+            img.add_header("Content-ID", "<chart>")
+            msg.attach(img)
+        except Exception as e:
+            # Image attach failed — still send the text body
+            print(f"  Email image attach failed: {type(e).__name__}")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        # SMTP exceptions can include the server response — typically
+        # safe to log (no token in URLs for SMTP), but redact for hygiene.
+        print(f"  SMTP send failed: {type(e).__name__} (details redacted)")
+        return False
+
+
+# ─── ALERT CHANNEL DISPATCHER ───────────────────────────────────────────
+# Routes alerts to one or more channels based on the ALERT_CHANNEL env var.
+# Supported values (case-insensitive, comma-separated for multi):
+#   "telegram"   → Telegram only (default)
+#   "email"      → Email only
+#   "both" / "telegram,email" → both channels
+#
+# Each channel is independent: if Telegram fails, email still goes; if
+# email fails, Telegram still goes. Caller logs at the channel level.
+ALERT_CHANNEL = os.environ.get("ALERT_CHANNEL", "telegram").lower()
+
+
+def _channels() -> list[str]:
+    if ALERT_CHANNEL == "both":
+        return ["telegram", "email"]
+    return [c.strip() for c in ALERT_CHANNEL.split(",") if c.strip()]
+
+
+def dispatch_alert(msg_full: str, msg_short: str | None = None,
+                   image_bytes: bytes | None = None) -> None:
+    """Route an alert to the configured channel(s).
+
+    msg_full:    alert text WITH LLM thesis (used when channel permits)
+    msg_short:   alert text WITHOUT LLM thesis (used when Telegram caption
+                 would overflow; defaults to msg_full if not provided)
+    image_bytes: PNG chart bytes (None means text-only)
+    """
+    if msg_short is None:
+        msg_short = msg_full
+
+    for ch in _channels():
+        if ch == "telegram":
+            if image_bytes:
+                # Pick the longest caption that fits Telegram's 1024-char cap
+                caption = msg_full if len(msg_full) <= TG_CAPTION_MAX else msg_short
+                ok = send_telegram_photo(image_bytes, caption)
+                if not ok:
+                    send_telegram(msg_full)   # fall back to text-only
+            else:
+                send_telegram(msg_full)
+        elif ch == "email":
+            subject = _email_subject_from_msg(msg_full)
+            # Email has no caption limit; always send the FULL message
+            send_email(subject, msg_full, image_bytes=image_bytes)
+        else:
+            print(f"  [unknown ALERT_CHANNEL '{ch}' — skipping]")
+
+
 def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
     """Send a PNG with caption to Telegram. Returns True on success.
 
