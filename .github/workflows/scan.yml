@@ -83,6 +83,14 @@ jobs:
           # Default '125m' tightens noisy intraday; add other TFs if you
           # want to tighten them too. Set to '' to disable everywhere.
           REQUIRE_DUAL_LEGOUT_TFS: '125m'
+          # Position-sizing: per-trade risk budget shown in the alert as
+          # "Qty @ ₹{X} risk: N shares". Default 5000 INR.
+          RISK_PER_TRADE_INR:   '5000'
+          # Chart visual config — bigger image = more candles per chart.
+          # 100 bars × 14×7-inch canvas @ 110 dpi ≈ 1540×770 px, ~150 KB PNG.
+          CHART_BARS:           '100'
+          CHART_WIDTH_IN:       '14'
+          CHART_HEIGHT_IN:      '7'
           PYTHONUNBUFFERED:     '1'
         run: python -u loop_scan.py
 

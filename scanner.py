@@ -122,6 +122,14 @@ ENTRY_BUFFER_PCT    = float(os.environ.get("ENTRY_BUFFER_PCT",    "0.3"))
 SL_BUFFER_PCT       = float(os.environ.get("SL_BUFFER_PCT",       "0.3"))
 TARGET_RR_MULTIPLE  = float(os.environ.get("TARGET_RR_MULTIPLE",  "2.6"))
 
+# ─── POSITION SIZING ────────────────────────────────────────────────────
+# Per-trade risk budget in INR. Used purely to display a suggested quantity
+# in the alert — does NOT affect detection or filtering.
+#   quantity = RISK_PER_TRADE_INR / |entry - sl|
+# Pick whatever single-trade loss you're comfortable with (typical: 0.5-2%
+# of total capital).
+RISK_PER_TRADE_INR  = float(os.environ.get("RISK_PER_TRADE_INR", "5000"))
+
 # ─── LEGOUT VOLUME STRENGTH ─────────────────────────────────────────────
 # Ratio of the legout candle's Volume to the average of the 20 bars
 # preceding it. A higher ratio = stronger institutional conviction at
@@ -1056,7 +1064,18 @@ def send_telegram(text: str) -> None:
 TG_CAPTION_MAX = 1024
 
 # Chart layout
-CHART_BARS       = int(os.environ.get("CHART_BARS", "60"))   # bars to plot
+# Chart visual config (all env-overridable).
+# CHART_BARS: how many recent bars to plot. More = more context but candles
+#             get visually thinner. Pair with CHART_WIDTH for legibility.
+# CHART_WIDTH / CHART_HEIGHT: matplotlib figsize in inches × DPI = pixel size.
+#             Default 14×7 in × 110 dpi ≈ 1540×770 px — Telegram displays
+#             this cleanly without compression artifacts.
+# CHART_DPI: rendering resolution. Higher = sharper but bigger file. 110 is
+#             a good balance for Telegram (image stays under ~150 KB).
+CHART_BARS       = int(os.environ.get("CHART_BARS", "100"))
+CHART_WIDTH_IN   = float(os.environ.get("CHART_WIDTH_IN",  "14"))
+CHART_HEIGHT_IN  = float(os.environ.get("CHART_HEIGHT_IN", "7"))
+CHART_DPI        = int(os.environ.get("CHART_DPI", "110"))
 CHART_SHOW_EMA20 = os.environ.get("CHART_SHOW_EMA20", "true").lower() == "true"
 
 
@@ -1159,9 +1178,13 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
             addplot  = addplots if addplots else None,
             title    = title,
             ylabel   = "Price",
-            figsize  = (10, 6) if has_volume else (10, 5),
+            # Wider canvas + more bars (CHART_BARS=100 default) = better
+            # context. Shrink slightly when no volume panel so the price
+            # area uses the freed space.
+            figsize  = ((CHART_WIDTH_IN, CHART_HEIGHT_IN) if has_volume
+                        else (CHART_WIDTH_IN, CHART_HEIGHT_IN - 1)),
             tight_layout = True,
-            savefig  = dict(fname=buf, format="png", dpi=110, bbox_inches="tight"),
+            savefig  = dict(fname=buf, format="png", dpi=CHART_DPI, bbox_inches="tight"),
         )
         if hlines_levels:
             plot_kwargs["hlines"] = dict(
@@ -2365,6 +2388,15 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
     tl = calc_trade_levels(zone)
     trade_line = (f"\nTrade: E `{tl['entry']:.2f}` | SL `{tl['sl']:.2f}` | "
                   f"T `{tl['target']:.2f}` (R:R {tl['rr']:.1f}:1)")
+    # Position-sizing helper:
+    #   risk_per_share = |entry - sl|
+    #   qty            = RISK_PER_TRADE_INR / risk_per_share
+    # Shown so the trader can place the order without doing the math by hand.
+    risk_per_share = abs(tl["entry"] - tl["sl"])
+    if risk_per_share > 0:
+        qty = int(RISK_PER_TRADE_INR / risk_per_share)
+        trade_line += (f"\nRisk/share: `₹{risk_per_share:.2f}`  |  "
+                       f"Qty @ ₹{RISK_PER_TRADE_INR:.0f} risk: *{qty}* shares")
 
     # Volume strength at the legout candle (informational only, no filtering)
     vol_line = ""
