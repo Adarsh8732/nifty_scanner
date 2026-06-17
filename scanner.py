@@ -1176,7 +1176,10 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
             style    = "yahoo",
             volume   = has_volume,
             addplot  = addplots if addplots else None,
-            title    = title,
+            # Pass title as a dict with explicit weight='bold' to override
+            # mplfinance's default semibold weight (most bundled fonts don't
+            # have a semibold face, which spams a findfont warning).
+            title    = dict(title=title, weight="bold"),
             ylabel   = "Price",
             # Wider canvas + more bars (CHART_BARS=100 default) = better
             # context. Shrink slightly when no volume panel so the price
