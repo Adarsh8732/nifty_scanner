@@ -27,7 +27,7 @@ from scanner import (
     detect_zones, compute_trend, htf_status, passes_strict_filter,
     passes_125m_strict_filter,
     is_approaching, zone_key, build_alert_msg,
-    build_chart_image, calc_trade_levels,
+    build_chart_album, calc_trade_levels,
     dispatch_alert,
     # EMA20 confluence
     compute_ema20, EMA20_TFS,
@@ -117,6 +117,11 @@ class HtfCache:
         if key not in self._df:
             self._df[key] = fetch_ohlc(sym, tf)
         return self._df[key]
+
+    # Public alias — callers needing the cached df directly (e.g., for chart
+    # rendering at trend or HTF zone timeframes) should use this.
+    def get_df(self, sym: str, tf: str):
+        return self._get_df(sym, tf)
 
     def get_trend(self, sym: str, tf: str) -> int:
         key = (sym, tf)
@@ -268,16 +273,26 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     if analysis:
                         msg_full = msg_short + "\n─────────\n*🧠 AI thesis:*\n" + analysis
 
-                # Build the chart snapshot for this alert (non-fatal if fails)
-                chart_bytes = build_chart_image(
-                    sym, df, z, tf, levels=calc_trade_levels(z),
+                # Build the 3-chart album: alert TF / trend TF / HTF zone TF.
+                # All charts are best-effort — any that fails to render is
+                # silently dropped. Empty list → dispatch_alert sends text only.
+                trend_tf  = trend_tf_for(tf)
+                zone_htf  = zone_tf_for(tf)
+                charts = build_chart_album(
+                    sym,
+                    alert_tf=tf, alert_df=df,
+                    alert_zone=z, alert_levels=calc_trade_levels(z),
+                    trend_tf=trend_tf, trend_df=htf_cache.get_df(sym, trend_tf),
+                    trend_value=trend_htf,
+                    htf_tf=zone_htf, htf_df=htf_cache.get_df(sym, zone_htf),
+                    htf_dem=htf_z["demand"], htf_sup=htf_z["supply"],
                 )
 
                 alerts.append({
-                    "sym":         sym,
-                    "msg_full":    msg_full,    # alert + LLM
-                    "msg_short":   msg_short,   # alert only (no LLM)
-                    "chart_bytes": chart_bytes, # PNG bytes or None
+                    "sym":       sym,
+                    "msg_full":  msg_full,    # alert + LLM
+                    "msg_short": msg_short,   # alert only (no LLM)
+                    "charts":    charts,      # list of PNG bytes (0-3 entries)
                 })
                 state[tf][key] = {
                     "first_alerted": now_ist().isoformat(),
@@ -351,7 +366,7 @@ def main() -> int:
         # chart-vs-text fallback, missing creds. Per-alert logic is unchanged
         # — just one function call instead of inline branching.
         for a in alerts:
-            dispatch_alert(a["msg_full"], a["msg_short"], a["chart_bytes"])
+            dispatch_alert(a["msg_full"], a["msg_short"], images=a["charts"])
             total_alerts_sent += 1
             time.sleep(0.4)  # respect TG / SMTP rate limits
 

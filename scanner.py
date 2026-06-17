@@ -1036,9 +1036,21 @@ CHART_BARS       = int(os.environ.get("CHART_BARS", "60"))   # bars to plot
 CHART_SHOW_EMA20 = os.environ.get("CHART_SHOW_EMA20", "true").lower() == "true"
 
 
-def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
-                      timeframe: str, levels: dict | None = None) -> bytes | None:
-    """Render an OHLC chart with the zone box + entry/SL/target lines.
+def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
+                      *, zone: dict | None = None,
+                      htf_dem: dict | None = None, htf_sup: dict | None = None,
+                      levels: dict | None = None,
+                      show_ema20: bool = True, show_sma50: bool = False,
+                      title_suffix: str = "") -> bytes | None:
+    """Render a candlestick chart with optional zone/HTF/level overlays.
+
+    All overlays are independent and optional:
+      zone     — primary zone (band drawn in green for demand, red for supply)
+      htf_dem  — additional HTF demand zone (green band) for confluence view
+      htf_sup  — additional HTF supply zone (red band) for confluence view
+      levels   — dict with entry/sl/target (dashed lines)
+      show_ema20 / show_sma50  — moving-average overlays
+      title_suffix — appended to default title (e.g., "  |  Trend: ↑ UP")
 
     Returns PNG bytes (suitable for Telegram sendPhoto) or None on error.
     The image is NOT cached — every alert gets a fresh render with the
@@ -1060,32 +1072,49 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
     # ancient history irrelevant to the current setup.
     df_plot = df.iloc[-CHART_BARS:].copy()
 
-    # Build the levels we want as horizontal lines
-    prox = float(zone["proximal"])
-    dist = float(zone["distal"])
-    hlines_levels = [prox, dist]
-    hlines_colors = ["#2e7d32" if zone["type"] == "demand" else "#c62828",
-                     "#2e7d32" if zone["type"] == "demand" else "#c62828"]
-    hlines_styles = ["-", "-"]
+    # Build horizontal-line overlays (zone bands + entry/SL/target dashes)
+    hlines_levels: list[float] = []
+    hlines_colors: list[str] = []
+    hlines_styles: list[str] = []
+    hlines_widths: list[float] = []
+
+    def _add_band(z: dict, color: str) -> None:
+        hlines_levels.extend([float(z["proximal"]), float(z["distal"])])
+        hlines_colors.extend([color, color])
+        hlines_styles.extend(["-", "-"])
+        hlines_widths.extend([1.5, 1.5])
+
+    if zone is not None:
+        # Primary zone: green for demand, red for supply
+        _add_band(zone, "#2e7d32" if zone["type"] == "demand" else "#c62828")
+    if htf_dem is not None:
+        _add_band(htf_dem, "#2e7d32")    # HTF demand always green
+    if htf_sup is not None:
+        _add_band(htf_sup, "#c62828")    # HTF supply always red
+
     if levels is not None:
-        # Add entry / SL / target dashed lines for trade context
-        hlines_levels += [levels["entry"], levels["sl"], levels["target"]]
-        hlines_colors += ["#1976d2", "#d32f2f", "#388e3c"]   # blue / red / green
-        hlines_styles += ["--", "--", "--"]
+        # Entry / SL / Target dashed lines
+        hlines_levels.extend([levels["entry"], levels["sl"], levels["target"]])
+        hlines_colors.extend(["#1976d2", "#d32f2f", "#388e3c"])   # blue / red / green
+        hlines_styles.extend(["--", "--", "--"])
+        hlines_widths.extend([1.0, 1.0, 1.0])
 
-    # Add EMA20 overlay if enabled and enough bars
+    # Moving-average overlays
     addplots = []
-    if CHART_SHOW_EMA20 and len(df_plot) >= 20:
-        ema20 = df_plot["Close"].rolling(20).mean()
+    if show_ema20 and len(df_plot) >= 20:
+        ema20 = df_plot["Close"].ewm(span=20, adjust=False).mean()
         addplots.append(mpf.make_addplot(ema20, color="#9e9e9e", width=1.0))
+    if show_sma50 and len(df_plot) >= 50:
+        sma50 = df_plot["Close"].rolling(50).mean()
+        addplots.append(mpf.make_addplot(sma50, color="#1565c0", width=1.2))
 
-    # Title: SYMBOL — Timeframe — last bar date
+    # Title: SYMBOL — Timeframe — last bar date [+ optional suffix]
     last_date = df_plot.index[-1]
     if hasattr(last_date, "strftime"):
         date_str = last_date.strftime("%Y-%m-%d")
     else:
         date_str = str(last_date)
-    title = f"{symbol} — {tf_label(timeframe)} — {date_str}"
+    title = f"{symbol} — {tf_label(timeframe)} — {date_str}{title_suffix}"
 
     # Show the volume panel only if Volume column exists AND has non-zero data.
     # Some derived timeframes (e.g., 125m before this fix) historically had no
@@ -1104,16 +1133,19 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
             style    = "yahoo",
             volume   = has_volume,
             addplot  = addplots if addplots else None,
-            hlines   = dict(hlines=hlines_levels,
-                            colors=hlines_colors,
-                            linestyle=hlines_styles,
-                            linewidths=[1.5, 1.5] + [1.0] * (len(hlines_levels) - 2)),
             title    = title,
             ylabel   = "Price",
             figsize  = (10, 6) if has_volume else (10, 5),
             tight_layout = True,
             savefig  = dict(fname=buf, format="png", dpi=110, bbox_inches="tight"),
         )
+        if hlines_levels:
+            plot_kwargs["hlines"] = dict(
+                hlines     = hlines_levels,
+                colors     = hlines_colors,
+                linestyle  = hlines_styles,
+                linewidths = hlines_widths,
+            )
         if has_volume:
             plot_kwargs["ylabel_lower"] = "Volume"
         mpf.plot(df_plot, **plot_kwargs)
@@ -1165,8 +1197,13 @@ def _email_subject_from_msg(msg: str) -> str:
 
 
 def send_email(subject: str, body: str,
-               image_bytes: bytes | None = None) -> bool:
-    """Send an email with optional inline PNG attachment. Returns True on success.
+               image_bytes: bytes | None = None,
+               images: list[bytes] | None = None) -> bool:
+    """Send an email with optional inline PNG attachments. Returns True on success.
+
+    Accepts either a single `image_bytes` or a list `images` (or both — they
+    are concatenated). All images are attached inline with sequential
+    Content-IDs so they render in order in the email body.
 
     Body is sent as plain text (markdown shows as-is — still readable). No
     caption length limit, so the full alert + Gemini thesis fits.
@@ -1187,15 +1224,22 @@ def send_email(subject: str, body: str,
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", _charset="utf-8"))
 
+    # Collect all image payloads
+    all_images: list[bytes] = []
     if image_bytes:
+        all_images.append(image_bytes)
+    if images:
+        all_images.extend(im for im in images if im)
+
+    for i, img_data in enumerate(all_images):
         try:
-            img = MIMEImage(image_bytes, _subtype="png")
-            img.add_header("Content-Disposition", "inline", filename="chart.png")
-            img.add_header("Content-ID", "<chart>")
+            img = MIMEImage(img_data, _subtype="png")
+            img.add_header("Content-Disposition", "inline",
+                           filename=f"chart{i+1}.png")
+            img.add_header("Content-ID", f"<chart{i+1}>")
             msg.attach(img)
         except Exception as e:
-            # Image attach failed — still send the text body
-            print(f"  Email image attach failed: {type(e).__name__}")
+            print(f"  Email image attach failed (chart {i+1}): {type(e).__name__}")
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
@@ -1229,31 +1273,45 @@ def _channels() -> list[str]:
 
 
 def dispatch_alert(msg_full: str, msg_short: str | None = None,
-                   image_bytes: bytes | None = None) -> None:
+                   image_bytes: bytes | None = None,
+                   images: list[bytes] | None = None) -> None:
     """Route an alert to the configured channel(s).
 
     msg_full:    alert text WITH LLM thesis (used when channel permits)
     msg_short:   alert text WITHOUT LLM thesis (used when Telegram caption
                  would overflow; defaults to msg_full if not provided)
-    image_bytes: PNG chart bytes (None means text-only)
+    image_bytes: single PNG chart (backward-compat). Use `images` for multi.
+    images:      list of PNG charts. ≥2 → Telegram album, all → email inline.
     """
     if msg_short is None:
         msg_short = msg_full
 
+    # Normalize to a single list of valid image payloads
+    imgs: list[bytes] = []
+    if image_bytes:
+        imgs.append(image_bytes)
+    if images:
+        imgs.extend(im for im in images if im)
+
     for ch in _channels():
         if ch == "telegram":
-            if image_bytes:
-                # Pick the longest caption that fits Telegram's 1024-char cap
+            if len(imgs) >= 2:
+                # Multi-image album (one message, swipeable carousel)
                 caption = msg_full if len(msg_full) <= TG_CAPTION_MAX else msg_short
-                ok = send_telegram_photo(image_bytes, caption)
+                ok = send_telegram_media_group(imgs, caption)
                 if not ok:
-                    send_telegram(msg_full)   # fall back to text-only
+                    send_telegram(msg_full)   # text-only fallback
+            elif imgs:
+                caption = msg_full if len(msg_full) <= TG_CAPTION_MAX else msg_short
+                ok = send_telegram_photo(imgs[0], caption)
+                if not ok:
+                    send_telegram(msg_full)
             else:
                 send_telegram(msg_full)
         elif ch == "email":
             subject = _email_subject_from_msg(msg_full)
-            # Email has no caption limit; always send the FULL message
-            send_email(subject, msg_full, image_bytes=image_bytes)
+            # Email has no caption limit; always send the FULL message + all charts
+            send_email(subject, msg_full, images=imgs)
         else:
             print(f"  [unknown ALERT_CHANNEL '{ch}' — skipping]")
 
@@ -1289,6 +1347,111 @@ def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
         # NEVER print {e} verbatim — URL contains bot token.
         print(f"  TG sendPhoto exception: {type(e).__name__} (details redacted)")
         return False
+
+
+def send_telegram_media_group(images: list[bytes], caption: str) -> bool:
+    """Send a list of PNGs as a single Telegram album (up to 10).
+
+    Telegram's sendMediaGroup bundles photos into ONE chat message — the
+    user gets a single notification with a swipeable carousel. Only the
+    FIRST photo carries a caption (Telegram limit), and that caption is
+    capped at TG_CAPTION_MAX chars like sendPhoto.
+
+    Returns True on success.
+    """
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print(f"  [no TG creds — would send {len(images)}-image album]:", caption.split('\n')[0])
+        return False
+    images = [im for im in (images or []) if im]
+    if not images:
+        return False
+    if len(images) == 1:
+        # Single image: just use sendPhoto (simpler, same UX)
+        return send_telegram_photo(images[0], caption)
+    if len(images) > 10:
+        images = images[:10]   # Telegram cap
+
+    if len(caption) > TG_CAPTION_MAX:
+        caption = caption[:TG_CAPTION_MAX - 4] + "\n..."
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup"
+    files: dict = {}
+    media: list[dict] = []
+    for i, img in enumerate(images):
+        key = f"photo{i}"
+        files[key] = (f"chart{i}.png", img, "image/png")
+        item = {"type": "photo", "media": f"attach://{key}"}
+        if i == 0:
+            # Caption only on first photo (Telegram requirement).
+            item["caption"] = caption
+            item["parse_mode"] = "Markdown"
+        media.append(item)
+    data = {"chat_id": TG_CHAT_ID, "media": json.dumps(media)}
+
+    try:
+        r = requests.post(url, data=data, files=files, timeout=30)
+        if not r.ok:
+            print(f"  TG sendMediaGroup failed: HTTP {r.status_code} (body redacted)")
+            return False
+        return True
+    except Exception as e:
+        print(f"  TG sendMediaGroup exception: {type(e).__name__} (details redacted)")
+        return False
+
+
+def build_chart_album(sym: str,
+                      *,
+                      alert_tf: str, alert_df: "pd.DataFrame",
+                      alert_zone: dict, alert_levels: dict,
+                      trend_tf: str, trend_df: "pd.DataFrame | None",
+                      trend_value: int,
+                      htf_tf: str, htf_df: "pd.DataFrame | None",
+                      htf_dem: dict | None, htf_sup: dict | None,
+                      ) -> list[bytes]:
+    """Build the 3-chart album for an alert: alert TF, trend TF, HTF zone TF.
+
+    Returns a list of PNG bytes in order [alert, trend, htf]. Charts that
+    fail to render (missing df, mplfinance error) are silently skipped —
+    the caller gets whatever rendered successfully.
+
+    Layout per chart:
+      [0] Alert TF: primary zone band + entry/SL/target dashed lines + EMA20
+      [1] Trend TF: OHLC + EMA20 + SMA50, trend verdict in the title
+      [2] HTF TF:   both monthly demand + supply zones + EMA20 (confluence view)
+    """
+    out: list[bytes] = []
+
+    # Chart 1 — Alert TF (zone + trade levels)
+    img = build_chart_image(
+        sym, alert_df, alert_tf,
+        zone=alert_zone, levels=alert_levels,
+        show_ema20=True, show_sma50=False,
+    )
+    if img:
+        out.append(img)
+
+    # Chart 2 — Trend TF (EMA20 + SMA50 + trend verdict)
+    if trend_df is not None and len(trend_df) >= 5:
+        trend_label = {1: "↑ UP", -1: "↓ DOWN"}.get(trend_value, "→ SIDE")
+        img = build_chart_image(
+            sym, trend_df, trend_tf,
+            show_ema20=True, show_sma50=True,
+            title_suffix=f"  |  Trend: {trend_label}",
+        )
+        if img:
+            out.append(img)
+
+    # Chart 3 — HTF zone TF (both monthly demand + supply for confluence)
+    if htf_df is not None and len(htf_df) >= 5:
+        img = build_chart_image(
+            sym, htf_df, htf_tf,
+            htf_dem=htf_dem, htf_sup=htf_sup,
+            show_ema20=True, show_sma50=False,
+        )
+        if img:
+            out.append(img)
+
+    return out
 
 
 # ─── OPERATIONAL ALERTS ─────────────────────────────────────────────────
