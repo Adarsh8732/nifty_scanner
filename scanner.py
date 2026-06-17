@@ -1405,6 +1405,8 @@ def build_chart_album(sym: str,
                       alert_zone: dict, alert_levels: dict,
                       trend_tf: str, trend_df: "pd.DataFrame | None",
                       trend_value: int,
+                      trend_dem: dict | None = None,
+                      trend_sup: dict | None = None,
                       htf_tf: str, htf_df: "pd.DataFrame | None",
                       htf_dem: dict | None, htf_sup: dict | None,
                       ) -> list[bytes]:
@@ -1416,8 +1418,9 @@ def build_chart_album(sym: str,
 
     Layout per chart:
       [0] Alert TF: primary zone band + entry/SL/target dashed lines + EMA20
-      [1] Trend TF: OHLC + EMA20 + SMA50, trend verdict in the title
-      [2] HTF TF:   both monthly demand + supply zones + EMA20 (confluence view)
+      [1] Trend TF: OHLC + EMA20 + SMA50 + BOTH demand/supply zones, trend
+                    verdict in the title
+      [2] HTF TF:   both demand + supply zones + EMA20 (confluence view)
     """
     out: list[bytes] = []
 
@@ -1430,18 +1433,19 @@ def build_chart_album(sym: str,
     if img:
         out.append(img)
 
-    # Chart 2 — Trend TF (EMA20 + SMA50 + trend verdict)
+    # Chart 2 — Trend TF (EMA20 + SMA50 + trend verdict + trend-TF zones)
     if trend_df is not None and len(trend_df) >= 5:
         trend_label = {1: "↑ UP", -1: "↓ DOWN"}.get(trend_value, "→ SIDE")
         img = build_chart_image(
             sym, trend_df, trend_tf,
+            htf_dem=trend_dem, htf_sup=trend_sup,
             show_ema20=True, show_sma50=True,
             title_suffix=f"  |  Trend: {trend_label}",
         )
         if img:
             out.append(img)
 
-    # Chart 3 — HTF zone TF (both monthly demand + supply for confluence)
+    # Chart 3 — HTF zone TF (both demand + supply for confluence)
     if htf_df is not None and len(htf_df) >= 5:
         img = build_chart_image(
             sym, htf_df, htf_tf,

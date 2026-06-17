@@ -278,12 +278,17 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 # silently dropped. Empty list → dispatch_alert sends text only.
                 trend_tf  = trend_tf_for(tf)
                 zone_htf  = zone_tf_for(tf)
+                # Detect zones on the trend timeframe too so the trend chart
+                # shows the same demand/supply bands the trader would draw.
+                trend_z = htf_cache.get_zones(sym, trend_tf,
+                                              close_now_override=close_now)
                 charts = build_chart_album(
                     sym,
                     alert_tf=tf, alert_df=df,
                     alert_zone=z, alert_levels=calc_trade_levels(z),
                     trend_tf=trend_tf, trend_df=htf_cache.get_df(sym, trend_tf),
                     trend_value=trend_htf,
+                    trend_dem=trend_z["demand"], trend_sup=trend_z["supply"],
                     htf_tf=zone_htf, htf_df=htf_cache.get_df(sym, zone_htf),
                     htf_dem=htf_z["demand"], htf_sup=htf_z["supply"],
                 )
