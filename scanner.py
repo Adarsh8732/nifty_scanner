@@ -1087,14 +1087,22 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
         date_str = str(last_date)
     title = f"{symbol} — {tf_label(timeframe)} — {date_str}"
 
+    # Show the volume panel only if Volume column exists AND has non-zero data.
+    # Some derived timeframes (e.g., 125m before this fix) historically had no
+    # Volume; passing volume=True to mpf.plot in that case raises ValueError.
+    # NOTE: cast to Python bool — pandas/numpy return numpy.bool_ which fails
+    # mplfinance's strict `isinstance(value, bool)` validator.
+    has_volume = bool("Volume" in df_plot.columns
+                      and not df_plot["Volume"].isna().all()
+                      and df_plot["Volume"].sum() > 0)
+
     # Render to memory
     buf = BytesIO()
     try:
-        mpf.plot(
-            df_plot,
+        plot_kwargs = dict(
             type     = "candle",
             style    = "yahoo",
-            volume   = True,
+            volume   = has_volume,
             addplot  = addplots if addplots else None,
             hlines   = dict(hlines=hlines_levels,
                             colors=hlines_colors,
@@ -1102,16 +1110,18 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", zone: dict,
                             linewidths=[1.5, 1.5] + [1.0] * (len(hlines_levels) - 2)),
             title    = title,
             ylabel   = "Price",
-            ylabel_lower = "Volume",
-            figsize  = (10, 6),
+            figsize  = (10, 6) if has_volume else (10, 5),
             tight_layout = True,
             savefig  = dict(fname=buf, format="png", dpi=110, bbox_inches="tight"),
         )
+        if has_volume:
+            plot_kwargs["ylabel_lower"] = "Volume"
+        mpf.plot(df_plot, **plot_kwargs)
         buf.seek(0)
         return buf.getvalue()
     except Exception as e:
         # Charting failure is non-fatal — fall back to text-only alert.
-        print(f"  Chart render failed: {type(e).__name__}")
+        print(f"  Chart render failed: {type(e).__name__}: {e}")
         return None
     finally:
         # Close any figures matplotlib left open (memory leak guard)
@@ -1373,6 +1383,18 @@ def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame | None:
     Volume filter     → strip phantom bars (NSE holidays/weekends where
                         yfinance fills O=H=L=C with prev close, Volume=0).
     """
+    # 125m has no native yfinance interval — fetch 5m and aggregate.
+    # Same special-case as fetch_ohlc_batch; keeps single-stock callers
+    # (audits, smoke tests, scan_one_tf) consistent with batch behaviour.
+    if timeframe == "125m":
+        df_5m = fetch_ohlc(symbol, "5m")
+        if df_5m is None or df_5m.empty:
+            return None
+        agg = aggregate_to_125m(df_5m)
+        if len(agg) < 20:
+            return None
+        return agg
+
     yf_sym = symbol + ".NS"
     try:
         df = yf.download(
@@ -1442,12 +1464,17 @@ def aggregate_to_125m(df_5m: pd.DataFrame) -> pd.DataFrame:
     )
 
     grouped = df_5m.groupby(keys)
+    # Volume MUST be summed across the constituent 5m bars so:
+    #   (a) the 125m volume reflects actual traded shares for the window
+    #   (b) downstream legout_volume_strength() works on 125m too
+    #   (c) mpf.plot(volume=True) for the alert chart doesn't crash
     agg = grouped.agg(
-        Open=("Open",  "first"),
-        High=("High",  "max"),
-        Low =("Low",   "min"),
-        Close=("Close","last"),
-    ).dropna()
+        Open  = ("Open",   "first"),
+        High  = ("High",   "max"),
+        Low   = ("Low",    "min"),
+        Close = ("Close",  "last"),
+        Volume= ("Volume", "sum"),
+    ).dropna(subset=["Open", "Close"])
     # Index by the first 5-min bar timestamp of each bucket for clarity.
     # Convert to IST first, THEN drop tz, so logs show 09:15 not 03:45.
     # (.values silently extracts UTC representation from tz-aware index —
