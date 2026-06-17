@@ -149,9 +149,11 @@ def audit_one_tf(sym: str, tf: str):
         close_now = float(df_snap["Close"].iloc[-2]) if len(df_snap) > 1 \
                     else float(df_snap["Close"].iloc[-1])
 
+        from scanner import require_dual_legout_for
         zones = detect_zones(df_snap, close_now_override=close_now,
                               use_close_beyond_legin=True,
-                              entry_pct=entry_pct_for(tf))
+                              entry_pct=entry_pct_for(tf),
+                              require_dual_legout=require_dual_legout_for(tf))
 
         trend_htf_tf = trend_tf_for(tf)
         zone_htf_tf  = zone_tf_for(tf)

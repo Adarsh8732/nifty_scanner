@@ -189,10 +189,11 @@ def evaluate_snapshot(sym: str, tf: str, cutoff: int,
 
     # LTF zones
     # Pass entry_pct so LTF zones get the departure-then-return gate
-    from scanner import entry_pct_for
+    from scanner import entry_pct_for, require_dual_legout_for
     zones = detect_zones(df_snap, close_now_override=close_now,
                           use_close_beyond_legin=True,
-                          entry_pct=entry_pct_for(tf))
+                          entry_pct=entry_pct_for(tf),
+                          require_dual_legout=require_dual_legout_for(tf))
 
     ltf_trend = compute_trend(df_snap)
     trend_htf_tf = trend_tf_for(tf)

@@ -41,6 +41,7 @@ from scanner import (
     analyze_with_gemini, USE_LLM,
     # Helpers
     state_path, trend_tf_for, zone_tf_for, tf_label, entry_pct_for,
+    require_dual_legout_for,
     # Config (already populated from env in scanner.py module load)
     TIMEFRAMES, ALERT_MIN_SCORE, STRICT_FILTER,
 )
@@ -191,6 +192,7 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 close_now_override=close_now,
                 use_close_beyond_legin=True,
                 entry_pct=entry_pct_for(tf),
+                require_dual_legout=require_dual_legout_for(tf),
             )
             dem, sup = zones["demand"], zones["supply"]
 

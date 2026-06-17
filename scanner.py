@@ -88,6 +88,30 @@ def entry_pct_for(timeframe: str | None) -> float:
     return ALERT_ENTRY_PCT
 
 
+# ─── DUAL-LEGOUT REQUIREMENT (per-timeframe quality filter) ─────────────
+# Some timeframes (typically noisy intraday like 125m) need confirmation:
+# the candle IMMEDIATELY AFTER the legout must ALSO be exciting (body >=
+# EXCITE_PCT of range) AND the same color as the legout. This filters out
+# single-bar fakeouts that get faded the next bar.
+#
+# Configurable via env var as a comma-separated list of timeframes.
+# Default: "125m" — daily/weekly use single-legout (existing behaviour).
+# Examples:
+#   REQUIRE_DUAL_LEGOUT_TFS='125m'           — default, just intraday
+#   REQUIRE_DUAL_LEGOUT_TFS='125m,1d'        — tighten daily too
+#   REQUIRE_DUAL_LEGOUT_TFS=''               — disable everywhere
+REQUIRE_DUAL_LEGOUT_TFS = {
+    tf.strip() for tf in
+    os.environ.get("REQUIRE_DUAL_LEGOUT_TFS", "125m").split(",")
+    if tf.strip()
+}
+
+
+def require_dual_legout_for(timeframe: str | None) -> bool:
+    """True if this timeframe requires legout + confirming next-bar."""
+    return bool(timeframe and timeframe in REQUIRE_DUAL_LEGOUT_TFS)
+
+
 # ─── ACTUAL TRADE LEVELS (Entry / SL / Target) ──────────────────────────
 # Distinct from ALERT_ENTRY_PCT (the alert-trigger distance from proximal):
 # these are the actual ORDER levels for placing the trade.
@@ -1724,7 +1748,8 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
 # ─── ZONE DETECTION (Pine port) ─────────────────────────────────────────
 def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                  use_close_beyond_legin: bool = False,
-                 entry_pct: float | None = None) -> dict:
+                 entry_pct: float | None = None,
+                 require_dual_legout: bool = False) -> dict:
     """Detect best (closest to current price) demand and supply zones.
 
     Mirrors scanner.pine f_scanZones(). Returns:
@@ -1806,6 +1831,29 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
 
         if lo_body == 0 or lo_bpct < EXCITE_PCT or not (lo_grn or lo_red):
             continue
+
+        # Dual-legout requirement (noisy intraday tightening, e.g. 125m).
+        # The bar IMMEDIATELY AFTER the legout (chronologically) must also
+        # be exciting AND the same color, confirming institutional follow-
+        # through rather than a single-bar fakeout.
+        #   reversed-array indexing: start_bar = legout, start_bar - 1 = next
+        # If start_bar == 1 the "next" bar would be C[0] (in-progress) — not
+        # valid for confirmation, so the zone has to wait one more bar.
+        if require_dual_legout:
+            if start_bar < 2:                  # only the in-progress bar remains
+                continue
+            nx_idx = start_bar - 1
+            nx_o = O[nx_idx]; nx_h = H[nx_idx]; nx_l = L[nx_idx]; nx_c = C[nx_idx]
+            nx_body = abs(nx_c - nx_o)
+            nx_rng  = nx_h - nx_l
+            nx_bpct = (nx_body / nx_rng) if nx_rng > 0 else 0.0
+            if nx_body == 0 or nx_bpct < EXCITE_PCT:
+                continue
+            # Same direction as the legout (green-green or red-red).
+            if lo_grn and not (nx_c > nx_o):
+                continue
+            if lo_red and not (nx_c < nx_o):
+                continue
 
         # Volume strength at the legout candle (vs 20 prior bars' average).
         # Phantom (market-closed) bars are already excluded by fetch_ohlc via
