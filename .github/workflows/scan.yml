@@ -71,13 +71,18 @@ jobs:
           GEMINI_MODEL:         'gemini-2.5-flash-lite'
 
           # ─── SCANNER CONFIG ───────────────────────────────────────────
-          TIMEFRAMES:           '1d,1wk'
+          TIMEFRAMES:           '125m,1d,1wk'
           ALERT_ENTRY_PCT:      '1.0'
           ALERT_MIN_SCORE:      '7.0'
           STRICT_FILTER:        'true'
           TF_125M_CLOSENESS_PCT: '0.30'
           POLL_SECONDS:         '30'
           CACHE_REFRESH_MINS:   '60'
+          # Comma-separated list of timeframes that require a dual-legout
+          # confirmation (legout candle + same-color exciting next bar).
+          # Default '125m' tightens noisy intraday; add other TFs if you
+          # want to tighten them too. Set to '' to disable everywhere.
+          REQUIRE_DUAL_LEGOUT_TFS: '125m'
           PYTHONUNBUFFERED:     '1'
         run: python -u loop_scan.py
 
