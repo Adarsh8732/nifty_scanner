@@ -1172,7 +1172,11 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
 #   SMTP_PORT       (default: 587 — TLS)
 #   SMTP_USER       (your sending account, e.g., yourname@gmail.com)
 #   SMTP_PASS       (Gmail App Password — NOT your regular password)
-#   EMAIL_TO        (recipient address — can be the same as SMTP_USER)
+#   EMAIL_TO        ONE OR MORE recipients, comma-separated. Examples:
+#                     "you@gmail.com"
+#                     "you@gmail.com,friend@gmail.com,spouse@gmail.com"
+#                   All recipients appear in the To: header (visible to each
+#                   other). For hidden recipients, you'd need a Bcc env var.
 #
 # Gmail App Password setup: https://myaccount.google.com/apppasswords
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -1180,6 +1184,11 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 EMAIL_TO  = os.environ.get("EMAIL_TO",  "")
+
+
+def _email_recipients() -> list[str]:
+    """Parse EMAIL_TO into a list of clean recipient addresses."""
+    return [r.strip() for r in EMAIL_TO.split(",") if r.strip()]
 
 
 def _email_subject_from_msg(msg: str) -> str:
@@ -1210,8 +1219,9 @@ def send_email(subject: str, body: str,
 
     Failure modes are caught — caller can fall back to another channel.
     """
-    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
-        print("  [no SMTP creds — would email]:", subject)
+    recipients = _email_recipients()
+    if not (SMTP_USER and SMTP_PASS and recipients):
+        print("  [no SMTP creds / recipients — would email]:", subject)
         return False
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -1220,7 +1230,9 @@ def send_email(subject: str, body: str,
 
     msg = MIMEMultipart()
     msg["From"]    = SMTP_USER
-    msg["To"]      = EMAIL_TO
+    # Comma-joined To header — visible to all recipients. send_message()
+    # extracts the actual delivery list from this header automatically.
+    msg["To"]      = ", ".join(recipients)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", _charset="utf-8"))
 

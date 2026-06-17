@@ -524,7 +524,7 @@ One-time setup:
    |--------|-------|
    | `SMTP_USER` | Your Gmail address, e.g. `yourname@gmail.com` |
    | `SMTP_PASS` | The 16-char App Password from step 2 |
-   | `EMAIL_TO`  | Recipient address (can be the same as `SMTP_USER`) |
+   | `EMAIL_TO`  | One OR MORE recipients, comma-separated. Examples: `you@gmail.com` or `you@gmail.com,friend@gmail.com,spouse@gmail.com`. All recipients see each other in the To: header. |
 4. **Flip `ALERT_CHANNEL` to `email`** in `scan.yml` and push.
 
 Defaults: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587` (TLS). Override via env
