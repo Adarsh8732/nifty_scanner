@@ -297,6 +297,7 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
 
                 alerts.append({
                     "sym":       sym,
+                    "tf":        tf,
                     "msg_full":  msg_full,    # alert + LLM
                     "msg_short": msg_short,   # alert only (no LLM)
                     "charts":    charts,      # list of PNG bytes (0-3 entries)
@@ -373,7 +374,8 @@ def main() -> int:
         # chart-vs-text fallback, missing creds. Per-alert logic is unchanged
         # — just one function call instead of inline branching.
         for a in alerts:
-            dispatch_alert(a["msg_full"], a["msg_short"], images=a["charts"])
+            dispatch_alert(a["msg_full"], a["msg_short"], images=a["charts"],
+                           symbol=a["sym"], timeframe=a["tf"])
             total_alerts_sent += 1
             time.sleep(0.4)  # respect TG / SMTP rate limits
 

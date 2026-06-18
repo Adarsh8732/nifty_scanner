@@ -1241,18 +1241,27 @@ def _email_recipients() -> list[str]:
     return [r.strip() for r in EMAIL_TO.split(",") if r.strip()]
 
 
-def _email_subject_from_msg(msg: str) -> str:
-    """Extract a one-line subject from the alert markdown body.
+def _email_subject_from_msg(msg: str, symbol: str | None = None,
+                            timeframe: str | None = None) -> str:
+    """Build a one-line email subject.
 
-    Picks the first non-empty line, strips markdown chars, caps at ~120 chars.
+    If symbol + timeframe are provided, the subject is prefixed `[SYM / TF] `
+    so inbox filtering by stock or TF is trivial. Body of the subject is the
+    first non-empty line of the alert (markdown stripped, capped at ~120 chars).
     """
+    base = "Zone scanner alert"
     for line in msg.splitlines():
         line = line.strip()
         if line:
-            cleaned = (line.replace("*", "").replace("`", "")
-                          .replace("_", "").replace("#", "").strip())
-            return cleaned[:120] if len(cleaned) > 120 else cleaned
-    return "Zone scanner alert"
+            base = (line.replace("*", "").replace("`", "")
+                        .replace("_", "").replace("#", "").strip())
+            break
+    if symbol and timeframe:
+        prefix = f"[{symbol} / {timeframe}] "
+        remaining = 120 - len(prefix)
+        if remaining < 10: remaining = 10
+        return prefix + (base[:remaining] if len(base) > remaining else base)
+    return base[:120] if len(base) > 120 else base
 
 
 def send_email(subject: str, body: str,
@@ -1336,7 +1345,9 @@ def _channels() -> list[str]:
 
 def dispatch_alert(msg_full: str, msg_short: str | None = None,
                    image_bytes: bytes | None = None,
-                   images: list[bytes] | None = None) -> None:
+                   images: list[bytes] | None = None,
+                   symbol: str | None = None,
+                   timeframe: str | None = None) -> None:
     """Route an alert to the configured channel(s).
 
     msg_full:    alert text WITH LLM thesis (used when channel permits)
@@ -1344,6 +1355,9 @@ def dispatch_alert(msg_full: str, msg_short: str | None = None,
                  would overflow; defaults to msg_full if not provided)
     image_bytes: single PNG chart (backward-compat). Use `images` for multi.
     images:      list of PNG charts. ≥2 → Telegram album, all → email inline.
+    symbol, timeframe: optional — when both are passed, the email subject is
+        prefixed `[SYMBOL / TF] ` for easy inbox filtering. Telegram is
+        unaffected (it uses the message body's first line as the title).
     """
     if msg_short is None:
         msg_short = msg_full
@@ -1371,7 +1385,8 @@ def dispatch_alert(msg_full: str, msg_short: str | None = None,
             else:
                 send_telegram(msg_full)
         elif ch == "email":
-            subject = _email_subject_from_msg(msg_full)
+            subject = _email_subject_from_msg(msg_full, symbol=symbol,
+                                              timeframe=timeframe)
             # Email has no caption limit; always send the FULL message + all charts
             send_email(subject, msg_full, images=imgs)
         else:
@@ -1802,6 +1817,14 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         for 125m) when scanning for LTF alerts. Pass None for HTF
         confluence detection (departure check disabled — HTF zones are
         used for confluence, not as direct alert sources).
+
+    require_dual_legout: enables a stricter legout-strength gate (3-way OR):
+        A: next chronological bar is exciting AND same color as legout
+        B: legout body >= 1.5 × legin body  — REVERSAL ZONES ONLY (DBR/RBD)
+        C: legout body > avg body of (21 prev + <=21 next surrounding bars)
+        A zone passes if ANY of A/B/C holds. Continuation zones (RBR/DBD)
+        cannot satisfy B and must rely on A or C. Driven per timeframe by
+        REQUIRE_DUAL_LEGOUT_TFS (default tightens 125m only).
     """
     # Reverse so index 0 = latest bar (matches Pine's [N] indexing)
     df_rev = df.iloc[::-1].reset_index(drop=True)
@@ -1858,28 +1881,47 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         if lo_body == 0 or lo_bpct < EXCITE_PCT or not (lo_grn or lo_red):
             continue
 
-        # Dual-legout requirement (noisy intraday tightening, e.g. 125m).
-        # The bar IMMEDIATELY AFTER the legout (chronologically) must also
-        # be exciting AND the same color, confirming institutional follow-
-        # through rather than a single-bar fakeout.
-        #   reversed-array indexing: start_bar = legout, start_bar - 1 = next
-        # If start_bar == 1 the "next" bar would be C[0] (in-progress) — not
-        # valid for confirmation, so the zone has to wait one more bar.
+        # Legout-strength gate (configurable via REQUIRE_DUAL_LEGOUT_TFS).
+        # Three OR conditions — zone passes if ANY one is satisfied:
+        #   A: Dual-legout — next bar (chronologically) is exciting AND same
+        #      color as legout.  Filters single-bar fakeouts.
+        #   B: Legout body >= 1.5 × legin body.  REVERSAL ZONES ONLY (DBR/RBD).
+        #      Checked LATER (legin index not yet known).  Continuation zones
+        #      (RBR/DBD) cannot pass via B — they need A or C.
+        #   C: Legout body > average body of (21 prev bars + <=21 next bars).
+        #      Catches dominant single-bar breakouts when no confirming next
+        #      bar is available.  "<=21 next" because future bars may not all
+        #      exist yet on freshly-formed zones.
+        # A and C are legout-only and checked here.  B deferred via flag.
+        dl_need_b_check = False
         if require_dual_legout:
-            if start_bar < 2:                  # only the in-progress bar remains
-                continue
-            nx_idx = start_bar - 1
-            nx_o = O[nx_idx]; nx_h = H[nx_idx]; nx_l = L[nx_idx]; nx_c = C[nx_idx]
-            nx_body = abs(nx_c - nx_o)
-            nx_rng  = nx_h - nx_l
-            nx_bpct = (nx_body / nx_rng) if nx_rng > 0 else 0.0
-            if nx_body == 0 or nx_bpct < EXCITE_PCT:
-                continue
-            # Same direction as the legout (green-green or red-red).
-            if lo_grn and not (nx_c > nx_o):
-                continue
-            if lo_red and not (nx_c < nx_o):
-                continue
+            # Condition A: same-color exciting next bar.  start_bar must be
+            # >= 2 so the next bar at start_bar-1 is closed (not C[0] in-progress).
+            cond_a = False
+            if start_bar >= 2:
+                nx_idx = start_bar - 1
+                nx_o = O[nx_idx]; nx_h = H[nx_idx]; nx_l = L[nx_idx]; nx_c = C[nx_idx]
+                nx_body = abs(nx_c - nx_o)
+                nx_rng  = nx_h - nx_l
+                nx_bpct = (nx_body / nx_rng) if nx_rng > 0 else 0.0
+                same_color = (lo_grn and nx_c > nx_o) or (lo_red and nx_c < nx_o)
+                cond_a = (nx_body > 0 and nx_bpct >= EXCITE_PCT and same_color)
+
+            # Condition C: legout body > avg body of surrounding ~42 bars.
+            # Reversed indexing: prev = higher indices, next = lower indices.
+            # Floor of 1 on next-side excludes C[0] (in-progress bar).
+            surround = []
+            prev_high = min(start_bar + 22, n)
+            for j in range(start_bar + 1, prev_high):
+                surround.append(abs(C[j] - O[j]))
+            next_low = max(start_bar - 22, 0)
+            for j in range(start_bar - 1, next_low, -1):
+                surround.append(abs(C[j] - O[j]))
+            cond_c = bool(surround) and lo_body > (sum(surround) / len(surround))
+
+            if not (cond_a or cond_c):
+                # B is the last chance; check after legin is identified.
+                dl_need_b_check = True
 
         # Volume strength at the legout candle (vs 20 prior bars' average).
         # Phantom (market-closed) bars are already excluded by fetch_ohlc via
@@ -1972,6 +2014,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
             if not (zb_demand or zb_supply):
                 continue
             if leg2_body == 0 or leg2_bpct < EXCITE_PCT:
+                continue
+            # Condition B (deferred legout-gate): legout body >= 1.5 × legin body.
+            # Zero-base is always reversal (DBR/RBD engulf) so the ratio is the
+            # only thing to check.
+            if dl_need_b_check and lo_body < 1.5 * leg2_body:
                 continue
             if use_close_beyond_legin:
                 # LTF rule (D/W/125m): legout close must close beyond legin close.
@@ -2085,6 +2132,14 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         legin_red = leg_c < leg_o
         legin_grn = leg_c > leg_o
         is_reversal = (lo_grn and legin_red) or (lo_red and legin_grn)
+        # Condition B (deferred legout-gate): legout body >= 1.5 × legin body,
+        # REVERSAL ZONES ONLY. Continuation zones (RBR/DBD) reach this point but
+        # cannot pass via B — they needed A or C to satisfy the gate, and didn't.
+        if dl_need_b_check:
+            if not is_reversal:
+                continue
+            if leg_body == 0 or lo_body < 1.5 * leg_body:
+                continue
         if is_reversal:
             if use_close_beyond_legin:
                 # LTF rule (D/W/125m): legout close must close beyond legin close.
