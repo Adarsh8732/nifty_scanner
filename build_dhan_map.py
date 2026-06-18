@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import requests
+
+# Windows console defaults to cp1252 which can't encode the box-drawing
+# characters used in our status output.
+sys.stdout.reconfigure(encoding="utf-8")
 
 from symbols import ALL_SYMBOLS
 
