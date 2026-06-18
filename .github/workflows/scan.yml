@@ -32,6 +32,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: System memory info
+        run: |
+          echo "====== MEMORY BEFORE SCANNER ======"
+          free -h
+          echo "====== CPU INFO ======"
+          nproc
+          echo "====== DISK ======"
+          df -h /
+
       - name: Run scanner loop
         env:
           # ─── ALERT CHANNEL ROUTING ────────────────────────────────────
@@ -93,6 +102,12 @@ jobs:
           CHART_HEIGHT_IN:      '7'
           PYTHONUNBUFFERED:     '1'
         run: python -u loop_scan.py
+
+      - name: System memory after scan
+        if: always()
+        run: |
+          echo "====== MEMORY AFTER SCANNER ======"
+          free -h
 
       - name: Commit updated state
         if: always()                # commit state even if scanner exited via SIGTERM
