@@ -87,11 +87,12 @@ jobs:
           TF_125M_CLOSENESS_PCT: '0.30'
           POLL_SECONDS:         '30'
           CACHE_REFRESH_MINS:   '60'
-          # Comma-separated list of timeframes that require a dual-legout
-          # confirmation (legout candle + same-color exciting next bar).
-          # Default '125m' tightens noisy intraday; add other TFs if you
-          # want to tighten them too. Set to '' to disable everywhere.
-          REQUIRE_DUAL_LEGOUT_TFS: '125m'
+          # Comma-separated list of timeframes that require the 3-way
+          # legout-strength gate (A: dual-legout | B: 1.5× legin body for
+          # reversal zones | C: legout > avg of 21±21 surrounding bodies).
+          # Each TF in this list rejects zones where NONE of A/B/C holds.
+          # Set to '' to disable everywhere.
+          REQUIRE_DUAL_LEGOUT_TFS: '125m,1d'
           # Position-sizing: per-trade risk budget shown in the alert as
           # "Qty @ ₹{X} risk: N shares". Default 5000 INR.
           RISK_PER_TRADE_INR:   '5000'
