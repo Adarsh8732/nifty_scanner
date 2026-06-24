@@ -1270,14 +1270,16 @@ def _email_subject_from_msg(msg: str, symbol: str | None = None,
 def send_email(subject: str, body: str,
                image_bytes: bytes | None = None,
                images: list[bytes] | None = None) -> bool:
-    """Send an email with optional inline PNG attachments. Returns True on success.
+    """Send an email with charts rendered INLINE in the message body.
 
-    Accepts either a single `image_bytes` or a list `images` (or both — they
-    are concatenated). All images are attached inline with sequential
-    Content-IDs so they render in order in the email body.
+    Builds a multipart/related message where the HTML body references each
+    chart by Content-ID (<img src="cid:chartN">). Inline charts render
+    directly inside the email — no clicking required to view. A plain-text
+    alternative is included for clients that don't render HTML.
 
-    Body is sent as plain text (markdown shows as-is — still readable). No
-    caption length limit, so the full alert + Gemini thesis fits.
+    Accepts either a single `image_bytes` or a list `images` (or both —
+    they are concatenated). Charts appear in order, sized to fill the email
+    body width (max-width:100% → as large as the client's column).
 
     Failure modes are caught — caller can fall back to another channel.
     """
@@ -1286,31 +1288,65 @@ def send_email(subject: str, body: str,
         print("  [no SMTP creds / recipients — would email]:", subject)
         return False
     import smtplib
+    import html as _html
     from email.mime.multipart import MIMEMultipart
     from email.mime.text  import MIMEText
     from email.mime.image import MIMEImage
 
-    msg = MIMEMultipart()
-    msg["From"]    = SMTP_USER
-    # Comma-joined To header — visible to all recipients. send_message()
-    # extracts the actual delivery list from this header automatically.
-    msg["To"]      = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", _charset="utf-8"))
-
-    # Collect all image payloads
+    # Collect all image payloads (deferred so HTML can reference them)
     all_images: list[bytes] = []
     if image_bytes:
         all_images.append(image_bytes)
     if images:
         all_images.extend(im for im in images if im)
 
+    # ── Build HTML body that inlines the charts via <img src="cid:..."> ──
+    # <pre> preserves the markdown body's line breaks + monospace
+    # alignment. word-break keeps long lines from blowing out the column.
+    # Images use max-width:100% so they fill the email column (no scrollbar)
+    # but never upscale beyond their natural resolution.
+    img_html = "\n".join(
+        f'<img src="cid:chart{i+1}" alt="chart {i+1}" '
+        f'style="max-width:100%;height:auto;display:block;margin:14px 0;'
+        f'border:1px solid #ddd;border-radius:4px;">'
+        for i in range(len(all_images))
+    )
+    html_body = (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<style>"
+        "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;"
+        "color:#222;max-width:900px;margin:0 auto;padding:8px;}"
+        "pre{font-family:SFMono-Regular,Menlo,Consolas,monospace;"
+        "white-space:pre-wrap;word-break:break-word;font-size:13px;"
+        "background:#f7f7f7;padding:10px;border-radius:4px;}"
+        "</style></head><body>"
+        f"<pre>{_html.escape(body)}</pre>"
+        f"{img_html}"
+        "</body></html>"
+    )
+
+    # ── Message structure ──
+    # outer: multipart/related — body + inline-referenced images
+    # inner: multipart/alternative — plain text fallback + HTML view
+    msg = MIMEMultipart("related")
+    msg["From"]    = SMTP_USER
+    msg["To"]      = ", ".join(recipients)
+    msg["Subject"] = subject
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(body, "plain", _charset="utf-8"))
+    alt.attach(MIMEText(html_body, "html", _charset="utf-8"))
+    msg.attach(alt)
+
+    # Inline image parts. Content-ID matches the <img src="cid:chartN">
+    # references in the HTML body. Content-Disposition inline tells clients
+    # "render this in the body, don't list as a downloadable attachment".
     for i, img_data in enumerate(all_images):
         try:
             img = MIMEImage(img_data, _subtype="png")
+            img.add_header("Content-ID", f"<chart{i+1}>")
             img.add_header("Content-Disposition", "inline",
                            filename=f"chart{i+1}.png")
-            img.add_header("Content-ID", f"<chart{i+1}>")
             msg.attach(img)
         except Exception as e:
             print(f"  Email image attach failed (chart {i+1}): {type(e).__name__}")
