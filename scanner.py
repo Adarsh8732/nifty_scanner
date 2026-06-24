@@ -47,27 +47,7 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
 _load_dotenv()
 
 
-from symbols import (ALL_SYMBOLS, STRATEGY_WORKS, STRATEGY_DOES_NOT_WORK,
-                     STRATEGY_UNTESTED)
-
-# O(1) lookup sets so we can tag every alert with its backtest category
-_STRATEGY_WORKS_SET     = set(STRATEGY_WORKS)
-_STRATEGY_FAILS_SET     = set(STRATEGY_DOES_NOT_WORK)
-_STRATEGY_UNTESTED_SET  = set(STRATEGY_UNTESTED)
-
-
-def strategy_tag(symbol: str) -> str:
-    """Return a three-way category tag for the symbol.
-
-    ✅ WORKS    — backtest alerted WR >= 33% (above 2.6R breakeven 27.78%)
-    ⚠️ FAILS    — backtest alerted WR < 33% OR zero resolved alerts
-    ❓ UNTESTED — broader-universe addition with no backtest data yet
-    """
-    if symbol in _STRATEGY_WORKS_SET:
-        return "✅ WORKS"
-    if symbol in _STRATEGY_UNTESTED_SET:
-        return "❓ UNTESTED"
-    return "⚠️ FAILS"
+from symbols import ALL_SYMBOLS
 
 # ─── CONFIG (env vars override defaults) ────────────────────────────────
 TG_TOKEN          = os.environ.get("TG_TOKEN", "")
@@ -2510,7 +2490,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
 
     return (
         f"{direction}\n"
-        f"*{symbol}*  {strategy_tag(symbol)}  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
+        f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
         f"Zone: prox `{zone['proximal']:.2f}` → dist `{zone['distal']:.2f}`\n"
         f"Alert at: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
         f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
