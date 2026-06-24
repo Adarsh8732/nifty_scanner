@@ -300,6 +300,14 @@ LOOKBACK_BARS    = 50
 MAX_ZONE_TESTS   = 1
 ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles between legin & legout)
 
+# Gap-legout rule. A candle that opens >= GAP_LEGOUT_PCT% above the previous
+# candle's close (or symmetrically below) qualifies as a valid legout EVEN IF
+# its body is too small to pass EXCITE_PCT. Color must still match the zone
+# direction (green for demand, red for supply). Bypasses the 3-way strength
+# gate too — the gap IS the strength signal. Catches small-body opening-gap
+# legouts that the existing rule would otherwise skip.
+GAP_LEGOUT_PCT   = float(os.environ.get("GAP_LEGOUT_PCT", "3.0"))
+
 # Catastrophic-candle threshold (corporate-action filter).
 # yfinance auto_adjust catches FORMAL stock splits but misses MANY Indian
 # demergers, bonus issues, and spin-offs (e.g., VEDL demerger Apr-2026 is
@@ -1897,7 +1905,25 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         lo_grn  = lo_c > lo_o
         lo_red  = lo_c < lo_o
 
-        if lo_body == 0 or lo_bpct < EXCITE_PCT or not (lo_grn or lo_red):
+        # Always reject doji / bodyless legout candidates.
+        if lo_body == 0 or not (lo_grn or lo_red):
+            continue
+
+        # Gap-legout detection: open is >= GAP_LEGOUT_PCT% above (green) or
+        # below (red) the immediately-preceding candle's close. Reversed
+        # indexing → prev candle is at start_bar + 1.
+        is_gap_legout = False
+        if start_bar + 1 < n:
+            prev_close = C[start_bar + 1]
+            if prev_close > 0:
+                gap_pct = (lo_o - prev_close) / prev_close * 100.0
+                if lo_grn and gap_pct >=  GAP_LEGOUT_PCT:
+                    is_gap_legout = True
+                elif lo_red and gap_pct <= -GAP_LEGOUT_PCT:
+                    is_gap_legout = True
+
+        # Standard EXCITE_PCT gate: bypassed when a gap legout was identified.
+        if lo_bpct < EXCITE_PCT and not is_gap_legout:
             continue
 
         # Legout-strength gate (configurable via REQUIRE_DUAL_LEGOUT_TFS).
@@ -1912,8 +1938,10 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         #      bar is available.  "<=21 next" because future bars may not all
         #      exist yet on freshly-formed zones.
         # A and C are legout-only and checked here.  B deferred via flag.
+        # Gap-legouts bypass the gate entirely — the opening gap is itself
+        # the strength signal that the gate is trying to confirm.
         dl_need_b_check = False
-        if require_dual_legout:
+        if require_dual_legout and not is_gap_legout:
             # Condition A: same-color exciting next bar.  start_bar must be
             # >= 2 so the next bar at start_bar-1 is closed (not C[0] in-progress).
             cond_a = False

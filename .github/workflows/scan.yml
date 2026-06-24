@@ -93,6 +93,12 @@ jobs:
           # Each TF in this list rejects zones where NONE of A/B/C holds.
           # Set to '' to disable everywhere.
           REQUIRE_DUAL_LEGOUT_TFS: '125m,1d'
+          # Gap-legout rule: a candle opening this many percent above
+          # (green/demand) or below (red/supply) the previous candle's
+          # close qualifies as a valid legout, bypassing both EXCITE_PCT
+          # and the dual-legout strength gate. Catches small-body opening
+          # gaps. Set higher to be stricter, lower to be more permissive.
+          GAP_LEGOUT_PCT:       '3.0'
           # Position-sizing: per-trade risk budget shown in the alert as
           # "Qty @ ₹{X} risk: N shares". Default 5000 INR.
           RISK_PER_TRADE_INR:   '5000'
