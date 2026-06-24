@@ -1821,8 +1821,18 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
     """Detect best (closest to current price) demand and supply zones.
 
     Mirrors scanner.pine f_scanZones(). Returns:
-        {"demand": {...} | None, "supply": {...} | None}
-    where each zone dict has: proximal, distal, score, tests, dist_pct, type.
+        {
+          "demand":     {...} | None,  # standard EXCITE-rule zone
+          "supply":     {...} | None,
+          "demand_gap": {...} | None,  # gap-only legout zone (extra alert)
+          "supply_gap": {...} | None,
+        }
+    where each zone dict has: proximal, distal, score, tests, dist_pct, type,
+    and from_gap (True only for *_gap entries — set so the caller can label
+    these as "GAP LEGOUT" in the alert message). The two _gap entries are
+    populated ONLY by candles whose body would have failed EXCITE_PCT but
+    the 3% opening gap rescued them. Standard EXCITE-rule zones never appear
+    in the _gap slots, so alerting on _gap is purely additive.
 
     close_now_override: if provided, used as the current-price reference (for
         dist_pct + best-zone selection). Pass the live LTP from Dhan here.
@@ -1876,8 +1886,14 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
     # C[0] (in-progress). Both invalidation and test counting are protected.
     walk_low = 1 if IGNORE_INPROGRESS_BAR else 0
 
-    best_dem = None
-    best_sup = None
+    best_dem     = None
+    best_sup     = None
+    # Gap-only legouts (3% open-gap candles whose body would have failed
+    # EXCITE_PCT) populate these separately. They are returned as extra
+    # zones — "demand_gap" / "supply_gap" — so callers can emit additional
+    # alerts WITHOUT displacing the standard zones above.
+    best_dem_gap = None
+    best_sup_gap = None
 
     # Precompute "catastrophic" bar indices (likely corporate-action artifacts
     # that yfinance's auto_adjust missed — typically Indian demergers/bonuses).
@@ -1923,8 +1939,16 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                     is_gap_legout = True
 
         # Standard EXCITE_PCT gate: bypassed when a gap legout was identified.
-        if lo_bpct < EXCITE_PCT and not is_gap_legout:
+        is_exciting = lo_bpct >= EXCITE_PCT
+        if not is_exciting and not is_gap_legout:
             continue
+
+        # "Gap-only" = candle passed via the gap rule BUT would have failed
+        # EXCITE_PCT. These zones are tracked SEPARATELY (best_dem_gap /
+        # best_sup_gap) so they emit EXTRA alerts alongside — never
+        # displacing — the standard EXCITE-rule zones. A gap+exciting
+        # candle stays in the standard pool (old behavior preserved).
+        is_gap_only_legout = is_gap_legout and not is_exciting
 
         # Legout-strength gate (configurable via REQUIRE_DUAL_LEGOUT_TFS).
         # Three OR conditions — zone passes if ANY one is satisfied:
@@ -1938,10 +1962,11 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
         #      bar is available.  "<=21 next" because future bars may not all
         #      exist yet on freshly-formed zones.
         # A and C are legout-only and checked here.  B deferred via flag.
-        # Gap-legouts bypass the gate entirely — the opening gap is itself
-        # the strength signal that the gate is trying to confirm.
+        # Only GAP-ONLY legouts bypass the gate (the opening gap IS the
+        # strength signal that the gate is trying to confirm). Gap+exciting
+        # candles still pass the gate as before — preserves old behavior.
         dl_need_b_check = False
-        if require_dual_legout and not is_gap_legout:
+        if require_dual_legout and not is_gap_only_legout:
             # Condition A: same-color exciting next bar.  start_bar must be
             # >= 2 so the next bar at start_bar-1 is closed (not C[0] in-progress).
             cond_a = False
@@ -2109,19 +2134,25 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
                         score = f_score + s_score + 2.0   # tScore = 2 (baseCnt=0)
                         dist_pct = (close_now - prox) / close_now * 100.0
-                        if best_dem is None or dist_pct < best_dem["dist_pct"]:
-                            best_dem = {
-                                "type":      "demand",
-                                "proximal":  float(prox),
-                                "distal":    float(dist),
-                                "score":     float(score),
-                                "tests":     int(tc),
-                                "dist_pct":  float(dist_pct),
-                                "vol_label": vs[0] if vs else None,
-                                "vol_ratio": vs[1] if vs else None,
-                                "close_label": cs[0] if cs else None,
-                                "close_pct":   cs[1] if cs else None,
-                            }
+                        zone_candidate = {
+                            "type":      "demand",
+                            "proximal":  float(prox),
+                            "distal":    float(dist),
+                            "score":     float(score),
+                            "tests":     int(tc),
+                            "dist_pct":  float(dist_pct),
+                            "vol_label": vs[0] if vs else None,
+                            "vol_ratio": vs[1] if vs else None,
+                            "close_label": cs[0] if cs else None,
+                            "close_pct":   cs[1] if cs else None,
+                            "from_gap":    bool(is_gap_only_legout),
+                        }
+                        if is_gap_only_legout:
+                            if best_dem_gap is None or dist_pct < best_dem_gap["dist_pct"]:
+                                best_dem_gap = zone_candidate
+                        else:
+                            if best_dem is None or dist_pct < best_dem["dist_pct"]:
+                                best_dem = zone_candidate
 
             # Supply: prox = min(legin body-high, legout open); dist = highest wick
             if zb_supply and SCAN_SUPPLY:
@@ -2152,19 +2183,25 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
                         f_score = 3.0 if tc == 0 else (1.5 if tc == 1 else 0.0)
                         score = f_score + s_score + 2.0
                         dist_pct = (prox - close_now) / close_now * 100.0
-                        if best_sup is None or dist_pct < best_sup["dist_pct"]:
-                            best_sup = {
-                                "type":      "supply",
-                                "proximal":  float(prox),
-                                "distal":    float(dist),
-                                "score":     float(score),
-                                "tests":     int(tc),
-                                "dist_pct":  float(dist_pct),
-                                "vol_label": vs[0] if vs else None,
-                                "vol_ratio": vs[1] if vs else None,
-                                "close_label": cs[0] if cs else None,
-                                "close_pct":   cs[1] if cs else None,
-                            }
+                        zone_candidate = {
+                            "type":      "supply",
+                            "proximal":  float(prox),
+                            "distal":    float(dist),
+                            "score":     float(score),
+                            "tests":     int(tc),
+                            "dist_pct":  float(dist_pct),
+                            "vol_label": vs[0] if vs else None,
+                            "vol_ratio": vs[1] if vs else None,
+                            "close_label": cs[0] if cs else None,
+                            "close_pct":   cs[1] if cs else None,
+                            "from_gap":    bool(is_gap_only_legout),
+                        }
+                        if is_gap_only_legout:
+                            if best_sup_gap is None or dist_pct < best_sup_gap["dist_pct"]:
+                                best_sup_gap = zone_candidate
+                        else:
+                            if best_sup is None or dist_pct < best_sup["dist_pct"]:
+                                best_sup = zone_candidate
             continue   # zero-base path complete for this start_bar
 
         # ── Standard path (1+ base candles) ─────────────────────────────
@@ -2241,19 +2278,25 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
 
             if close_now > prox:
                 dist_pct = (close_now - prox) / close_now * 100.0
-                if best_dem is None or dist_pct < best_dem["dist_pct"]:
-                    best_dem = {
-                        "type":      "demand",
-                        "proximal":  float(prox),
-                        "distal":    float(dist),
-                        "score":     float(score),
-                        "tests":     int(tc),
-                        "dist_pct":  float(dist_pct),
-                        "vol_label": vs[0] if vs else None,
-                        "vol_ratio": vs[1] if vs else None,
-                        "close_label": cs[0] if cs else None,
-                        "close_pct":   cs[1] if cs else None,
-                    }
+                zone_candidate = {
+                    "type":      "demand",
+                    "proximal":  float(prox),
+                    "distal":    float(dist),
+                    "score":     float(score),
+                    "tests":     int(tc),
+                    "dist_pct":  float(dist_pct),
+                    "vol_label": vs[0] if vs else None,
+                    "vol_ratio": vs[1] if vs else None,
+                    "close_label": cs[0] if cs else None,
+                    "close_pct":   cs[1] if cs else None,
+                    "from_gap":    bool(is_gap_only_legout),
+                }
+                if is_gap_only_legout:
+                    if best_dem_gap is None or dist_pct < best_dem_gap["dist_pct"]:
+                        best_dem_gap = zone_candidate
+                else:
+                    if best_dem is None or dist_pct < best_dem["dist_pct"]:
+                        best_dem = zone_candidate
 
         # ─── Supply zone (red legout) ────────────────────────────
         if lo_red and SCAN_SUPPLY:
@@ -2292,21 +2335,32 @@ def detect_zones(df: pd.DataFrame, close_now_override: float | None = None,
 
             if close_now < prox:
                 dist_pct = (prox - close_now) / close_now * 100.0
-                if best_sup is None or dist_pct < best_sup["dist_pct"]:
-                    best_sup = {
-                        "type":      "supply",
-                        "proximal":  float(prox),
-                        "distal":    float(dist),
-                        "score":     float(score),
-                        "tests":     int(tc),
-                        "dist_pct":  float(dist_pct),
-                        "vol_label": vs[0] if vs else None,
-                        "vol_ratio": vs[1] if vs else None,
-                        "close_label": cs[0] if cs else None,
-                        "close_pct":   cs[1] if cs else None,
-                    }
+                zone_candidate = {
+                    "type":      "supply",
+                    "proximal":  float(prox),
+                    "distal":    float(dist),
+                    "score":     float(score),
+                    "tests":     int(tc),
+                    "dist_pct":  float(dist_pct),
+                    "vol_label": vs[0] if vs else None,
+                    "vol_ratio": vs[1] if vs else None,
+                    "close_label": cs[0] if cs else None,
+                    "close_pct":   cs[1] if cs else None,
+                    "from_gap":    bool(is_gap_only_legout),
+                }
+                if is_gap_only_legout:
+                    if best_sup_gap is None or dist_pct < best_sup_gap["dist_pct"]:
+                        best_sup_gap = zone_candidate
+                else:
+                    if best_sup is None or dist_pct < best_sup["dist_pct"]:
+                        best_sup = zone_candidate
 
-    return {"demand": best_dem, "supply": best_sup}
+    return {
+        "demand":     best_dem,
+        "supply":     best_sup,
+        "demand_gap": best_dem_gap,
+        "supply_gap": best_sup_gap,
+    }
 
 
 # ─── ALERT LOGIC ────────────────────────────────────────────────────────

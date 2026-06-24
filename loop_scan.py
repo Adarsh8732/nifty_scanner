@@ -194,9 +194,13 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 entry_pct=entry_pct_for(tf),
                 require_dual_legout=require_dual_legout_for(tf),
             )
-            dem, sup = zones["demand"], zones["supply"]
+            dem, sup     = zones["demand"], zones["supply"]
+            # Gap-only legouts (3% opening-gap, small body) — extra alerts
+            # alongside any standard zone above. Never displace, only add.
+            dem_gap      = zones.get("demand_gap")
+            sup_gap      = zones.get("supply_gap")
 
-            for z in (dem, sup):
+            for z in (dem, sup, dem_gap, sup_gap):
                 if z is None or z["score"] < ALERT_MIN_SCORE:
                     continue
                 if not is_approaching(close_now, z, tf):
