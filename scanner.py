@@ -103,7 +103,7 @@ def require_dual_legout_for(timeframe: str | None) -> bool:
 #   Target = entry projected by TARGET_RR_MULTIPLE × (entry − SL)
 ENTRY_BUFFER_PCT    = float(os.environ.get("ENTRY_BUFFER_PCT",    "0.3"))
 SL_BUFFER_PCT       = float(os.environ.get("SL_BUFFER_PCT",       "0.3"))
-TARGET_RR_MULTIPLE  = float(os.environ.get("TARGET_RR_MULTIPLE",  "2.6"))
+TARGET_RR_MULTIPLE  = float(os.environ.get("TARGET_RR_MULTIPLE",  "2.0"))
 
 # ─── POSITION SIZING ────────────────────────────────────────────────────
 # Per-trade risk budget in INR. Used purely to display a suggested quantity

@@ -99,6 +99,9 @@ jobs:
           # and the dual-legout strength gate. Catches small-body opening
           # gaps. Set higher to be stricter, lower to be more permissive.
           GAP_LEGOUT_PCT:       '3.0'
+          # Trade-level target: reward-to-risk multiple.
+          # Target = entry + RR × (entry - SL). 2.0 means target is 2× risk.
+          TARGET_RR_MULTIPLE:   '2.0'
           # Position-sizing: per-trade risk budget shown in the alert as
           # "Qty @ ₹{X} risk: N shares". Default 5000 INR.
           RISK_PER_TRADE_INR:   '5000'
