@@ -99,6 +99,19 @@ jobs:
           # and the dual-legout strength gate. Catches small-body opening
           # gaps. Set higher to be stricter, lower to be more permissive.
           GAP_LEGOUT_PCT:       '3.0'
+          # ─── SWING-ANCHORED VOLUME PROFILE ───────────────────────────
+          # Tags zones with 🎯 VP-POC when the zone band contains the POC
+          # of the swing-anchored Volume Profile. Empirical backtest edge:
+          # 1d +3.9pp WR, 1wk +8.6pp WR over baseline. Alert TF chart also
+          # gets a VP overlay (shaded window + POC line + histogram).
+          ENABLE_VP_TAGS:       'true'
+          # Comma-separated list of TFs to tag. 125m intentionally
+          # excluded — backtest showed no edge.
+          VP_TFS:               '1d,1wk'
+          VP_PIVOT_LR:          '5'    # pivot detection left=right window
+          VP_MIN_BARS:          '10'   # skip VP if anchor < this many bars away
+          VP_BINS:              '50'   # histogram resolution
+          VP_VA_PCT:            '0.70' # Value Area volume threshold
           # Trade-level target: reward-to-risk multiple.
           # Target = entry + RR × (entry - SL). 2.0 means target is 2× risk.
           TARGET_RR_MULTIPLE:   '2.0'

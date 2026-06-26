@@ -33,6 +33,8 @@ from scanner import (
     compute_ema20, EMA20_TFS,
     # Swing origin (W/M/3M)
     find_swing_origin, find_origin_htf_match,
+    # Swing-anchored Volume Profile
+    swing_vp_for_zone, ENABLE_VP_TAGS, VP_TFS,
     # Fetching
     fetch_ohlc_batch, fetch_ohlc, fetch_dhan_ltps, load_dhan_security_ids,
     # IO
@@ -256,12 +258,35 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     origin_price, z["type"], origin_htf_zones, ltf_timeframe=tf,
                 )
 
+                # Swing-anchored Volume Profile.
+                # alert_vp is gated on VP_TFS (drives the 🎯/📍 tags in the
+                # alert text — backtested for 1d/1wk only).
+                # trend_vp + htf_vp are computed for chart visualization on
+                # all TFs that have data (no tag, just the overlay).
+                # All three VPs are anchored to the ALERT zone's direction
+                # (demand → last pivot low; supply → last pivot high).
+                vp_info = None
+                trend_vp_info = None
+                htf_vp_info_chart = None
+                if ENABLE_VP_TAGS:
+                    if tf in VP_TFS:
+                        vp_info = swing_vp_for_zone(df, z)
+                    _trend_tf_for_vp = trend_tf_for(tf)
+                    _zone_tf_for_vp  = zone_tf_for(tf)
+                    _trend_df = htf_cache.get_df(sym, _trend_tf_for_vp)
+                    _zone_df  = htf_cache.get_df(sym, _zone_tf_for_vp)
+                    if _trend_df is not None:
+                        trend_vp_info = swing_vp_for_zone(_trend_df, z)
+                    if _zone_df is not None:
+                        htf_vp_info_chart = swing_vp_for_zone(_zone_df, z)
+
                 msg_short = build_alert_msg(sym, z, close_now, tf,
                                       ltf_trend, trend_htf,
                                       htf_z["demand"], htf_z["supply"],
                                       ema20s=ema20s,
                                       origin_price=origin_price,
-                                      origin_match=origin_match)
+                                      origin_match=origin_match,
+                                      vp_info=vp_info)
                 msg_full = msg_short
 
                 # LLM enrichment (Gemini). No-op if USE_LLM=false.
@@ -297,6 +322,9 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     trend_dem=trend_z["demand"], trend_sup=trend_z["supply"],
                     htf_tf=zone_htf, htf_df=htf_cache.get_df(sym, zone_htf),
                     htf_dem=htf_z["demand"], htf_sup=htf_z["supply"],
+                    vp_info=vp_info,
+                    trend_vp_info=trend_vp_info,
+                    htf_vp_info=htf_vp_info_chart,
                 )
 
                 alerts.append({

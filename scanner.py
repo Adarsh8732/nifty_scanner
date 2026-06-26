@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -198,6 +199,155 @@ def legout_close_strength(o: float, h: float, l: float,
     return ("WEAK", pos)
 
 
+# ─── SWING-ANCHORED VOLUME PROFILE HELPERS ──────────────────────────────
+
+def find_last_pivot(df: "pd.DataFrame", end_idx: int, lr: int,
+                    kind: str) -> int | None:
+    """Most recent confirmed pivot of `kind` ("low" or "high") strictly
+    BEFORE bar `end_idx`. A pivot is confirmed when it has `lr` bars on each
+    side that don't break it. Returns absolute index in df, or None.
+    """
+    if kind not in ("low", "high"):
+        return None
+    col = "Low" if kind == "low" else "High"
+    series = df[col].values
+    op = (lambda a, b: a < b) if kind == "low" else (lambda a, b: a > b)
+    # Latest confirmable pivot has `lr` bars to its right (still within end_idx)
+    for i in range(end_idx - 1 - lr, lr - 1, -1):
+        v = series[i]
+        if all(op(v, series[j]) for j in range(i - lr, i)) and \
+           all(op(v, series[j]) for j in range(i + 1, i + lr + 1)):
+            return i
+    return None
+
+
+def compute_swing_vp(df: "pd.DataFrame", anchor_idx: int, end_idx: int,
+                     bins: int = None, va_pct: float = None) -> dict | None:
+    """Compute the volume profile from df.iloc[anchor_idx : end_idx+1].
+
+    Returns:
+        {
+          "poc":   float,                # price of the highest-volume bin
+          "vah":   float,                # top of the Value Area
+          "val":   float,                # bottom of the Value Area
+          "centers": list[float],        # price level of each bin (low → high)
+          "vol_per_bin": list[float],    # volume in each bin
+          "anchor_idx": int,             # echoed back for plotting
+          "end_idx": int,
+          "n_bars":  int,
+        }
+    Returns None if the window is too short, has no volume, or is flat.
+    """
+    if bins is None:    bins = VP_BINS
+    if va_pct is None:  va_pct = VP_VA_PCT
+    if df is None or anchor_idx is None or anchor_idx >= end_idx:
+        return None
+    window = df.iloc[anchor_idx: end_idx + 1]
+    if len(window) < VP_MIN_BARS:
+        return None
+    if "Volume" not in window.columns or window["Volume"].sum() <= 0:
+        return None
+    lo = float(window["Low"].min()); hi = float(window["High"].max())
+    if hi <= lo:
+        return None
+
+    edges = np.linspace(lo, hi, bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    vol_per_bin = np.zeros(bins)
+    L = window["Low"].values; H = window["High"].values
+    V = window["Volume"].values
+    for i in range(len(window)):
+        if H[i] <= L[i] or V[i] <= 0:
+            continue
+        mask = (centers >= L[i]) & (centers <= H[i])
+        n = int(mask.sum())
+        if n > 0:
+            vol_per_bin[mask] += V[i] / n
+    if vol_per_bin.sum() <= 0:
+        return None
+
+    poc_idx = int(vol_per_bin.argmax())
+    poc = float(centers[poc_idx])
+
+    # Value Area: expand outward from POC until va_pct of total volume captured
+    total = vol_per_bin.sum()
+    cum = vol_per_bin[poc_idx]
+    lo_i = hi_i = poc_idx
+    while cum < va_pct * total:
+        up = vol_per_bin[hi_i + 1] if hi_i + 1 < bins else 0
+        dn = vol_per_bin[lo_i - 1] if lo_i - 1 >= 0    else 0
+        if up >= dn and hi_i + 1 < bins:
+            hi_i += 1; cum += up
+        elif lo_i - 1 >= 0:
+            lo_i -= 1; cum += dn
+        else:
+            break
+
+    return {
+        "poc":         poc,
+        "vah":         float(centers[hi_i]),
+        "val":         float(centers[lo_i]),
+        "centers":     centers.tolist(),
+        "vol_per_bin": vol_per_bin.tolist(),
+        "anchor_idx":  int(anchor_idx),
+        "end_idx":     int(end_idx),
+        "n_bars":      int(len(window)),
+    }
+
+
+def swing_vp_for_zone(df: "pd.DataFrame", zone: dict,
+                      end_idx: int | None = None) -> dict | None:
+    """Convenience: find the right pivot anchor for a zone (demand→last pivot
+    low, supply→last pivot high) and compute the VP. Returns None on any
+    failure (no pivot, insufficient bars, etc.) so callers can degrade
+    gracefully and emit the alert without VP tags."""
+    if zone is None or df is None or len(df) == 0:
+        return None
+    if end_idx is None:
+        end_idx = len(df) - 1
+    kind = "low" if zone.get("type") == "demand" else "high"
+    anchor = find_last_pivot(df, end_idx, VP_PIVOT_LR, kind)
+    if anchor is None or (end_idx - anchor) < VP_MIN_BARS:
+        return None
+    return compute_swing_vp(df, anchor, end_idx)
+
+
+def zone_overlaps_poc(zone: dict, vp: dict) -> bool:
+    """True if the zone band [distal, proximal] contains the POC."""
+    if zone is None or vp is None:
+        return False
+    z_lo = min(zone["proximal"], zone["distal"])
+    z_hi = max(zone["proximal"], zone["distal"])
+    return z_lo <= vp["poc"] <= z_hi
+
+
+def zone_overlaps_va_edge(zone: dict, vp: dict) -> str | None:
+    """Check whether the zone band straddles the Value Area's RELEVANT edge:
+
+      demand zone → VAL (Value Area Low) — "value-reversion buy" setup
+      supply zone → VAH (Value Area High) — mirror
+
+    The value-reversion idea (per Trader-Dale / Market Profile classics):
+    when price overshoots the Value Area and reaches its lower (or upper)
+    edge, the market often reverts back into value. A demand zone sitting
+    AT the VAL is a high-conviction reversion buy. Same for supply at VAH.
+
+    Returns "VAL" / "VAH" if the relevant edge is inside the zone band,
+    else None.
+    """
+    if zone is None or vp is None:
+        return None
+    z_lo = min(zone["proximal"], zone["distal"])
+    z_hi = max(zone["proximal"], zone["distal"])
+    if zone.get("type") == "demand":
+        if z_lo <= vp["val"] <= z_hi:
+            return "VAL"
+    elif zone.get("type") == "supply":
+        if z_lo <= vp["vah"] <= z_hi:
+            return "VAH"
+    return None
+
+
 
 def calc_trade_levels(zone: dict) -> dict:
     """Compute actual order levels (Entry / SL / Target) for a zone.
@@ -307,6 +457,24 @@ ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles be
 # gate too — the gap IS the strength signal. Catches small-body opening-gap
 # legouts that the existing rule would otherwise skip.
 GAP_LEGOUT_PCT   = float(os.environ.get("GAP_LEGOUT_PCT", "3.0"))
+
+# ─── SWING-ANCHORED VOLUME PROFILE ──────────────────────────────────────
+# Backtested edge: zones overlapping the swing-anchored POC win meaningfully
+# more often than baseline. Empirical results on a 50-stock sample, 5y daily
+# and full history weekly:
+#   1d   pivot L=R=5   POC overlap → +3.9pp WR over baseline (N=248)
+#   1wk  pivot L=R=5   POC overlap → +8.6pp WR over baseline (N=82)
+# Anchor logic: demand zone alerts anchor to the most recent confirmed swing
+# LOW; supply alerts anchor to the most recent swing HIGH. VP is computed
+# from the anchor bar to the current bar. Only 1d and 1wk get tagged.
+VP_PIVOT_LR      = int(os.environ.get("VP_PIVOT_LR",   "5"))
+VP_MIN_BARS      = int(os.environ.get("VP_MIN_BARS",  "10"))
+VP_BINS          = int(os.environ.get("VP_BINS",      "50"))
+VP_VA_PCT        = float(os.environ.get("VP_VA_PCT",  "0.70"))
+ENABLE_VP_TAGS   = os.environ.get("ENABLE_VP_TAGS", "true").lower() == "true"
+VP_TFS           = {tf.strip() for tf in
+                    os.environ.get("VP_TFS", "1d,1wk").split(",")
+                    if tf.strip()}
 
 # Catastrophic-candle threshold (corporate-action filter).
 # yfinance auto_adjust catches FORMAL stock splits but misses MANY Indian
@@ -1070,12 +1238,89 @@ CHART_DPI        = int(os.environ.get("CHART_DPI", "110"))
 CHART_SHOW_EMA20 = os.environ.get("CHART_SHOW_EMA20", "true").lower() == "true"
 
 
+def _draw_vp_overlay(ax, df_full, df_plot, vp_info: dict) -> None:
+    """Draw the swing-anchored Volume Profile on top of mplfinance's price axes:
+
+      1. Shaded vertical span — the window VP was computed over (anchor → now)
+      2. Dashed horizontal POC line
+      3. Light horizontal band for the Value Area (val → vah)
+      4. Horizontal histogram of vol_per_bin pinned to the right edge
+    All overlays use transparency so the candles remain readable.
+    """
+    if vp_info is None:
+        return
+    # Translate anchor's absolute index in df_full → index inside df_plot.
+    # mplfinance plots one tick per row of df_plot starting at x=0.
+    plot_offset = len(df_full) - len(df_plot)
+    anchor_x = vp_info["anchor_idx"] - plot_offset
+    end_x    = len(df_plot) - 1
+    if end_x <= 0:
+        return
+    if anchor_x < 0:
+        anchor_x = 0   # anchor is older than the visible window — clamp
+    # If anchor and end coincide (only one bar), skip overlay
+    if anchor_x >= end_x:
+        return
+
+    # (1) Shaded VP window — light blue tint
+    ax.axvspan(anchor_x, end_x, alpha=0.07, color="#1976d2", zorder=0)
+
+    # (2) POC line — purple dashed
+    poc = vp_info["poc"]
+    ax.axhline(poc, color="#7b1fa2", linewidth=1.4, linestyle="--",
+               alpha=0.85, zorder=2)
+    # Text label flush right
+    ax.text(end_x + 0.5, poc, f" POC {poc:.2f}",
+            color="#7b1fa2", fontsize=8, va="center", ha="left", alpha=0.9)
+
+    # (3) Value Area band — very light purple tint
+    vah = vp_info["vah"]; val = vp_info["val"]
+    if vah > val:
+        ax.axhspan(val, vah, alpha=0.04, color="#7b1fa2", zorder=0)
+
+    # (4) Horizontal volume histogram placed JUST LEFT of the VP window
+    # (anchor) and growing LEFTWARD into the older-candles area. Anchors the
+    # profile visually to the range it summarizes.
+    centers = vp_info.get("centers") or []
+    vols    = vp_info.get("vol_per_bin") or []
+    if not centers or not vols:
+        return
+    vols_arr = np.asarray(vols, dtype=float)
+    if vols_arr.max() <= 0:
+        return
+
+    x_min, x_max = ax.get_xlim()
+    chart_width  = x_max - x_min
+    # Limit histogram width to either ~14% of chart OR the space available
+    # to the left of the anchor (whichever is smaller). Ensures we never
+    # draw outside the panel.
+    available_left = max(0.0, anchor_x - x_min)
+    hist_width = min(chart_width * 0.14, available_left * 0.95)
+    if hist_width <= 0:
+        return
+    # Right edge of histogram = the anchor bar; bars grow LEFTWARD from here.
+    hist_x_right = anchor_x
+
+    bin_h = (centers[1] - centers[0]) * 0.9 if len(centers) >= 2 else 0.0
+    max_v = vols_arr.max()
+    for c, v in zip(centers, vols_arr):
+        if v <= 0:
+            continue
+        bar_len = (v / max_v) * hist_width
+        # POC bin = solid purple; everything else = translucent slate-blue
+        color = "#7b1fa2" if abs(c - poc) < bin_h else "#5c6bc0"
+        # left = right_edge - length so bars grow LEFTWARD
+        ax.barh(c, bar_len, left=hist_x_right - bar_len, height=bin_h,
+                color=color, alpha=0.35, edgecolor="none", zorder=1)
+
+
 def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
                       *, zone: dict | None = None,
                       htf_dem: dict | None = None, htf_sup: dict | None = None,
                       levels: dict | None = None,
                       show_ema20: bool = True, show_sma50: bool = False,
-                      title_suffix: str = "") -> bytes | None:
+                      title_suffix: str = "",
+                      vp_info: dict | None = None) -> bytes | None:
     """Render a candlestick chart with optional zone/HTF/level overlays.
 
     All overlays are independent and optional:
@@ -1178,7 +1423,6 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
             figsize  = ((CHART_WIDTH_IN, CHART_HEIGHT_IN) if has_volume
                         else (CHART_WIDTH_IN, CHART_HEIGHT_IN - 1)),
             tight_layout = True,
-            savefig  = dict(fname=buf, format="png", dpi=CHART_DPI, bbox_inches="tight"),
         )
         if hlines_levels:
             plot_kwargs["hlines"] = dict(
@@ -1189,7 +1433,20 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
             )
         if has_volume:
             plot_kwargs["ylabel_lower"] = "Volume"
-        mpf.plot(df_plot, **plot_kwargs)
+
+        # When VP overlay is requested, render with returnfig=True so we can
+        # draw the volume profile on top of mplfinance's price axes before
+        # saving. Otherwise use the original direct-to-buf path.
+        if vp_info is not None:
+            plot_kwargs["returnfig"] = True
+            fig, axes = mpf.plot(df_plot, **plot_kwargs)
+            _draw_vp_overlay(axes[0], df, df_plot, vp_info)
+            fig.savefig(buf, format="png", dpi=CHART_DPI, bbox_inches="tight")
+            plt.close(fig)
+        else:
+            plot_kwargs["savefig"] = dict(
+                fname=buf, format="png", dpi=CHART_DPI, bbox_inches="tight")
+            mpf.plot(df_plot, **plot_kwargs)
         buf.seek(0)
         return buf.getvalue()
     except Exception as e:
@@ -1513,6 +1770,9 @@ def build_chart_album(sym: str,
                       trend_sup: dict | None = None,
                       htf_tf: str, htf_df: "pd.DataFrame | None",
                       htf_dem: dict | None, htf_sup: dict | None,
+                      vp_info: dict | None = None,
+                      trend_vp_info: dict | None = None,
+                      htf_vp_info: dict | None = None,
                       ) -> list[bytes]:
     """Build the 3-chart album for an alert: alert TF, trend TF, HTF zone TF.
 
@@ -1528,16 +1788,21 @@ def build_chart_album(sym: str,
     """
     out: list[bytes] = []
 
-    # Chart 1 — Alert TF (zone + trade levels)
+    # Chart 1 — Alert TF (zone + trade levels). VP overlay only on this
+    # chart — the trend / HTF charts focus on their own role and don't need it.
     img = build_chart_image(
         sym, alert_df, alert_tf,
         zone=alert_zone, levels=alert_levels,
         show_ema20=True, show_sma50=False,
+        vp_info=vp_info,
     )
     if img:
         out.append(img)
 
-    # Chart 2 — Trend TF (EMA20 + SMA50 + trend verdict + trend-TF zones)
+    # Chart 2 — Trend TF (EMA20 + SMA50 + trend verdict + trend-TF zones).
+    # Trend-TF swing-anchored VP overlay shows institutional positioning
+    # over the current trend leg, even though we don't tag this in the
+    # alert text — visualization only.
     if trend_df is not None and len(trend_df) >= 5:
         trend_label = {1: "↑ UP", -1: "↓ DOWN"}.get(trend_value, "→ SIDE")
         img = build_chart_image(
@@ -1545,6 +1810,7 @@ def build_chart_album(sym: str,
             htf_dem=trend_dem, htf_sup=trend_sup,
             show_ema20=True, show_sma50=True,
             title_suffix=f"  |  Trend: {trend_label}",
+            vp_info=trend_vp_info,
         )
         if img:
             out.append(img)
@@ -1555,6 +1821,7 @@ def build_chart_album(sym: str,
             sym, htf_df, htf_tf,
             htf_dem=htf_dem, htf_sup=htf_sup,
             show_ema20=True, show_sma50=False,
+            vp_info=htf_vp_info,
         )
         if img:
             out.append(img)
@@ -2488,7 +2755,8 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
                     htf_sup: dict | None,
                     ema20s: dict | None = None,
                     origin_price: float | None = None,
-                    origin_match: tuple | None = None) -> str:
+                    origin_match: tuple | None = None,
+                    vp_info: dict | None = None) -> str:
     """Builds Telegram alert message mirroring Pine scanner table fields.
 
     ema20s: optional dict {"1d": 4500.0, "1wk": 4520.0, ...} of EMA20 values
@@ -2570,12 +2838,26 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         close_line = (f"\nClose: legout @ {zone['close_pct']*100:.0f}% of range "
                       f"→ *{zone['close_label']}*")
 
+    # Swing-anchored VP confluence — empirical edge: 1d +3.9pp / 1wk +8.6pp WR
+    # over baseline when zone band contains the POC. VAL/VAH proximity adds
+    # the value-reversion setup tag (demand at VAL, supply at VAH). Both can
+    # fire on the same alert when the value area is tight.
+    vp_tag = ""
+    if vp_info is not None:
+        if zone_overlaps_poc(zone, vp_info):
+            vp_tag += f"  🎯 VP-POC `{vp_info['poc']:.2f}`"
+        va_edge = zone_overlaps_va_edge(zone, vp_info)
+        if va_edge == "VAL":
+            vp_tag += f"  📍 VP-VAL `{vp_info['val']:.2f}`"
+        elif va_edge == "VAH":
+            vp_tag += f"  📍 VP-VAH `{vp_info['vah']:.2f}`"
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
         f"Zone: prox `{zone['proximal']:.2f}` → dist `{zone['distal']:.2f}`\n"
         f"Alert at: `{entry:.2f}`  |  Dist: {zone['dist_pct']:.1f}%\n"
-        f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}\n"
+        f"Score: *{zone['score']:.1f}*  |  Tests: {zone['tests']}  |  LTF Trend: {trend_label(ltf_trend)}{vp_tag}\n"
         f"─────────\n"
         f"{trend_lbl} Trend: {trend_label(htf_trend)}\n"
         f"{_htf_zone_line(htf_dem, f'{zone_lbl} Dem')}\n"
@@ -2699,10 +2981,13 @@ def scan_one_tf(timeframe: str, symbols: list[str],
 
         for z in filtered_candidates:
             key = zone_key(sym, z)
+            vp_info = (swing_vp_for_zone(df, z)
+                       if ENABLE_VP_TAGS and timeframe in VP_TFS else None)
             alerts.append((
                 sym,
                 build_alert_msg(sym, z, close_now, timeframe,
-                                ltf_trend, htf_trend, htf_dem, htf_sup),
+                                ltf_trend, htf_trend, htf_dem, htf_sup,
+                                vp_info=vp_info),
             ))
             new_state[key] = {
                 "first_alerted": datetime.now(timezone.utc).isoformat(),
