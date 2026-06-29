@@ -112,6 +112,11 @@ jobs:
           VP_MIN_BARS:          '10'   # skip VP if anchor < this many bars away
           VP_BINS:              '50'   # histogram resolution
           VP_VA_PCT:            '0.70' # Value Area volume threshold
+          # How far back to scan for legout candidates (zone formation).
+          # 100 bars ≈ 5 weeks on 125m, ~5 months on 1d, ~2 years on 1wk.
+          # Older zones still pass — the scanner picks the one CLOSEST to
+          # current price among all valid candidates in the window.
+          LOOKBACK_BARS:        '100'
           # Trade-level target: reward-to-risk multiple.
           # Target = entry + RR × (entry - SL). 2.0 means target is 2× risk.
           TARGET_RR_MULTIPLE:   '2.0'

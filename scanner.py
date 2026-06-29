@@ -446,7 +446,7 @@ BASE_PCT         = 0.50
 EXCITE_PCT       = 0.50
 LEGOUT_MIN_RATIO = 0.8
 MAX_BASE         = 3
-LOOKBACK_BARS    = 50
+LOOKBACK_BARS    = int(os.environ.get("LOOKBACK_BARS", "100"))
 MAX_ZONE_TESTS   = 1
 ALLOW_ZERO_BASE  = True   # detect engulfing-spike reversals (no base candles between legin & legout)
 
