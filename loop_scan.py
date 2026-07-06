@@ -289,30 +289,30 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                                       vp_info=vp_info)
                 msg_full = msg_short
 
-                # LLM enrichment (Gemini). No-op if USE_LLM=false.
-                # Pass EMA20 confluence + swing origin so the model can use
-                # the same structural signals shown in the Telegram alert.
-                if USE_LLM:
-                    analysis = analyze_with_gemini(
-                        sym, z, close_now, tf,
-                        ltf_trend, trend_htf,
-                        htf_z["demand"], htf_z["supply"],
-                        ema20s=ema20s,
-                        origin_price=origin_price,
-                        origin_match=origin_match,
-                    )
-                    if analysis:
-                        msg_full = msg_short + "\n─────────\n*🧠 AI thesis:*\n" + analysis
-
-                # Build the 3-chart album: alert TF / trend TF / HTF zone TF.
-                # All charts are best-effort — any that fails to render is
-                # silently dropped. Empty list → dispatch_alert sends text only.
+                # Build the multi-chart album FIRST so we can also feed it
+                # into the vision-enabled Gemini call below.
+                # Album contents (dedup'd): alert TF / trend TF / HTF zone /
+                # 1mo / 3mo. Best-effort — any chart that fails to render is
+                # silently dropped.
                 trend_tf  = trend_tf_for(tf)
                 zone_htf  = zone_tf_for(tf)
                 # Detect zones on the trend timeframe too so the trend chart
                 # shows the same demand/supply bands the trader would draw.
                 trend_z = htf_cache.get_zones(sym, trend_tf,
                                               close_now_override=close_now)
+                # Extra context charts (1mo + 3mo) for the trader to
+                # eyeball the highest-timeframe view. Only appended by
+                # build_chart_album when not already present as alert_tf /
+                # trend_tf / htf_tf (e.g. a 1wk alert already shows 3mo as
+                # the HTF chart, so 3mo here is deduped).
+                extra_ctx = []
+                for _extra_tf in ("1mo", "3mo"):
+                    _extra_df = htf_cache.get_df(sym, _extra_tf)
+                    _extra_vp = (swing_vp_for_zone(_extra_df, z)
+                                 if ENABLE_VP_TAGS and _extra_df is not None
+                                 else None)
+                    extra_ctx.append((_extra_tf, _extra_df, _extra_vp))
+
                 charts = build_chart_album(
                     sym,
                     alert_tf=tf, alert_df=df,
@@ -325,7 +325,26 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     vp_info=vp_info,
                     trend_vp_info=trend_vp_info,
                     htf_vp_info=htf_vp_info_chart,
+                    extra_context_charts=extra_ctx,
                 )
+
+                # Vision-enabled LLM enrichment. Charts are sent to Gemini
+                # as inline_data alongside the text prompt so the model sees
+                # the actual chart pattern (zone shape, VP overlay, trend
+                # structure) rather than reasoning purely from metadata.
+                # No-op when USE_LLM=false.
+                if USE_LLM:
+                    analysis = analyze_with_gemini(
+                        sym, z, close_now, tf,
+                        ltf_trend, trend_htf,
+                        htf_z["demand"], htf_z["supply"],
+                        ema20s=ema20s,
+                        origin_price=origin_price,
+                        origin_match=origin_match,
+                        charts=charts,
+                    )
+                    if analysis:
+                        msg_full = msg_short + "\n─────────\n*🧠 AI thesis:*\n" + analysis
 
                 alerts.append({
                     "sym":       sym,

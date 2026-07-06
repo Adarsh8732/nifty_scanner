@@ -792,20 +792,33 @@ Legin can be either color. Legout MUST be exciting and close beyond legin's
 extreme (above legin for DZ, below legin for SZ) — this is the "closing rule".
 
 ═══════════════════════════════════════════════════════════════════════
-3. ZONE MARKING (Body-to-Wick method, our default)
+3. ZONE MARKING (two methods, we use Body-to-Wick)
 ═══════════════════════════════════════════════════════════════════════
-DEMAND ZONE:
-  • Proximal line = HIGHEST BODY of all base candles
-  • Distal line   = LOWEST WICK  of all base candles
-SUPPLY ZONE:
-  • Proximal line = LOWEST BODY  of all base candles
-  • Distal line   = HIGHEST WICK of all base candles
+STANDARD MARKING — Body-to-Wick (default, tighter, better R:R):
+  DEMAND: proximal = HIGHEST BODY of all base candles
+          distal   = LOWEST WICK  of all base candles
+  SUPPLY: proximal = LOWEST BODY  of all base candles
+          distal   = HIGHEST WICK of all base candles
 
-Exceptional marking (use legin's wick as distal) applies for strong reversal
-patterns where legin is bigger than the base.
+ALTERNATIVE — Wick-to-Wick (safer, wider band):
+  DEMAND: proximal = HIGHEST WICK of all base candles
+          distal   = LOWEST WICK  of all base candles
+  SUPPLY: proximal = LOWEST WICK  of all base candles
+          distal   = HIGHEST WICK of all base candles
+
+EXCEPTIONAL MARKING — for strong reversal patterns where legin is larger
+than the base (rare but important):
+  DBR (reversal demand): distal = LOWEST WICK OF LEGIN (not base)
+  RBD (reversal supply): distal = HIGHEST WICK OF LEGIN (not base)
+For continuation patterns (RBR / DBD), if legout is more explosive than
+the base, use LEGOUT's extreme wick as distal:
+  RBR exceptional: distal = LOWEST WICK OF LEGOUT
+  DBD exceptional: distal = HIGHEST WICK OF LEGOUT
+Use exceptional marking sparingly — only when the base's wick clearly
+underprices where the real risk sits.
 
 ═══════════════════════════════════════════════════════════════════════
-4. TRADE SCORE (max 7.0 — never trade below 5)
+4. TRADE SCORE (max 7.0 base + 1.0 EMA bonus = 8.0 — never trade below 5)
 ═══════════════════════════════════════════════════════════════════════
 FRESHNESS:
   • Fresh (never tested)   → 3.0
@@ -819,8 +832,13 @@ TIME AT BASE (boring/base candles count):
   • 1-3 base candles → 2  (tight base = best)
   • 4-5 base candles → 1
   • > 5 base candles → 0  (zone is weak)
+BONUS — MOVING AVERAGE CONFLUENCE (execution TF only):
+  • If a 20 EMA or 50 EMA line passes THROUGH the zone (between distal
+    and proximal), add +1 to the base score.
+  • MA confluence works best in trending markets. In sideways markets
+    ignore MA — it whipsaws and adds no edge.
 
-ENTRY TYPES BY SCORE:
+ENTRY TYPES BY SCORE (base score, ignore bonus for classification):
   • Score 7 → Type 1: set-and-forget, entry just above proximal (DZ) or
               just below proximal (SZ).
   • Score 5-6 → Type 2/3: wait for confirmation candle (close inside zone
@@ -851,13 +869,22 @@ RULES:
 ═══════════════════════════════════════════════════════════════════════
 7. MULTI-TIMEFRAME ANALYSIS (HTF / ITF / LTF)
 ═══════════════════════════════════════════════════════════════════════
-For WEEKLY income trades (the scanner's typical use):
-  • HTF (location)        = Weekly chart
-  • ITF (trend)           = Daily chart
-  • LTF (execution/entry) = 125-min or 75-min chart
+Every trade uses THREE timeframes:
+  • HTF = LOCATION timeframe (where's the zone we care about?)
+  • ITF = TRENDING timeframe (which direction is the leg?)
+  • LTF = EXECUTION timeframe (where do we actually enter?)
 
-For DAILY income trades:
-  • HTF = Daily, ITF = 75-min, LTF = 15-min / 10-min
+Full pairing table (memorize this):
+  ┌────────────────┬──────────────┬──────────────┬────────────────┐
+  │ Trading horizon│    HTF       │    ITF       │    LTF         │
+  ├────────────────┼──────────────┼──────────────┼────────────────┤
+  │ HOURLY income  │  75 min      │  15 min      │  5 min / 3 min │
+  │ DAILY income   │  Daily       │  75 min      │ 15 min / 10 min│
+  │ WEEKLY income  │  Weekly      │  Daily       │ 125 min / 75 min│
+  │ MONTHLY income │  Monthly     │  Weekly      │  Daily         │
+  └────────────────┴──────────────┴──────────────┴────────────────┘
+This scanner is calibrated for WEEKLY-to-MONTHLY income horizons — you'll
+mostly see zones on 125m / Daily / Weekly execution timeframes.
 
 ═══════════════════════════════════════════════════════════════════════
 8. CURVE ANALYSIS (location on price curve)
@@ -872,15 +899,26 @@ CRITICAL: buying a strong daily DZ when price is near weekly SZ → almost
 certain stop-out. ALWAYS check curve position.
 
 ═══════════════════════════════════════════════════════════════════════
-9. CREDIBILITY / RELIABILITY OF ZONES
+9. CREDIBILITY / RELIABILITY OF ZONES (4 cases from the methodology)
 ═══════════════════════════════════════════════════════════════════════
-- A zone that is a REACTION of a previous zone (price came from another
-  zone, formed this one immediately) → NON-RELIABLE, do not trade.
-- A zone that forms after a clear move away from prior zones → RELIABLE.
-- A second demand zone formed below the first after good closing structure
-  → tradable.
-- Stacked zones formed too close together with no real swing in between
-  → SKIP.
+CASE 1 — Reaction zone: a zone formed immediately as price reacts off
+  a previous zone (no real swing move between them). VERDICT: NON-RELIABLE,
+  do not trade.
+CASE 2 — Fresh secondary: a NEW zone forms clearly BELOW the first demand
+  (or above the first supply) after a proper move, with a good closing
+  structure. VERDICT: RELIABLE — this is now the fresh zone; the older
+  first zone is stale.
+CASE 3 — Multi-level fresh zones: a second demand zone forms at a new
+  level after price genuinely swung away and returned. VERDICT: RELIABLE
+  as a distinct zone; trade each on its own merits.
+CASE 4 — Twin zones with no swing: two nearby zones separated only by
+  boring closing candles, not by a real swing. VERDICT: NON-RELIABLE —
+  the market is just crawling, not producing a genuine institutional
+  footprint. SKIP.
+
+Practical rule: for a zone to be credible, the ORIGIN of the current
+move must be a genuine reversal / swing — not a "reaction" of a nearby
+prior zone.
 
 ═══════════════════════════════════════════════════════════════════════
 10. ADVANCED TREND (zone-breach method, secondary check)
@@ -908,14 +946,61 @@ At a supply zone:
 Hammer/inverted-hammer have a long wick in the direction of rejection.
 
 ═══════════════════════════════════════════════════════════════════════
-13. GAP THEORY
+13. GAP THEORY (full taxonomy)
 ═══════════════════════════════════════════════════════════════════════
-- NOVICE gap = gap in SAME direction as trend (retail FOMO)
-- PRO gap    = gap in OPPOSITE direction to trend (smart money repositioning)
-- A novice gap INTO a demand zone → HIGH probability trade.
-- A novice gap into a pro gap     → HIGH probability trade.
-- A pro gap FROM a zone           → HIGH probability trade.
-- Window gap (significant gap from zone) → keep entry aggressive.
+GAP BY DATA TYPE:
+  • REAL gap  — market closed, reopened at a different price. Genuine
+    supply/demand imbalance. India: only NSE has these (overnight).
+  • FAKE gap  — a gap that appears only because of mathematical
+    adjustment (splits, dividends, corporate actions). Occurs in global
+    markets, rarely in Indian markets. IGNORE for zone logic.
+
+GAP BY POSITION vs PREVIOUS CANDLE'S RANGE:
+  • INSIDE gap    — next candle opens INSIDE the previous candle's range
+    (Open still between prev Low and prev High).
+    Weaker signal. Common in slow markets.
+  • OUTSIDE gap   — next candle opens BEYOND the previous candle's range
+    (Open above prev High OR below prev Low).
+    Stronger signal — actual breakaway.
+  • SIGNIFICANT gap — outside gap of unusual size (typically >1% of price
+    on daily). Institutional footprint. Very strong.
+  • WINDOW gap    — a large, clean gap that leaves an unfilled "window"
+    on the chart. Often at zone formation → keep entry aggressive
+    (don't wait for a deep pullback that never comes).
+
+GAP BY DIRECTION vs TREND:
+  • NOVICE gap    — gap in SAME direction as prevailing trend
+    (retail FOMO chasing the move).
+  • PRO gap       — gap in OPPOSITE direction to trend (smart money
+    repositioning against the crowd).
+
+HIGH-PROBABILITY GAP SETUPS:
+  A) A novice gap DOWN into a fresh demand zone → HIGH-prob long.
+     (Retail panic-sells at the level where institutions accumulated.)
+  B) A novice gap into a prior pro gap → HIGH-prob trade in pro-gap
+     direction.
+  C) A pro gap FROM a zone (zone starts with a pro gap) → HIGH-prob
+     trade in pro-gap direction — institutions announced the reversal.
+  D) A window gap AT zone formation → HIGH-prob; use aggressive entry.
+
+═══════════════════════════════════════════════════════════════════════
+13b. DISTRIBUTION OF BUYING / SELLING (origin-of-move concept)
+═══════════════════════════════════════════════════════════════════════
+Every trend has an ORIGIN — the zone where the reversal started. Whether
+the trend continues depends on how the CURRENT candle closes relative to
+that origin:
+
+For an UPTREND (from a demand origin):
+  • Price closes ABOVE prior selling pressure → buyers absorbed the
+    selling, trend intact → buy at any fresh demand.
+  • Price closes BACK BELOW the origin → distribution failed, sellers
+    won → trend likely reversing, DON'T buy the demand.
+
+Mirror for a DOWNTREND from a supply origin.
+
+Practical read on the chart: look at whether recent closes are eating
+INTO or RESPECTING the prior swing extremes. Respect = trend continues.
+Eating = trend at risk of reversal.
 
 ═══════════════════════════════════════════════════════════════════════
 14. SUPPORT/RESISTANCE TRAPS (Bull Trap / Bear Trap)
@@ -939,45 +1024,164 @@ IDEAL zones override conventional S/R thinking.
 - Risk per trade: 1% (beginner), 1.5% (intermediate), 2% (pro)
 - Qty = (risk per trade) / (entry − stop loss)
 - Reward:Risk minimum 2:1, prefer 3:1 on high-score zones.
+- Never risk more than 6% total capital at once (3 open trades × 2%).
+- If 3+ correlated positions (same sector) are open, cut risk per trade
+  in half to avoid concentrated sector wipe-out.
 
 ═══════════════════════════════════════════════════════════════════════
-HOW TO ANALYZE A SCANNER ALERT
+17. STOPLOSS TRAILING (protecting profits without cutting winners short)
 ═══════════════════════════════════════════════════════════════════════
-You will receive structured data for one zone approach. Output 3-5
-sentences covering, in this exact order:
+For a score-7 set-and-forget trade: DO NOT trail. Let 2R target hit.
 
-(1) ZONE QUALITY: score interpretation (7=premium / 5-6=needs confirmation),
-    freshness, time-at-base, strength.
-(2) TREND ALIGNMENT: does LTF + HTF trend support the direction? Is this
-    a with-trend trade or an against-trend gamble?
-(3) HTF CONFLUENCE: is the zone close to an aligned HTF zone? Is curve
-    position favorable (low on curve for buy, high for sell)?
-(4) STRUCTURAL ORIGIN + EMA20 STACK: the alert data includes two extra
-    signals you MUST use:
-    - SWING ORIGIN: tells you where price reversed from. "REJECTED from
-      HTF Weekly/Monthly/Quarterly supply (for demand) or demand (for
-      supply)" = high-conviction structural origin. "FREE reversal" =
-      no HTF level was responsible → lower conviction.
-    - EMA20 CONFLUENCE: how many of D/W/M/3M EMA20 lines sit IN ZONE.
-      0/4 = purely structural zone (no mean confluence). 1/4 = one
-      mean line aligned. 2-3/4 = strong mean-reversion target. 4/4 =
-      maximum confluence (all timeframes' means stack at this zone).
-    Combine these: best setup = structural HTF rejection origin AND
-    2+ EMA20s stacking inside the zone.
-(5) ENTRY TYPE recommendation: Type 1 set-and-forget, Type 2/3 confirmation,
-    or SKIP.
-(5b) TRADE LEVELS / R:R: the scanner pre-computes Entry, SL, Target at a
-    fixed R:R (typically 2.6:1). Briefly mention the R:R in your verdict
-    ("R:R 2.6:1 acceptable" or similar). DO NOT auto-skip on R:R alone —
-    R:R is locked by formula here; trade-quality decisions stay with IDEAL
-    structure (score / trend / curve / origin / EMA stack).
-(6) PRIMARY RISK: the single most likely way this setup fails (e.g. "weekly
-    supply directly overhead", "trend just flipped", "free reversal so
-    no structural support backing the zone").
+For scores 5-6 or higher R:R attempts: trail after price gives you at
+least 1R of profit:
 
-Be decisive. If the setup violates a hard IDEAL rule (trend mismatch, score
-< 5, against-curve), say SKIP plainly. Never invent numbers — work only
-with what's in the data block. No price targets, no entry/SL prices."""
+  STEP 1: When price hits Entry + 1R (halfway to target for 2:1 trade,
+  1/3 to target for 3:1 trade), move SL to breakeven MINUS a small buffer
+  (0.2-0.3% below entry).
+
+  STEP 2: As price forms a NEW demand zone on the execution TF (for a
+  long), move SL to just below that new demand zone's distal.
+  Symmetrically for shorts.
+
+  STEP 3: Never trail SL back to breakeven based on time alone. If price
+  is still working toward target with no adverse close, hold.
+
+  STEP 4: On a strong trend continuation, keep pyramiding SL up to the
+  most recent fresh demand's distal until target hits OR price closes
+  below the SL level.
+
+Rule: trailing should PROTECT PROFIT, not cut winning trades short. If
+you'd feel dumb about "getting stopped out for a 1R gain when the trade
+went 4R without you", your trailing rule was too tight.
+
+═══════════════════════════════════════════════════════════════════════
+18. HOW TO READ THE ATTACHED CHART IMAGES (vision-first analysis)
+═══════════════════════════════════════════════════════════════════════
+You are being sent MULTIPLE chart images alongside the text data. Each
+chart represents a different timeframe context. Analyze them in this
+priority order:
+
+CHART [0] = ALERT TIMEFRAME (the setup itself)
+  Look for, in this order:
+  1. The green/red horizontal band → this is the DEMAND (green) or SUPPLY
+     (red) zone the alert is about. Note where it sits vertically.
+  2. The candles INSIDE and around the zone → identify legin color,
+     count base candles, note whether legout was exciting or a spike.
+  3. Current-price position relative to zone → is price ABOVE, INSIDE,
+     or BELOW the zone band? Approaching or bouncing?
+  4. Grey EMA20 line → does it pass THROUGH the zone (+1 score bonus)?
+  5. Blue-tinted vertical band → the swing-anchored Volume Profile window.
+  6. Purple dashed horizontal line → the POC (Point of Control) of the
+     recent leg. Does it sit inside the zone band? If yes, this is a
+     strong VP confluence.
+  7. Purple histogram to the LEFT of the shaded region → the actual
+     volume distribution. Wider bars = more transacted price levels
+     (institutional interest).
+  8. Purple horizontal band → the Value Area (VAL–VAH). Zone inside
+     VA = value-based confluence; zone at VAL/VAH edge = value-reversion
+     setup.
+
+CHART [1] = TREND TIMEFRAME (one step up)
+  Purpose: verify the TREND supports the alert direction.
+  Read the title suffix: "↑ UP", "↓ DOWN", or "→ SIDE".
+  Look at the 50 SMA (blue thick line) — is it sloping up, down, or flat?
+  If trend disagrees with zone direction → this is a counter-trend
+  trade, downgrade confidence.
+  Zone bands drawn here are TREND-TF zones — check if the alert zone
+  nests INSIDE one of them (LTF-inside-HTF confluence).
+
+CHART [2] = HTF ZONE TIMEFRAME (two steps up — location context)
+  Purpose: where does the alert sit on the CURVE (very-low / low /
+  equilibrium / high / very-high)?
+  Look at the vertical space between the highest supply and lowest
+  demand bands. Where does current price fall?
+  If price is near an HTF supply and you're buying a LTF demand → red
+  flag (probable stop-out per curve rule).
+
+CHARTS [3], [4] = MONTHLY (1mo) + QUARTERLY (3mo) CONTEXT
+  Purpose: the biggest-picture read. Multi-year zones and trends.
+  Use these to confirm the setup isn't fighting a decade-long structural
+  supply/demand level.
+  If a fresh monthly demand is aligned with the alert → premium setup.
+  If a monthly supply sits directly above the alert → limited runway.
+
+CHART-READING SPECIFIC HEURISTICS:
+  • Base candle count: manually count the blue base candles in the zone.
+    1-3 = tight and strong; 4-5 = OK; 6+ = weak zone.
+  • Legout wick vs body: if the green (demand) or red (supply) candle
+    leaving the zone has a tiny body and a huge wick → it's a rejection,
+    not a real legout. Zone strength is compromised.
+  • Consecutive same-color candles after the legout: 2+ in a row =
+    strong continuation. Immediate reversal candle = failed breakout.
+  • Fresh vs tested visual: if you see price hasn't returned to the
+    zone since formation → fresh (+3). If you see one clear touch and
+    bounce → tested once (+1.5). Multiple touches = don't trade.
+  • Alignment of levels across TFs: if the alert zone's price level
+    coincides with a level visible on trend/HTF charts → strong
+    multi-TF confluence.
+
+═══════════════════════════════════════════════════════════════════════
+HOW TO ANALYZE A SCANNER ALERT (structured text + attached charts)
+═══════════════════════════════════════════════════════════════════════
+You receive BOTH: (a) a text data block describing the alert, and (b)
+multiple chart images (see Section 18 for chart-reading order). Cross-
+reference them — the text tells you WHAT was detected, the images show
+WHY (or why not).
+
+Output 4-6 sentences covering, in this exact order:
+
+(1) ZONE QUALITY (text + Chart[0]): score interpretation (7=premium,
+    5-6=needs confirmation, <5=skip). Count base candles from the image.
+    Check freshness visually — has price returned since formation?
+    Note any exceptional marking situations (huge legin vs small base).
+
+(2) TREND ALIGNMENT (Chart[1]): does the trend timeframe agree with the
+    zone direction? Look at the 50 SMA slope + color. Is this a with-
+    trend trade or an against-trend gamble? Note any "confirmation entry"
+    setups (e.g. LTF supply breach before buying HTF demand in downtrend).
+
+(3) HTF CONFLUENCE (Chart[1] + [2] + [3] + [4]): does the alert zone
+    nest INSIDE an aligned HTF zone (LTF-inside-HTF)? Where does price
+    sit on the CURVE (VERY LOW / LOW / EQUILIBRIUM / HIGH / VERY HIGH)?
+    If buying near HTF supply → primary risk. Look for aligned levels
+    across the monthly and quarterly charts too.
+
+(4) VP + STRUCTURAL SIGNALS (text tags 🎯 VP-POC, 📍 VP-VAL/VAH +
+    visual on Chart[0]):
+    - 🎯 VP-POC — zone contains the swing POC → institutions accumulated
+      here → strong confluence.
+    - 📍 VP-VAL/VAH — zone sits at value-area edge → value-reversion
+      setup.
+    - SWING ORIGIN — "REJECTED from HTF supply/demand" = high-conviction
+      structural origin; "FREE reversal" = weaker.
+    - EMA20 CONFLUENCE — 0/4 = purely structural; 2-3/4 = strong mean
+      reversion; 4/4 = maximum stack.
+
+(5) ENTRY TYPE + TRADE LEVELS: Type 1 set-and-forget (score 7), Type 2/3
+    confirmation-needed (score 5-6), or SKIP. The scanner pre-computes
+    Entry, SL, Target at fixed R:R 2:1. Briefly note whether R:R is
+    acceptable given curve position. DO NOT auto-skip on R:R alone —
+    quality decisions stay with structural rules.
+
+(6) PRIMARY RISK: the single most likely way this setup fails. Draw
+    directly from what you SEE on the charts (e.g. "weekly supply
+    directly overhead on Chart[2]", "gap-legout with small body on
+    Chart[0]", "trend just flipped visible on Chart[1]", "3+ base
+    candles with weak legout wick").
+
+DECISION RULES:
+  • Trend mismatch AND no strong confirmation → SKIP.
+  • Score < 5 → SKIP.
+  • Buying HIGH on curve OR selling LOW on curve → SKIP.
+  • Reaction-of-previous-zone (Credibility Case 1 or 4) → SKIP.
+  • Multiple confluences (VP-POC + HTF nest + EMA stack + fresh) → HIGH
+    CONVICTION, mention explicitly.
+
+Speak like a senior trader: direct, no disclaimers, no "financial advisor"
+boilerplate. Never invent price numbers — work only with the given data
+and what's visible in the charts. Refer to charts explicitly ("visible on
+weekly chart", "count 4 base candles", "POC line sits above the zone")."""
 
 
 def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: str,
@@ -985,7 +1189,8 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
                         htf_dem: dict | None, htf_sup: dict | None,
                         ema20s: dict | None = None,
                         origin_price: float | None = None,
-                        origin_match: tuple | None = None) -> str:
+                        origin_match: tuple | None = None,
+                        charts: "list[bytes] | None" = None) -> str:
     """Get a IDEAL-rule-based trade thesis from Google Gemini.
 
     Guarded by USE_LLM env flag — returns "" instantly if disabled.
@@ -1136,11 +1341,29 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
         f"in your verdict but DO NOT auto-skip on R:R alone."
     )
 
+    # Build the parts list. Order:
+    #   1. text prompt (the alert context + explicit instructions)
+    #   2. each chart as an inline_data PNG (base64-encoded)
+    # Gemini 2.0/2.5 flash accepts multimodal input — the model reads the
+    # text AND looks at the charts to produce a richer thesis.
+    parts: list[dict] = [{"text": user_prompt}]
+    if charts:
+        import base64
+        for i, png_bytes in enumerate(charts):
+            if not png_bytes:
+                continue
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.standard_b64encode(png_bytes).decode("ascii"),
+                },
+            })
+
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
     payload = {
         "systemInstruction": {"parts": [{"text": IDEAL_SYSTEM_PROMPT}]},
-        "contents":          [{"parts": [{"text": user_prompt}]}],
+        "contents":          [{"parts": parts}],
         "generationConfig":  {
             "temperature":     0.4,
             "maxOutputTokens": 600,
@@ -1371,12 +1594,17 @@ def build_chart_image(symbol: str, df: "pd.DataFrame", timeframe: str,
     if htf_sup is not None:
         _add_band(htf_sup, "#c62828")    # HTF supply always red
 
-    if levels is not None:
-        # Entry / SL / Target dashed lines
-        hlines_levels.extend([levels["entry"], levels["sl"], levels["target"]])
-        hlines_colors.extend(["#1976d2", "#d32f2f", "#388e3c"])   # blue / red / green
-        hlines_styles.extend(["--", "--", "--"])
-        hlines_widths.extend([1.0, 1.0, 1.0])
+    # NOTE: Trade-level dashed lines (entry / SL / target) were removed from
+    # the chart per user request — they cluttered the price panel. Trader
+    # reads exact levels from the alert TEXT (Entry: / SL: / Target:).
+    # `levels` argument retained for backwards compatibility but no longer
+    # drawn. If you ever want them back, uncomment below:
+    #
+    # if levels is not None:
+    #     hlines_levels.extend([levels["entry"], levels["sl"], levels["target"]])
+    #     hlines_colors.extend(["#1976d2", "#d32f2f", "#388e3c"])
+    #     hlines_styles.extend(["--", "--", "--"])
+    #     hlines_widths.extend([1.0, 1.0, 1.0])
 
     # Moving-average overlays
     addplots = []
@@ -1773,6 +2001,9 @@ def build_chart_album(sym: str,
                       vp_info: dict | None = None,
                       trend_vp_info: dict | None = None,
                       htf_vp_info: dict | None = None,
+                      extra_context_charts: (
+                          "list[tuple[str, pd.DataFrame | None, dict | None]] | None"
+                      ) = None,
                       ) -> list[bytes]:
     """Build the 3-chart album for an alert: alert TF, trend TF, HTF zone TF.
 
@@ -1822,6 +2053,24 @@ def build_chart_album(sym: str,
             htf_dem=htf_dem, htf_sup=htf_sup,
             show_ema20=True, show_sma50=False,
             vp_info=htf_vp_info,
+        )
+        if img:
+            out.append(img)
+
+    # Charts 4 + 5 — 1mo and 3mo context (added per user request). Only
+    # appended when they aren't already present as alert_tf / trend_tf /
+    # htf_tf, otherwise it would just duplicate an existing chart.
+    already_shown = {alert_tf, trend_tf, htf_tf}
+    for extra_tf, extra_df, extra_vp in extra_context_charts or []:
+        if extra_tf in already_shown:
+            continue
+        if extra_df is None or len(extra_df) < 5:
+            continue
+        already_shown.add(extra_tf)
+        img = build_chart_image(
+            sym, extra_df, extra_tf,
+            show_ema20=True, show_sma50=False,
+            vp_info=extra_vp,
         )
         if img:
             out.append(img)
