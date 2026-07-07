@@ -80,7 +80,7 @@ jobs:
           GEMINI_MODEL:         'gemini-2.5-flash-lite'
 
           # ─── SCANNER CONFIG ───────────────────────────────────────────
-          TIMEFRAMES:           '125m,1d,1wk'
+          TIMEFRAMES:           '1wk,1d,125m'
           ALERT_ENTRY_PCT:      '1.0'
           ALERT_MIN_SCORE:      '7.0'
           STRICT_FILTER:        'true'
