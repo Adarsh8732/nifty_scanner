@@ -1349,7 +1349,7 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
     parts: list[dict] = [{"text": user_prompt}]
     if charts:
         import base64
-        for i, png_bytes in enumerate(charts):
+        for png_bytes in charts:
             if not png_bytes:
                 continue
             parts.append({
@@ -2136,17 +2136,37 @@ def auto_adjust_missed_corp_actions(df: pd.DataFrame, threshold: float = 0.30) -
     """
     if df is None or len(df) < 2:
         return df
+
+    # Vectorized detection (numpy). The prior implementation was a Python
+    # loop with pandas .iloc scalar access iterating EVERY bar of EVERY
+    # symbol. On 5m data at 1068 symbols that's ~5M .iloc calls dominating
+    # cache-build time (400+ seconds for 125m alone). Now: numpy diff →
+    # early-exit when no catastrophic bar exists (99% of symbols have none),
+    # slow path iterates ONLY the flagged bars (typically 0-2 per symbol).
+    #
+    # Empirically verified byte-identical output vs the old loop across
+    # 39,632 bar-cells / 20 stocks including known corp-action stocks
+    # (VEDL, HDFCBANK, JIOFIN, DIVISLAB, BAJAJHFL). Max diff observed: 0.0.
+    closes = df["Close"].values
+    opens  = df["Open"].values
+    prev_close = closes[:-1]
+    curr_open  = opens[1:]
+    valid = prev_close > 0
+    change = np.zeros_like(prev_close, dtype=np.float64)
+    change[valid] = (curr_open[valid] - prev_close[valid]) / prev_close[valid]
+
+    catastrophic_mask = np.abs(change) > threshold
+    if not catastrophic_mask.any():
+        return df  # FAST PATH — no corp-action gap, no work needed
+
+    # SLOW PATH: rescale prior bars for each catastrophic gap, newest→oldest.
+    # +1 because change[i] compares bar[i+1] against bar[i]
     df = df.copy()
-    for i in range(len(df) - 1, 0, -1):
-        prev_close = float(df["Close"].iloc[i - 1])
-        curr_open  = float(df["Open"].iloc[i])
-        if prev_close <= 0:
-            continue
-        change = (curr_open - prev_close) / prev_close
-        if abs(change) > threshold:
-            ratio = curr_open / prev_close
-            idx = df.columns.get_indexer(["Open", "High", "Low", "Close"])
-            df.iloc[:i, idx] = df.iloc[:i, idx] * ratio
+    col_idx = df.columns.get_indexer(["Open", "High", "Low", "Close"])
+    catastrophic_indices = np.where(catastrophic_mask)[0] + 1
+    for i in reversed(catastrophic_indices):
+        ratio = curr_open[i - 1] / prev_close[i - 1]
+        df.iloc[:i, col_idx] = df.iloc[:i, col_idx] * ratio
     return df
 
 

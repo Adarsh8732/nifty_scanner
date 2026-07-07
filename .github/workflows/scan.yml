@@ -75,7 +75,7 @@ jobs:
           # 60 alerts/day). gemini-2.5-flash gives slightly better quality at
           # ~$3/mo. gemini-2.0-flash is being phased out — newer billing-
           # enabled projects return HTTP 404 for it.
-          USE_LLM:              'true'       # Gemini vision analysis on every alert
+          USE_LLM:              'false'      # Gemini vision analysis disabled
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL:         'gemini-2.5-flash-lite'
 
