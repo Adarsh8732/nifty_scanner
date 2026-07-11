@@ -151,6 +151,12 @@ jobs:
           # Set 'false' to disable and force full fetches (debug/rollback).
           USE_DISK_CACHE:       'true'
           OHLC_CACHE_DIR:       '.ohlc_cache'
+          # ─── DELIVERY CIRCUIT BREAKER ────────────────────────────────
+          # If every configured alert channel fails N times in a row, halt
+          # the scanner with exit(2). A single successful delivery resets
+          # the counter. Prevents burning API quota / cook cycles when
+          # tokens are revoked or SMTP is misconfigured.
+          CIRCUIT_BREAKER_THRESHOLD: '5'
         run: python -u loop_scan.py
 
       - name: System memory after scan

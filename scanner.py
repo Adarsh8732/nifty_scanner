@@ -1419,11 +1419,11 @@ def analyze_with_gemini(symbol: str, zone: dict, close_now: float, timeframe: st
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────
-def send_telegram(text: str) -> None:
-    """Push a markdown message to your Telegram chat."""
+def send_telegram(text: str) -> bool:
+    """Push a markdown message to your Telegram chat. Returns True on success."""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("  [no TG creds — would send]:", text.split('\n')[0])
-        return
+        return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         r = requests.post(
@@ -1435,10 +1435,13 @@ def send_telegram(text: str) -> None:
             # Telegram URL contains the bot token; don't log response body
             # which may include the request URL or token snippets.
             print(f"  TG failed: HTTP {r.status_code} (body redacted)")
+            return False
+        return True
     except Exception as e:
         # NEVER print {e} verbatim — requests exceptions can include the
         # full URL, which contains the bot token (`/bot{TG_TOKEN}/...`).
         print(f"  TG exception: {type(e).__name__} (details redacted — TG URL contains bot token)")
+        return False
 
 
 # ─── CHART SNAPSHOT (mplfinance) ────────────────────────────────────────
@@ -1855,6 +1858,44 @@ def _channels() -> list[str]:
     return [c.strip() for c in ALERT_CHANNEL.split(",") if c.strip()]
 
 
+# ─── DELIVERY CIRCUIT BREAKER ───────────────────────────────────────────
+# If every configured channel fails to deliver N alerts in a row, halt the
+# process rather than keep firing into the void (rate-limits, blocked
+# tokens, mis-configured SMTP…). A hit is defined as "at least one channel
+# reported success" — a single working channel resets the counter, so we
+# don't halt when e.g. Telegram is down but email works.
+CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"))
+_consecutive_delivery_failures = 0
+
+
+def _register_delivery_result(any_channel_success: bool) -> None:
+    """Update the failure counter and halt the process if we've crossed
+    CIRCUIT_BREAKER_THRESHOLD consecutive full-failure attempts.
+
+    Called once per dispatch_alert. `any_channel_success` is True iff at
+    least one configured channel returned OK for this alert.
+    """
+    global _consecutive_delivery_failures
+    if any_channel_success:
+        if _consecutive_delivery_failures:
+            print(f"  ✅ delivery recovered after "
+                  f"{_consecutive_delivery_failures} consecutive failure(s)")
+        _consecutive_delivery_failures = 0
+        return
+    _consecutive_delivery_failures += 1
+    print(f"  ⚠️  delivery failure #{_consecutive_delivery_failures} "
+          f"(threshold {CIRCUIT_BREAKER_THRESHOLD})")
+    if _consecutive_delivery_failures >= CIRCUIT_BREAKER_THRESHOLD:
+        # Alerts are the entire point of the scanner; if we can't deliver
+        # them we're just burning API quota. Exit with a non-zero code so
+        # the workflow's failure-notification step (and GitHub Actions
+        # dashboard) surface the halt.
+        print(f"  🚨 CIRCUIT BREAKER TRIPPED: "
+              f"{_consecutive_delivery_failures} consecutive delivery failures "
+              f"across all channels — halting scanner.")
+        raise SystemExit(2)
+
+
 def dispatch_alert(msg_full: str, msg_short: str | None = None,
                    image_bytes: bytes | None = None,
                    images: list[bytes] | None = None,
@@ -1881,6 +1922,7 @@ def dispatch_alert(msg_full: str, msg_short: str | None = None,
     if images:
         imgs.extend(im for im in images if im)
 
+    any_success = False
     for ch in _channels():
         if ch == "telegram":
             if len(imgs) >= 2:
@@ -1888,21 +1930,25 @@ def dispatch_alert(msg_full: str, msg_short: str | None = None,
                 caption = msg_full if len(msg_full) <= TG_CAPTION_MAX else msg_short
                 ok = send_telegram_media_group(imgs, caption)
                 if not ok:
-                    send_telegram(msg_full)   # text-only fallback
+                    ok = send_telegram(msg_full)   # text-only fallback
             elif imgs:
                 caption = msg_full if len(msg_full) <= TG_CAPTION_MAX else msg_short
                 ok = send_telegram_photo(imgs[0], caption)
                 if not ok:
-                    send_telegram(msg_full)
+                    ok = send_telegram(msg_full)
             else:
-                send_telegram(msg_full)
+                ok = send_telegram(msg_full)
+            any_success = any_success or ok
         elif ch == "email":
             subject = _email_subject_from_msg(msg_full, symbol=symbol,
                                               timeframe=timeframe)
             # Email has no caption limit; always send the FULL message + all charts
-            send_email(subject, msg_full, images=imgs)
+            ok = send_email(subject, msg_full, images=imgs)
+            any_success = any_success or ok
         else:
             print(f"  [unknown ALERT_CHANNEL '{ch}' — skipping]")
+
+    _register_delivery_result(any_success)
 
 
 def send_telegram_photo(image_bytes: bytes, caption: str) -> bool:
