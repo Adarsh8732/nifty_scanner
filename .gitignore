@@ -15,6 +15,9 @@ venv/
 # Persistent OHLC disk cache (F5) — recreated per run, never commit
 .ohlc_cache/
 
+# Sector-map disk cache (F4) — monthly TTL, recreated on demand
+.sector_cache/
+
 # === Secrets / credentials (extra safety net) ===
 # Never commit any file with these patterns. Secrets live ONLY in GitHub
 # Actions repository secrets, never on disk.

@@ -390,6 +390,25 @@ def main() -> int:
     caches = fetch_caches(ALL_SYMBOLS)
     last_cache_refresh = time.time()
 
+    # ── Sector correlation (F4) ──────────────────────────────────────
+    # One-shot at session start: build the stock→sector map (yf.info,
+    # monthly disk cache) then fetch each unique sector index on the
+    # trend + zone TFs. Results live on scanner as module globals; every
+    # alert reads them via build_sector_ctx_line.  Never blocks the scan
+    # — any failure here just leaves the sector block off alerts.
+    try:
+        import scanner as _sc
+        import sector_map as _sm
+        _sc.SECTOR_MAP = _sm.build_sector_map(list(ALL_SYMBOLS))
+        _sectors = _sm.unique_sectors(_sc.SECTOR_MAP)
+        if _sectors:
+            _sc.SECTOR_CTX = _sc.build_sector_context(_sectors, list(TIMEFRAMES))
+        else:
+            print("  sector_ctx: no known sectors mapped — skipping")
+    except Exception as e:
+        print(f"  sector_ctx setup failed: {type(e).__name__} — alerts will "
+              f"omit sector block")
+
     state = load_states()
     state_counts_at_start = {tf: len(state[tf]) for tf in TIMEFRAMES}
     print(f"State carried in: {state_counts_at_start}")

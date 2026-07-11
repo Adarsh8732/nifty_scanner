@@ -2155,9 +2155,17 @@ def _drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
     (zero range → body% = 0 → qualifies as base), creating fake zones.
 
     A real NSE trading bar always has Volume > 0. We use that as the filter.
+
+    Sector-index tickers (^CNXIT, ^NSEBANK, …) return Volume=0 on EVERY bar
+    on Yahoo, so this filter would empty their frames. If every bar has
+    Volume=0 we treat that as "index" data and skip filtering — real
+    stocks always have at least some bars with positive volume.
     """
     if "Volume" in df.columns:
-        df = df[df["Volume"] > 0]
+        vol = df["Volume"]
+        if len(vol) > 0 and (vol > 0).any():
+            df = df[vol > 0]
+        # else: all-zero volume → treat as sector-index data; keep every bar.
     return df
 
 
@@ -2364,7 +2372,10 @@ def _fetch_ohlc_batch_impl(symbols: list[str], timeframe: str,
     out: dict[str, pd.DataFrame] = {}
     for i in range(0, len(symbols), chunk_size):
         chunk_syms = symbols[i:i + chunk_size]
-        yf_chunk = [s + ".NS" for s in chunk_syms]
+        # Yahoo index tickers (^CNXIT, ^NSEBANK, ^CNXAUTO, …) are already
+        # fully qualified — do NOT append '.NS' or they 404. Regular NSE
+        # stocks stay unchanged: 'TCS' → 'TCS.NS'.
+        yf_chunk = [s if s.startswith("^") else s + ".NS" for s in chunk_syms]
         try:
             all_df = yf.download(
                 yf_chunk,
@@ -2377,8 +2388,17 @@ def _fetch_ohlc_batch_impl(symbols: list[str], timeframe: str,
             continue
 
         for sym, yf_sym in zip(chunk_syms, yf_chunk):
+            # yfinance with group_by='ticker' returns a MultiIndex
+            # (ticker, ohlc) EVEN for single-symbol batches, so we always
+            # try to slice by ticker first — this drops the outer level
+            # and leaves a flat (Open,High,Low,Close,Volume) frame. Only
+            # a totally flat return (no MultiIndex, single-symbol pre-v0.2)
+            # falls back to using all_df directly.
             try:
-                df = all_df[yf_sym] if len(yf_chunk) > 1 else all_df
+                if isinstance(all_df.columns, pd.MultiIndex):
+                    df = all_df[yf_sym]
+                else:
+                    df = all_df
             except (KeyError, IndexError):
                 continue
             if df is None or df.empty:
@@ -3132,6 +3152,112 @@ def is_approaching(close_now: float, zone: dict, timeframe: str | None = None) -
         return close_now >= entry and close_now < zone["distal"]
 
 
+# ─── SECTOR CORRELATION (F4) ────────────────────────────────────────────
+# Populated once per session by build_sector_context(). Keys:
+#   SECTOR_MAP  : {symbol → sector-index Yahoo ticker | "OTHER"}
+#   SECTOR_CTX  : {sector_ticker → {tf → {"trend": int, "dem": zone|None,
+#                                         "sup": zone|None, "close": float}}}
+# "OTHER" is never inserted into SECTOR_CTX — build_sector_ctx_line skips
+# sectors without an entry, so unmapped stocks contribute no lines.
+SECTOR_MAP: dict[str, str] = {}
+SECTOR_CTX: dict[str, dict[str, dict]] = {}
+# TFs we compute sector trend + zones on. Fixed list per user spec:
+# same TF as alert (added dynamically), plus daily/weekly for trend,
+# plus 1mo/3mo for zones. Union deduped at build time.
+SECTOR_TREND_TFS = ("1d", "1wk")
+SECTOR_ZONE_TFS  = ("1d", "1wk", "1mo", "3mo")
+
+
+def build_sector_context(sector_tickers: list[str],
+                          alert_tfs: list[str]) -> dict[str, dict[str, dict]]:
+    """Fetch each sector-index ticker's OHLC on trend/zone TFs, then compute
+    trend + demand/supply zones. Returns SECTOR_CTX-shaped dict.
+
+    `alert_tfs` are the scanner's actual alert timeframes (e.g. 125m). We
+    add these to the trend-TF set so `same-TF sector trend` in the alert
+    message uses the right series.
+
+    Errors are swallowed — missing entries just mean no sector line in the
+    alert. Never blocks the scan.
+    """
+    tfs = tuple(sorted(set(SECTOR_TREND_TFS) | set(SECTOR_ZONE_TFS) | set(alert_tfs)))
+    print(f"  sector_ctx: fetching {len(sector_tickers)} sectors × "
+          f"{len(tfs)} TFs ({','.join(tfs)})")
+    ctx: dict[str, dict[str, dict]] = {t: {} for t in sector_tickers}
+    for tf in tfs:
+        try:
+            data = fetch_ohlc_batch(sector_tickers, tf)
+        except Exception as e:
+            print(f"    sector_ctx fetch {tf} failed: {type(e).__name__}")
+            continue
+        for sec, df in data.items():
+            if df is None or len(df) < 20:
+                continue
+            try:
+                zones = detect_zones(df, entry_pct=entry_pct_for(tf))
+                ctx[sec][tf] = {
+                    "trend": compute_trend(df),
+                    "dem":   zones["demand"],
+                    "sup":   zones["supply"],
+                    "close": float(df["Close"].iloc[-1]),
+                }
+            except Exception as e:
+                print(f"    sector_ctx {sec}@{tf} zone-calc failed: "
+                      f"{type(e).__name__}")
+    filled = sum(1 for s in ctx.values() if s)
+    print(f"  sector_ctx: {filled}/{len(sector_tickers)} sectors populated")
+    return ctx
+
+
+def _sector_zone_line(tf_lbl: str, tf_data: dict | None) -> str:
+    """Format one 'D `low-high`  S `low-high`' line for a sector TF."""
+    if not tf_data:
+        return f"  {tf_lbl}: -"
+    parts = []
+    d, s = tf_data.get("dem"), tf_data.get("sup")
+    if d:
+        parts.append(f"D `{d['distal']:.0f}-{d['proximal']:.0f}`")
+    if s:
+        parts.append(f"S `{s['proximal']:.0f}-{s['distal']:.0f}`")
+    return f"  {tf_lbl}: " + ("  ".join(parts) if parts else "-")
+
+
+def build_sector_ctx_line(symbol: str, alert_tf: str) -> str:
+    """Return the sector-correlation block for a given symbol's alert.
+
+    Returns '' when the symbol isn't mapped, the sector has no context,
+    or the ticker is OTHER — the alert then shows nothing extra, no
+    blank line. Format (multi-line, appended to the alert body):
+
+        ─────────
+        📊 Sector: NIFTY IT — Trend {alert_tf}↑ / 1wk↑
+          1d:  D `34800-35100`  S `36400-36700`
+          1wk: D `33900-34200`  S `37100-37500`
+          1mo: D `31800-32500`  S `38400-39100`
+          3mo: D `28200-29500`  S `41000-43000`
+    """
+    sec = SECTOR_MAP.get(symbol, "OTHER")
+    if sec == "OTHER" or sec not in SECTOR_CTX:
+        return ""
+    import sector_map as _sm
+    ctx = SECTOR_CTX[sec]
+    if not ctx:
+        return ""
+
+    same_tf_data = ctx.get(alert_tf)
+    wk_data      = ctx.get("1wk")
+    same_lbl     = trend_label(same_tf_data["trend"]) if same_tf_data else "-"
+    wk_lbl       = trend_label(wk_data["trend"])      if wk_data      else "-"
+    header = (f"─────────\n"
+              f"📊 Sector: {_sm.label(sec)} — "
+              f"Trend {alert_tf} {same_lbl} / 1wk {wk_lbl}")
+
+    lines = [header]
+    for tf in SECTOR_ZONE_TFS:
+        lines.append(_sector_zone_line(tf, ctx.get(tf)))
+    return "\n" + "\n".join(lines)
+
+
 def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
                     ltf_trend: int, htf_trend: int, htf_dem: dict | None,
                     htf_sup: dict | None,
@@ -3234,6 +3360,10 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         elif va_edge == "VAH":
             vp_tag += f"  📍 VP-VAH `{vp_info['vah']:.2f}`"
 
+    # Sector correlation block (F4). Empty string when sector unmapped or
+    # context wasn't built — the block including the divider is skipped.
+    sector_line = build_sector_ctx_line(symbol, timeframe)
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
@@ -3250,6 +3380,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{trade_line}"
         f"{vol_line}"
         f"{close_line}"
+        f"{sector_line}"
     )
 
 
