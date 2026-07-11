@@ -2472,11 +2472,18 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
     _cache.save_tf(timeframe, merged_raw)
     _cache.save_meta()
 
-    # Now apply corp-action fix to the RETURN value. This is idempotent
-    # thanks to the fast-path exit in the vectorized adjuster.
+    # Return ONLY the symbols the caller actually asked for. The disk
+    # cache accumulates across every fetch_ohlc_batch caller — the main
+    # scanner passes ~1068 stocks, sector-context passes ~10 sector
+    # indices — so merged_raw is a superset of any single caller's ask.
+    # Without this filter, sector-context sees 1068 stocks in `data` and
+    # crashes writing them into a ctx dict that was pre-keyed with only
+    # sector tickers. As a bonus, auto_adjust stops running on unrequested
+    # symbols — no wasted work.
+    requested = set(symbols)
     out = {}
     for sym, df in merged_raw.items():
-        if len(df) >= 20:
+        if sym in requested and len(df) >= 20:
             out[sym] = auto_adjust_missed_corp_actions(df)
 
     return out
@@ -3191,6 +3198,12 @@ def build_sector_context(sector_tickers: list[str],
             print(f"    sector_ctx fetch {tf} failed: {type(e).__name__}")
             continue
         for sec, df in data.items():
+            # Defensive: skip anything that wasn't in our requested
+            # sector list. fetch_ohlc_batch already filters to requested
+            # symbols, but if that guarantee ever breaks we don't want
+            # sector_ctx to KeyError on stray stock symbols.
+            if sec not in ctx:
+                continue
             if df is None or len(df) < 20:
                 continue
             try:
