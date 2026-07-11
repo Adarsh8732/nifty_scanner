@@ -32,6 +32,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ─── PERSISTENT OHLC CACHE ─────────────────────────────────────────
+      # Cache the .ohlc_cache/ directory across runs so daily fetches only
+      # need to tail-refresh the last few bars per TF instead of re-fetching
+      # 5y of history for 1068 symbols × 5 timeframes. The cache key rotates
+      # daily (yyyy-mm-dd) so we get one cold miss per day at worst;
+      # restore-keys let us fall back to yesterday's cache when today's
+      # hasn't been saved yet. On any corruption / >7-day staleness the
+      # scanner silently falls back to a full fetch (see ohlc_cache.py).
+      - name: Restore OHLC cache
+        id: ohlc-cache
+        uses: actions/cache@v4
+        with:
+          path: .ohlc_cache
+          key: ohlc-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            ohlc-cache-v1-
+
       - name: System memory info
         run: |
           echo "====== MEMORY BEFORE SCANNER ======"
@@ -129,6 +146,11 @@ jobs:
           CHART_WIDTH_IN:       '14'
           CHART_HEIGHT_IN:      '7'
           PYTHONUNBUFFERED:     '1'
+          # ─── OHLC DISK CACHE (F5) ────────────────────────────────────
+          # 'true' = wrap fetch_ohlc_batch with the persistent cache above.
+          # Set 'false' to disable and force full fetches (debug/rollback).
+          USE_DISK_CACHE:       'true'
+          OHLC_CACHE_DIR:       '.ohlc_cache'
         run: python -u loop_scan.py
 
       - name: System memory after scan

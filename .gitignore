@@ -12,6 +12,9 @@ venv/
 # Logs
 *.log
 
+# Persistent OHLC disk cache (F5) — recreated per run, never commit
+.ohlc_cache/
+
 # === Secrets / credentials (extra safety net) ===
 # Never commit any file with these patterns. Secrets live ONLY in GitHub
 # Actions repository secrets, never on disk.

@@ -2293,23 +2293,25 @@ def aggregate_to_125m(df_5m: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-def fetch_ohlc_batch(symbols: list[str], timeframe: str,
-                     chunk_size: int = 100) -> dict[str, pd.DataFrame]:
-    """Batch-fetch OHLC for many symbols at once. Returns {symbol: DataFrame}.
+USE_DISK_CACHE = os.environ.get("USE_DISK_CACHE", "false").lower() == "true"
 
-    yfinance accepts a list of tickers and fetches them in parallel internally.
-    For "125m" we fetch 5m and aggregate (yfinance has no native 125m interval).
 
-    Chunks of 100 to handle individual ticker failures without losing the whole
-    batch. Failed tickers are silently dropped (not in the returned dict).
+def _fetch_ohlc_batch_impl(symbols: list[str], timeframe: str,
+                           period: str,
+                           chunk_size: int = 100) -> dict[str, pd.DataFrame]:
+    """Actual yfinance-driven batch fetch for one timeframe over a fixed
+    `period` string. Used for both full fetches and tail refreshes.
+
+    yfinance accepts a list of tickers and parallelizes internally.
+    Chunks of 100 to isolate individual ticker failures.
     """
     # 125m has no native yfinance interval — fetch 5m, aggregate to 125m
     if timeframe == "125m":
-        raw_5m = fetch_ohlc_batch(symbols, "5m", chunk_size)
+        raw_5m = _fetch_ohlc_batch_impl(symbols, "5m", period, chunk_size)
         out: dict[str, pd.DataFrame] = {}
         for sym, df in raw_5m.items():
             agg = aggregate_to_125m(df)
-            if len(agg) >= 20:
+            if len(agg) >= 1:      # keep even tiny tail refreshes; caller merges
                 out[sym] = agg
         return out
 
@@ -2320,7 +2322,7 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
         try:
             all_df = yf.download(
                 yf_chunk,
-                period=period_for(timeframe), interval=timeframe,
+                period=period, interval=timeframe,
                 progress=False, auto_adjust=False, actions=False,
                 threads=True, group_by="ticker",
             )
@@ -2330,7 +2332,6 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
 
         for sym, yf_sym in zip(chunk_syms, yf_chunk):
             try:
-                # When only one ticker is in the batch, columns are flat
                 df = all_df[yf_sym] if len(yf_chunk) > 1 else all_df
             except (KeyError, IndexError):
                 continue
@@ -2343,9 +2344,75 @@ def fetch_ohlc_batch(symbols: list[str], timeframe: str,
                 df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
             except KeyError:
                 continue
+            if len(df) >= 1:
+                out[sym] = df
+    return out
+
+
+def fetch_ohlc_batch(symbols: list[str], timeframe: str,
+                     chunk_size: int = 100) -> dict[str, pd.DataFrame]:
+    """Batch-fetch OHLC for many symbols. Returns {symbol: DataFrame}.
+
+    When USE_DISK_CACHE=true:
+      1. Load prior session's cache from disk.
+      2. If cache is fresh (< STALE_DAYS) AND non-empty for this TF:
+         - Fetch ONLY the tail (last N bars per symbol, per TAIL_PERIOD)
+         - Merge tail into cached data (tail wins on overlap)
+      3. Else: full fetch as before.
+      4. Apply auto_adjust_missed_corp_actions on the merged result
+         (idempotent fast-path exit — cheap for already-adjusted data).
+      5. Persist the updated cache back to disk.
+
+    When USE_DISK_CACHE=false (default): behaves exactly like before —
+    full fetch, no cache interaction. Zero risk to alert quality.
+    """
+    if not USE_DISK_CACHE:
+        # Original behavior: full fetch, apply corp-action fix, done.
+        fresh = _fetch_ohlc_batch_impl(symbols, timeframe,
+                                       period_for(timeframe), chunk_size)
+        out: dict[str, pd.DataFrame] = {}
+        for sym, df in fresh.items():
             if len(df) >= 20:
-                # Patch up missed Indian demergers/bonuses
                 out[sym] = auto_adjust_missed_corp_actions(df)
+        return out
+
+    # Cached mode.
+    import ohlc_cache as _cache
+    cached = _cache.load_tf(timeframe) if _cache.is_cache_fresh() else {}
+
+    # For 125m, cache stores the AGGREGATED 125m data (not raw 5m).
+    # The tail-refresh fetches 5m over TAIL_PERIOD["5m"] then aggregates.
+    tail_key = "5m" if timeframe == "125m" else timeframe
+    tail_period = _cache.TAIL_PERIOD.get(tail_key, period_for(timeframe))
+
+    if cached:
+        # HIT path: tail refresh only
+        print(f"  ohlc_cache[{timeframe}]: HIT ({len(cached)} symbols cached), "
+              f"tail-refreshing last {tail_period}...")
+        tail = _fetch_ohlc_batch_impl(symbols, timeframe, tail_period, chunk_size)
+        merged_raw = _cache.merge_ohlc_dicts(cached, tail)
+    else:
+        # MISS path: full fetch
+        print(f"  ohlc_cache[{timeframe}]: MISS, doing full fetch...")
+        merged_raw = _fetch_ohlc_batch_impl(symbols, timeframe,
+                                            period_for(timeframe), chunk_size)
+
+    # CRITICAL: cache the RAW (pre-adjustment) data. If we cached the
+    # adjusted data, the next HIT run would re-apply auto_adjust to the
+    # merged (adjusted-history + raw-tail) df — the corp-action gap gets
+    # detected AGAIN and pre-split bars get rescaled TWICE. Empirically
+    # observed as ~9% drift on MARUTI 1wk after its bonus. Fix: cache raw,
+    # adjust on return only.
+    _cache.save_tf(timeframe, merged_raw)
+    _cache.save_meta()
+
+    # Now apply corp-action fix to the RETURN value. This is idempotent
+    # thanks to the fast-path exit in the vectorized adjuster.
+    out = {}
+    for sym, df in merged_raw.items():
+        if len(df) >= 20:
+            out[sym] = auto_adjust_missed_corp_actions(df)
+
     return out
 
 
