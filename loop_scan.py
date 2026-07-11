@@ -390,24 +390,40 @@ def main() -> int:
     caches = fetch_caches(ALL_SYMBOLS)
     last_cache_refresh = time.time()
 
-    # ── Sector correlation (F4) ──────────────────────────────────────
-    # One-shot at session start: build the stock→sector map (yf.info,
-    # monthly disk cache) then fetch each unique sector index on the
-    # trend + zone TFs. Results live on scanner as module globals; every
-    # alert reads them via build_sector_ctx_line.  Never blocks the scan
-    # — any failure here just leaves the sector block off alerts.
-    try:
-        import scanner as _sc
-        import sector_map as _sm
-        _sc.SECTOR_MAP = _sm.build_sector_map(list(ALL_SYMBOLS))
-        _sectors = _sm.unique_sectors(_sc.SECTOR_MAP)
-        if _sectors:
-            _sc.SECTOR_CTX = _sc.build_sector_context(_sectors, list(TIMEFRAMES))
-        else:
-            print("  sector_ctx: no known sectors mapped — skipping")
-    except Exception as e:
-        print(f"  sector_ctx setup failed: {type(e).__name__} — alerts will "
-              f"omit sector block")
+    # ── Sector correlation (F4) — background thread ─────────────────
+    # First-run cost (yfinance .info × 1068 stocks) is 15-30 min. If we
+    # ran that inline before the polling loop, the scanner would miss
+    # ~half an hour of live market. Instead, kick it off on a daemon
+    # thread: the polling loop starts immediately, and every alert fired
+    # before the map is ready simply omits the sector block (empty
+    # string). Once the thread finishes, module-level SECTOR_MAP /
+    # SECTOR_CTX are atomically reassigned and subsequent alerts include
+    # the block.
+    #
+    # Thread-safety: build_alert_msg reads SECTOR_MAP/SECTOR_CTX via
+    # dict.get() at call time; attribute reassignment is atomic under the
+    # GIL, so alerts see either the old (empty) or new (populated) view,
+    # never a partial one. Daemon=True so the thread doesn't block
+    # workflow shutdown if the lookup is still in flight at 3:15 PM.
+    import threading
+    def _bootstrap_sector_ctx():
+        try:
+            import scanner as _sc
+            import sector_map as _sm
+            mapping = _sm.build_sector_map(list(ALL_SYMBOLS))
+            _sc.SECTOR_MAP = mapping
+            sectors = _sm.unique_sectors(mapping)
+            if not sectors:
+                print("  sector_ctx: no known sectors mapped — skipping")
+                return
+            _sc.SECTOR_CTX = _sc.build_sector_context(sectors, list(TIMEFRAMES))
+        except Exception as e:
+            print(f"  sector bootstrap failed: {type(e).__name__} — alerts "
+                  f"will omit sector block for this session")
+    threading.Thread(target=_bootstrap_sector_ctx,
+                     name="sector-bootstrap",
+                     daemon=True).start()
+    print("  sector_ctx: bootstrap running in background")
 
     state = load_states()
     state_counts_at_start = {tf: len(state[tf]) for tf in TIMEFRAMES}

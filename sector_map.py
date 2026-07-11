@@ -110,10 +110,15 @@ def build_sector_map(symbols: list[str]) -> dict[str, str]:
     print(f"  sector_map: {len(cached)} cached, "
           f"looking up {len(missing)} new via yfinance…")
     mapping = dict(cached)
+    # Save every SAVE_EVERY lookups so partial progress survives a crash
+    # or GitHub Actions job timeout. 50 balances IO overhead vs risk of
+    # losing work — one pickle write is ~10 KB, negligible cost.
+    SAVE_EVERY = 50
     for i, sym in enumerate(missing):
         mapping[sym] = _lookup_sector(sym)
-        if (i + 1) % 100 == 0:
-            print(f"    …{i+1}/{len(missing)}")
+        if (i + 1) % SAVE_EVERY == 0:
+            _save_cache(mapping)
+            print(f"    …{i+1}/{len(missing)} (checkpoint saved)")
     _save_cache(mapping)
     print(f"  sector_map: saved {len(mapping)} entries to {CACHE_FILE}")
     return {s: mapping.get(s, "OTHER") for s in symbols}
