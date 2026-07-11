@@ -1,51 +1,28 @@
-"""Stock → sector-index mapping via yfinance Ticker.info, disk-cached.
+"""Static stock → NSE-sector-index mapping.
 
-At session startup we ask yfinance for each stock's `sector` field (once
-per month, then reuse from disk). Yahoo's free-form sector names map to
-NSE sectoral index Yahoo tickers via SECTOR_INDEX_TICKER; any unmapped
-stock gets "OTHER" and skips sector correlation.
+Why hardcoded instead of yfinance.info:
+  Yahoo's /quoteSummary endpoint is aggressively rate-limited from cloud
+  IPs — GitHub Actions runners get HTTP 401 "Invalid Crumb" on nearly
+  every request. yfinance.info worked on the local dev box but was near-
+  useless in production. A static dict covers the ~200 stocks we're most
+  likely to alert on (Nifty 500 leaders across 11 sectors) with zero
+  external calls and zero flakiness.
 
-Storage:
-  .sector_cache/v1/sector_map.pkl   {saved_at: iso, map: {sym → ticker}}
+Coverage: any stock NOT in HARDCODED_MAP gets "OTHER" and skips the
+sector block on its alerts. That's ~800 tail stocks — the ones you're
+least likely to hold size in — and adding to the map is a one-line PR.
 
-Fallback behavior — ANY failure (bad pickle, missing key, yfinance
-timeout, unknown sector) → the symbol gets "OTHER", not an exception.
-Sector correlation is additive info; never blocks an alert.
+The values are NSE sector index Yahoo tickers, used by
+scanner.build_sector_context to fetch each unique sector's OHLC once
+per session and compute trend + demand/supply zones.
 """
 from __future__ import annotations
 
-import os
-import pickle
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-import yfinance as yf
-
-CACHE_DIR   = Path(os.environ.get("SECTOR_CACHE_DIR", ".sector_cache")) / "v1"
-CACHE_FILE  = CACHE_DIR / "sector_map.pkl"
-STALE_DAYS  = int(os.environ.get("SECTOR_CACHE_STALE_DAYS", "30"))
-IST         = timezone(timedelta(hours=5, minutes=30))
-
-# yf.Ticker(...).info["sector"] returns Yahoo's ~11-value taxonomy.
-# Map each to the closest NSE sectoral index Yahoo ticker.
-SECTOR_INDEX_TICKER: dict[str, str] = {
-    "Technology":             "^CNXIT",
-    "Financial Services":     "^CNXFIN",
-    "Consumer Cyclical":      "^CNXAUTO",
-    "Healthcare":             "^CNXPHARMA",
-    "Consumer Defensive":     "^CNXFMCG",
-    "Basic Materials":        "^CNXMETAL",
-    "Energy":                 "^CNXENERGY",
-    "Real Estate":            "^CNXREALTY",
-    "Communication Services": "^CNXMEDIA",
-    "Industrials":            "^CNXINFRA",
-    "Utilities":              "^CNXENERGY",
-}
-
-# Pretty labels shown in the alert (no "^CNX" noise).
+# ─── SECTOR INDEX LABELS ────────────────────────────────────────────────
 SECTOR_LABEL: dict[str, str] = {
-    "^CNXIT":      "NIFTY IT",
+    "^NSEBANK":    "NIFTY BANK",
     "^CNXFIN":     "NIFTY FIN",
+    "^CNXIT":      "NIFTY IT",
     "^CNXAUTO":    "NIFTY AUTO",
     "^CNXPHARMA":  "NIFTY PHARMA",
     "^CNXFMCG":    "NIFTY FMCG",
@@ -58,70 +35,180 @@ SECTOR_LABEL: dict[str, str] = {
 }
 
 
-def _load_cache() -> dict[str, str] | None:
-    if not CACHE_FILE.exists():
-        return None
-    try:
-        data = pickle.loads(CACHE_FILE.read_bytes())
-        if not isinstance(data, dict):
-            return None
-        saved = datetime.fromisoformat(data.get("saved_at", ""))
-        if datetime.now(IST) - saved > timedelta(days=STALE_DAYS):
-            return None
-        m = data.get("map", {})
-        return m if isinstance(m, dict) else None
-    except Exception:
-        return None
+# ─── HARDCODED STOCK → SECTOR-INDEX MAP ─────────────────────────────────
+# Curated from Nifty sector index constituents. When a stock qualifies
+# for multiple sectors (e.g. HDFCBANK is in both Nifty Bank and Nifty
+# Financial Services), we map it to the more specific one (BANK).
+# Duplicates within this dict are a bug — key uniqueness enforced by dict.
+_BANK = "^NSEBANK"
+_FIN  = "^CNXFIN"
+_IT   = "^CNXIT"
+_AUTO = "^CNXAUTO"
+_PHM  = "^CNXPHARMA"
+_FMCG = "^CNXFMCG"
+_MET  = "^CNXMETAL"
+_ENR  = "^CNXENERGY"
+_RLT  = "^CNXREALTY"
+_MED  = "^CNXMEDIA"
+_INF  = "^CNXINFRA"
 
+HARDCODED_MAP: dict[str, str] = {
+    # ── NIFTY BANK ────────────────────────────────────────────────────
+    "HDFCBANK": _BANK, "ICICIBANK": _BANK, "SBIN": _BANK,
+    "KOTAKBANK": _BANK, "AXISBANK": _BANK, "INDUSINDBK": _BANK,
+    "BANKBARODA": _BANK, "FEDERALBNK": _BANK, "PNB": _BANK,
+    "IDFCFIRSTB": _BANK, "AUBANK": _BANK, "BANDHANBNK": _BANK,
+    "CANBK": _BANK, "IDBI": _BANK, "IOB": _BANK, "UCOBANK": _BANK,
+    "CENTRALBK": _BANK, "MAHABANK": _BANK, "INDIANB": _BANK,
+    "RBLBANK": _BANK, "YESBANK": _BANK, "SOUTHBANK": _BANK,
+    "KARURVYSYA": _BANK, "CITYUNIONBK": _BANK, "DCBBANK": _BANK,
+    "J&KBANK": _BANK, "CSBBANK": _BANK, "TMB": _BANK,
 
-def _save_cache(mapping: dict[str, str]) -> None:
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        blob = {"saved_at": datetime.now(IST).isoformat(), "map": mapping}
-        tmp = CACHE_FILE.with_suffix(".tmp")
-        tmp.write_bytes(pickle.dumps(blob, protocol=pickle.HIGHEST_PROTOCOL))
-        tmp.replace(CACHE_FILE)
-    except Exception as e:
-        print(f"  sector_map save failed: {type(e).__name__}")
+    # ── NIFTY IT ──────────────────────────────────────────────────────
+    "TCS": _IT, "INFY": _IT, "HCLTECH": _IT, "WIPRO": _IT,
+    "LTIM": _IT, "TECHM": _IT, "PERSISTENT": _IT, "COFORGE": _IT,
+    "MPHASIS": _IT, "LTTS": _IT, "OFSS": _IT, "TATAELXSI": _IT,
+    "KPITTECH": _IT, "HAPPSTMNDS": _IT, "INTELLECT": _IT,
+    "ZENSARTECH": _IT, "BIRLASOFT": _IT, "CYIENT": _IT,
+    "SONATSOFTW": _IT, "NEWGEN": _IT, "RATEGAIN": _IT,
+    "TATATECH": _IT, "ROUTE": _IT, "MASTEK": _IT,
 
+    # ── NIFTY AUTO ────────────────────────────────────────────────────
+    "MARUTI": _AUTO, "M&M": _AUTO, "TATAMOTORS": _AUTO,
+    "BAJAJ-AUTO": _AUTO, "EICHERMOT": _AUTO, "HEROMOTOCO": _AUTO,
+    "ASHOKLEY": _AUTO, "TVSMOTOR": _AUTO, "BHARATFORG": _AUTO,
+    "MOTHERSON": _AUTO, "BOSCHLTD": _AUTO, "MRF": _AUTO,
+    "BALKRISIND": _AUTO, "EXIDEIND": _AUTO, "TIINDIA": _AUTO,
+    "SONACOMS": _AUTO, "ENDURANCE": _AUTO, "AMBER": _AUTO,
+    "APOLLOTYRE": _AUTO, "CEATLTD": _AUTO, "SUNDRMFAST": _AUTO,
+    "ESCORTS": _AUTO, "ASTRAZEN": _AUTO, "ZFCVINDIA": _AUTO,
+    "SCHAEFFLER": _AUTO, "MINDA": _AUTO, "SANDHAR": _AUTO,
+    "GOODYEAR": _AUTO, "JBMA": _AUTO, "GABRIEL": _AUTO,
 
-def _lookup_sector(sym: str) -> str:
-    """One yfinance .info call. Any failure → 'OTHER'."""
-    try:
-        info = yf.Ticker(f"{sym}.NS").info
-        raw = (info.get("sector") or "").strip()
-        return SECTOR_INDEX_TICKER.get(raw, "OTHER")
-    except Exception:
-        return "OTHER"
+    # ── NIFTY PHARMA ──────────────────────────────────────────────────
+    "SUNPHARMA": _PHM, "DIVISLAB": _PHM, "CIPLA": _PHM,
+    "DRREDDY": _PHM, "LUPIN": _PHM, "TORNTPHARM": _PHM,
+    "BIOCON": _PHM, "AUROPHARMA": _PHM, "GLENMARK": _PHM,
+    "LAURUSLABS": _PHM, "ZYDUSLIFE": _PHM, "ALKEM": _PHM,
+    "MANKIND": _PHM, "ABBOTINDIA": _PHM, "SANOFI": _PHM,
+    "IPCALAB": _PHM, "GRANULES": _PHM, "NATCOPHARM": _PHM,
+    "JBCHEPHARM": _PHM, "AJANTPHARM": _PHM, "GLAND": _PHM,
+    "PFIZER": _PHM, "PPLPHARMA": _PHM, "SUVENPHAR": _PHM,
+    "CAPLIPOINT": _PHM, "ERIS": _PHM, "SEQUENT": _PHM,
+    "STRIDES": _PHM, "SUPRIYA": _PHM, "SOLARA": _PHM,
+    "INDOCO": _PHM, "MEDPLUS": _PHM, "FORTIS": _PHM,
+    "APOLLOHOSP": _PHM, "MAXHEALTH": _PHM, "NARAYANHRLR": _PHM,
+    "GLOBALHITECH": _PHM, "KIMS": _PHM, "SHILPAMED": _PHM,
+
+    # ── NIFTY FMCG ────────────────────────────────────────────────────
+    "HINDUNILVR": _FMCG, "ITC": _FMCG, "NESTLEIND": _FMCG,
+    "BRITANNIA": _FMCG, "DABUR": _FMCG, "MARICO": _FMCG,
+    "TATACONSUM": _FMCG, "GODREJCP": _FMCG, "COLPAL": _FMCG,
+    "PGHH": _FMCG, "RADICO": _FMCG, "VBL": _FMCG,
+    "EMAMILTD": _FMCG, "UBL": _FMCG, "MCDOWELL-N": _FMCG,
+    "JUBLFOOD": _FMCG, "VARUN": _FMCG, "WESTLIFE": _FMCG,
+    "HATSUN": _FMCG, "PATANJALI": _FMCG, "BAJAJCON": _FMCG,
+    "GILLETTE": _FMCG, "GODFRYPHLP": _FMCG, "AWL": _FMCG,
+    "KALYANKJIL": _FMCG, "TITAN": _FMCG, "TRENT": _FMCG,
+    "PAGEIND": _FMCG, "VIP": _FMCG, "RELAXO": _FMCG,
+    "BATAINDIA": _FMCG, "CENTURYPLY": _FMCG, "GREENPLY": _FMCG,
+    "HAVELLS": _FMCG, "VOLTAS": _FMCG, "CROMPTON": _FMCG,
+    "WHIRLPOOL": _FMCG, "BLUESTARCO": _FMCG, "SYMPHONY": _FMCG,
+
+    # ── NIFTY METAL ───────────────────────────────────────────────────
+    "TATASTEEL": _MET, "HINDALCO": _MET, "JSWSTEEL": _MET,
+    "VEDL": _MET, "COALINDIA": _MET, "NMDC": _MET,
+    "JINDALSTEL": _MET, "SAIL": _MET, "ADANIENT": _MET,
+    "NATIONALUM": _MET, "HINDZINC": _MET, "HINDCOPPER": _MET,
+    "RATNAMANI": _MET, "WELCORP": _MET, "APLAPOLLO": _MET,
+    "JSL": _MET, "JINDALSAW": _MET, "MOIL": _MET,
+    "GMDCLTD": _MET, "GRAVITA": _MET, "SANDUMA": _MET,
+    "MAHSEAMLES": _MET, "SHYAMMETL": _MET,
+
+    # ── NIFTY ENERGY ──────────────────────────────────────────────────
+    "RELIANCE": _ENR, "ONGC": _ENR, "POWERGRID": _ENR,
+    "NTPC": _ENR, "IOC": _ENR, "BPCL": _ENR, "GAIL": _ENR,
+    "HINDPETRO": _ENR, "TATAPOWER": _ENR, "ADANIGREEN": _ENR,
+    "ADANIPOWER": _ENR, "JSWENERGY": _ENR, "TORNTPOWER": _ENR,
+    "NHPC": _ENR, "CESC": _ENR, "OIL": _ENR,
+    "MGL": _ENR, "IGL": _ENR, "GUJGASLTD": _ENR,
+    "AEGISLOG": _ENR, "PETRONET": _ENR, "GSPL": _ENR,
+    "SJVN": _ENR, "SUZLON": _ENR, "INOXWIND": _ENR,
+
+    # ── NIFTY REALTY ──────────────────────────────────────────────────
+    "DLF": _RLT, "GODREJPROP": _RLT, "LODHA": _RLT,
+    "OBEROIRLTY": _RLT, "PRESTIGE": _RLT, "PHOENIXLTD": _RLT,
+    "BRIGADE": _RLT, "SOBHA": _RLT, "MAHLIFE": _RLT,
+    "SUNTECK": _RLT, "IBREALEST": _RLT, "SIGNATURE": _RLT,
+    "RAYMOND": _RLT, "ANANTRAJ": _RLT, "KOLTEPATIL": _RLT,
+    "ARVSMART": _RLT, "PURVA": _RLT,
+
+    # ── NIFTY MEDIA ───────────────────────────────────────────────────
+    "ZEEL": _MED, "SUNTV": _MED, "NETWORK18": _MED,
+    "DISHTV": _MED, "TV18BRDCST": _MED, "PVRINOX": _MED,
+    "SAREGAMA": _MED, "HATHWAY": _MED, "DEN": _MED,
+    "NAZARA": _MED, "TIPS": _MED, "SHEMAROO": _MED,
+
+    # ── NIFTY INFRA ───────────────────────────────────────────────────
+    "LT": _INF, "ADANIPORTS": _INF, "HAL": _INF, "BEL": _INF,
+    "GRASIM": _INF, "ULTRACEMCO": _INF, "SHREECEM": _INF,
+    "AMBUJACEM": _INF, "DALBHARAT": _INF, "GMRINFRA": _INF,
+    "IRB": _INF, "KEC": _INF, "KNRCON": _INF, "RVNL": _INF,
+    "IRFC": _INF, "RITES": _INF, "NBCC": _INF, "TITAGARH": _INF,
+    "ACC": _INF, "JKCEMENT": _INF, "RAMCOCEM": _INF,
+    "HEIDELBERG": _INF, "PRISMJOHNS": _INF, "STARCEMENT": _INF,
+    "IRCON": _INF, "GRINFRA": _INF, "PNCINFRA": _INF,
+    "NCC": _INF, "HGINFRA": _INF, "JKIL": _INF,
+    "IGARASHI": _INF, "BHEL": _INF, "SIEMENS": _INF,
+    "ABB": _INF, "CGPOWER": _INF, "THERMAX": _INF,
+    "CUMMINSIND": _INF, "TIMKEN": _INF, "SKFINDIA": _INF,
+    "MAZDOCK": _INF, "COCHINSHIP": _INF, "BEML": _INF,
+    "GESHIP": _INF, "SCI": _INF, "CONCOR": _INF,
+    "GRSE": _INF, "BDL": _INF, "SOLARINDS": _INF,
+    "PARADEEP": _INF, "GNFC": _INF, "COROMANDEL": _INF,
+    "DEEPAKNTR": _INF, "TATACHEM": _INF, "PIDILITIND": _INF,
+    "SRF": _INF, "ATUL": _INF, "AARTIIND": _INF,
+
+    # ── NIFTY FINANCIAL SERVICES (non-bank) ───────────────────────────
+    "BAJFINANCE": _FIN, "BAJAJFINSV": _FIN, "HDFCLIFE": _FIN,
+    "SBILIFE": _FIN, "ICICIPRULI": _FIN, "ICICIGI": _FIN,
+    "HDFCAMC": _FIN, "CHOLAFIN": _FIN, "SBICARD": _FIN,
+    "MUTHOOTFIN": _FIN, "PFC": _FIN, "RECLTD": _FIN,
+    "LICHSGFIN": _FIN, "MFSL": _FIN, "MANAPPURAM": _FIN,
+    "IIFL": _FIN, "POONAWALLA": _FIN, "PEL": _FIN,
+    "ABCAPITAL": _FIN, "L&TFH": _FIN, "SHRIRAMFIN": _FIN,
+    "EDELWEISS": _FIN, "PAYTM": _FIN, "POLICYBZR": _FIN,
+    "CAMS": _FIN, "MOTILALOFS": _FIN, "ANGELONE": _FIN,
+    "CDSL": _FIN, "BSE": _FIN, "MCX": _FIN,
+    "NIACL": _FIN, "GICRE": _FIN, "LICI": _FIN,
+    "STARHEALTH": _FIN, "KOTAKMF": _FIN, "UTIAMC": _FIN,
+    "JMFINANCIL": _FIN, "MASFIN": _FIN, "CREDITACC": _FIN,
+    "IEX": _FIN, "PAISALO": _FIN, "REPCOHOME": _FIN,
+    "AAVAS": _FIN, "HOMEFIRST": _FIN, "APTUS": _FIN,
+    "FIVESTAR": _FIN, "CANFINHOME": _FIN, "PNBHOUSING": _FIN,
+    "SPANDANA": _FIN, "UJJIVAN": _FIN, "EQUITASBNK": _FIN,
+    "UJJIVANSFB": _FIN, "ESAFSFB": _FIN, "SURYODAY": _FIN,
+    "CAPRIGLOBL": _FIN, "MAHINDFIN": _FIN, "SUNDARMFIN": _FIN,
+}
 
 
 def build_sector_map(symbols: list[str]) -> dict[str, str]:
-    """Return {symbol → sector_index_ticker | 'OTHER'} for every input symbol.
+    """Return {symbol → sector_index_ticker | 'OTHER'} for every input.
 
-    Loads from disk cache when fresh; only calls yfinance for symbols
-    missing from the cached map. Result is persisted before return.
+    Instant — pure dict lookup, no network / IO. Symbols not in
+    HARDCODED_MAP get 'OTHER' and their alerts skip the sector block.
     """
-    cached = _load_cache() or {}
-    missing = [s for s in symbols if s not in cached]
-    if not missing:
-        print(f"  sector_map: hit ({len(cached)} syms cached, 0 lookups)")
-        return {s: cached[s] for s in symbols}
-
-    print(f"  sector_map: {len(cached)} cached, "
-          f"looking up {len(missing)} new via yfinance…")
-    mapping = dict(cached)
-    # Save every SAVE_EVERY lookups so partial progress survives a crash
-    # or GitHub Actions job timeout. 50 balances IO overhead vs risk of
-    # losing work — one pickle write is ~10 KB, negligible cost.
-    SAVE_EVERY = 50
-    for i, sym in enumerate(missing):
-        mapping[sym] = _lookup_sector(sym)
-        if (i + 1) % SAVE_EVERY == 0:
-            _save_cache(mapping)
-            print(f"    …{i+1}/{len(missing)} (checkpoint saved)")
-    _save_cache(mapping)
-    print(f"  sector_map: saved {len(mapping)} entries to {CACHE_FILE}")
-    return {s: mapping.get(s, "OTHER") for s in symbols}
+    unknown = 0
+    mapping = {}
+    for s in symbols:
+        mapped = HARDCODED_MAP.get(s, "OTHER")
+        mapping[s] = mapped
+        if mapped == "OTHER":
+            unknown += 1
+    covered = len(symbols) - unknown
+    print(f"  sector_map: {covered}/{len(symbols)} covered by hardcoded map "
+          f"({unknown} → OTHER, skip sector block)")
+    return mapping
 
 
 def unique_sectors(mapping: dict[str, str]) -> list[str]:

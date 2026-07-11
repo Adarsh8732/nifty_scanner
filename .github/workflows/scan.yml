@@ -40,16 +40,15 @@ jobs:
       # restore-keys let us fall back to yesterday's cache when today's
       # hasn't been saved yet. On any corruption / >7-day staleness the
       # scanner silently falls back to a full fetch (see ohlc_cache.py).
-      - name: Restore OHLC + sector cache
+      - name: Restore OHLC cache
         id: ohlc-cache
         uses: actions/cache@v4
         with:
-          # Both caches live under a common path so a single actions/cache
-          # entry covers OHLC bars (rotates daily via STALE_DAYS=7) and the
-          # sector-map/yf.info lookup (rotates monthly via STALE_DAYS=30).
-          path: |
-            .ohlc_cache
-            .sector_cache
+          # Persists the OHLC bar cache across runs so daily fetches only
+          # need to tail-refresh (see ohlc_cache.py — 7-day TTL). Sector
+          # map is now a hardcoded dict in sector_map.py; no disk cache
+          # needed for it.
+          path: .ohlc_cache
           key: scanner-cache-v1-${{ github.run_id }}
           restore-keys: |
             scanner-cache-v1-
