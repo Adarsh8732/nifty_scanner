@@ -3186,40 +3186,80 @@ def build_sector_context(sector_tickers: list[str],
 
     Errors are swallowed — missing entries just mean no sector line in the
     alert. Never blocks the scan.
+
+    Strategy: fetch DAILY data once per sector index and resample locally
+    to 1wk / 1mo / 3mo. Yahoo returns wildly inconsistent multi-TF data
+    for Indian sector indices — most sectors have 240+ daily bars but
+    return only 1 bar on native `interval=1mo` / `interval=3mo`, and the
+    subset that returns nothing rotates between sessions. Resampling from
+    the reliable daily series gives us consistent coverage across all
+    sectors on all TFs.
     """
-    tfs = tuple(sorted(set(SECTOR_TREND_TFS) | set(SECTOR_ZONE_TFS) | set(alert_tfs)))
-    print(f"  sector_ctx: fetching {len(sector_tickers)} sectors × "
-          f"{len(tfs)} TFs ({','.join(tfs)})")
+    # 10y of daily data → ~2500 bars → ~520 weekly / ~120 monthly / ~40
+    # quarterly after resample. All satisfy the len>=20 gate. period_for
+    # returns only 1y for daily, which resamples to just 13 monthly bars
+    # (fails the check) — so we bypass the shared fetch_ohlc_batch here
+    # and call the impl with an explicit longer period.
+    print(f"  sector_ctx: fetching 10y daily for {len(sector_tickers)} "
+          f"sectors, resampling to 1wk/1mo/3mo locally")
     ctx: dict[str, dict[str, dict]] = {t: {} for t in sector_tickers}
-    for tf in tfs:
-        try:
-            data = fetch_ohlc_batch(sector_tickers, tf)
-        except Exception as e:
-            print(f"    sector_ctx fetch {tf} failed: {type(e).__name__}")
+
+    try:
+        raw = _fetch_ohlc_batch_impl(list(sector_tickers), "1d", "10y", 100)
+        daily = {sym: df for sym, df in raw.items() if len(df) >= 20}
+    except Exception as e:
+        print(f"    sector_ctx daily fetch failed: {type(e).__name__}")
+        return ctx
+
+    # TFs we materialize per sector — union of trend + zone + alert TFs,
+    # minus 125m (no meaningful sector view at intraday). 125m alerts
+    # will fall back to '-' for same-TF trend, which is correct.
+    tfs = [tf for tf in sorted(set(SECTOR_TREND_TFS) | set(SECTOR_ZONE_TFS)
+                                | set(alert_tfs))
+           if tf != "125m"]
+
+    RESAMPLE_FREQ = {"1wk": "W-FRI", "1mo": "ME", "3mo": "QE"}
+
+    for sec, daily_df in daily.items():
+        if sec not in ctx:
             continue
-        for sec, df in data.items():
-            # Defensive: skip anything that wasn't in our requested
-            # sector list. fetch_ohlc_batch already filters to requested
-            # symbols, but if that guarantee ever breaks we don't want
-            # sector_ctx to KeyError on stray stock symbols.
-            if sec not in ctx:
-                continue
+        if daily_df is None or len(daily_df) < 20:
+            continue
+        for tf in tfs:
+            if tf == "1d":
+                df = daily_df
+            else:
+                freq = RESAMPLE_FREQ.get(tf)
+                if freq is None:
+                    continue
+                try:
+                    df = daily_df.resample(freq).agg({
+                        "Open":   "first",
+                        "High":   "max",
+                        "Low":    "min",
+                        "Close":  "last",
+                        "Volume": "sum",
+                    }).dropna(subset=["Open", "Close"])
+                except Exception as e:
+                    print(f"    sector_ctx {sec}@{tf} resample failed: "
+                          f"{type(e).__name__}")
+                    continue
             if df is None or len(df) < 20:
                 continue
             try:
                 zones = detect_zones(df, entry_pct=entry_pct_for(tf))
-                entry = {
+                ctx[sec][tf] = {
                     "trend": compute_trend(df),
                     "dem":   zones["demand"],
                     "sup":   zones["supply"],
                     "close": float(df["Close"].iloc[-1]),
-                    "df":    df,        # kept for on-demand chart rendering
-                    "png":   None,      # populated lazily by build_sector_chart_album
+                    "df":    df,     # kept for on-demand chart rendering
+                    "png":   None,   # populated lazily by build_sector_chart_album
                 }
-                ctx[sec][tf] = entry
             except Exception as e:
                 print(f"    sector_ctx {sec}@{tf} zone-calc failed: "
                       f"{type(e).__name__}")
+
     filled = sum(1 for s in ctx.values() if s)
     print(f"  sector_ctx: {filled}/{len(sector_tickers)} sectors populated")
     return ctx
