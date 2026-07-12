@@ -3208,12 +3208,15 @@ def build_sector_context(sector_tickers: list[str],
                 continue
             try:
                 zones = detect_zones(df, entry_pct=entry_pct_for(tf))
-                ctx[sec][tf] = {
+                entry = {
                     "trend": compute_trend(df),
                     "dem":   zones["demand"],
                     "sup":   zones["supply"],
                     "close": float(df["Close"].iloc[-1]),
+                    "df":    df,        # kept for on-demand chart rendering
+                    "png":   None,      # populated lazily by build_sector_chart_album
                 }
+                ctx[sec][tf] = entry
             except Exception as e:
                 print(f"    sector_ctx {sec}@{tf} zone-calc failed: "
                       f"{type(e).__name__}")
@@ -3269,6 +3272,69 @@ def build_sector_ctx_line(symbol: str, alert_tf: str) -> str:
     for tf in SECTOR_ZONE_TFS:
         lines.append(_sector_zone_line(tf, ctx.get(tf)))
     return "\n" + "\n".join(lines)
+
+
+# TFs shown as sector charts appended to the alert album. User picked
+# 1d + 1wk + 1mo — long-term (3mo) is available in SECTOR_CTX but not
+# rendered by default to keep the album to a reasonable size.
+SECTOR_CHART_TFS = ("1d", "1wk", "1mo")
+
+
+def build_sector_chart_album(symbol: str) -> list[bytes]:
+    """Return the sector's 1d + 1wk + 1mo charts (list of PNG bytes).
+
+    Empty list when:
+      - the symbol maps to OTHER (per user: no sector chart for OTHER)
+      - SECTOR_CTX hasn't been built yet (background bootstrap still running)
+      - the sector has no data on any of the chart TFs
+
+    Charts are RENDERED lazily and cached inside SECTOR_CTX[sec][tf]["png"]
+    so N stocks alerting on the same sector produce one render, not N.
+    Fresh renders happen inside a try/except — chart failures never block
+    the alert (text block still fires).
+    """
+    sec = SECTOR_MAP.get(symbol, "OTHER")
+    if sec == "OTHER" or sec not in SECTOR_CTX:
+        return []
+    ctx = SECTOR_CTX[sec]
+    if not ctx:
+        return []
+
+    import sector_map as _sm
+    sec_label = _sm.label(sec)
+    out: list[bytes] = []
+
+    for tf in SECTOR_CHART_TFS:
+        tf_data = ctx.get(tf)
+        if not tf_data or tf_data.get("df") is None:
+            continue
+
+        # Cached render — reuse across every stock in this sector
+        if tf_data.get("png"):
+            out.append(tf_data["png"])
+            continue
+
+        try:
+            # Render with BOTH demand + supply overlaid (like the HTF
+            # confluence chart) — no entry/SL lines since these aren't
+            # tradable levels, they're context.
+            png = build_chart_image(
+                sec_label, tf_data["df"], tf,
+                htf_dem=tf_data.get("dem"),
+                htf_sup=tf_data.get("sup"),
+                show_ema20=True, show_sma50=False,
+                title_suffix=f"  |  Sector",
+            )
+        except Exception as e:
+            print(f"    sector chart {sec}@{tf} render failed: "
+                  f"{type(e).__name__}")
+            png = None
+
+        if png:
+            tf_data["png"] = png    # memoize for the rest of this session
+            out.append(png)
+
+    return out
 
 
 def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,

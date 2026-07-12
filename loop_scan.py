@@ -27,7 +27,7 @@ from scanner import (
     detect_zones, compute_trend, htf_status, passes_strict_filter,
     passes_125m_strict_filter,
     is_approaching, zone_key, build_alert_msg,
-    build_chart_album, calc_trade_levels,
+    build_chart_album, build_sector_chart_album, calc_trade_levels,
     dispatch_alert,
     # EMA20 confluence
     compute_ema20, EMA20_TFS,
@@ -327,6 +327,13 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     htf_vp_info=htf_vp_info_chart,
                     extra_context_charts=extra_ctx,
                 )
+
+                # Append the sector chart album (1d + 1wk + 1mo of the
+                # sector index the stock belongs to). Empty list when the
+                # stock is OTHER-mapped or SECTOR_CTX isn't ready yet, so
+                # OTHER stocks and pre-bootstrap alerts get zero sector
+                # charts as designed.
+                charts.extend(build_sector_chart_album(sym))
 
                 # Vision-enabled LLM enrichment. Charts are sent to Gemini
                 # as inline_data alongside the text prompt so the model sees
