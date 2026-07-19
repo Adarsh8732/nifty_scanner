@@ -162,6 +162,16 @@ jobs:
           # the counter. Prevents burning API quota / cook cycles when
           # tokens are revoked or SMTP is misconfigured.
           CIRCUIT_BREAKER_THRESHOLD: '5'
+          # ─── RRG (RELATIVE ROTATION GRAPH) ────────────────────────────
+          # Every mapped-sector alert gets a 2-chart RRG album appended
+          # (sector-vs-Nifty500 + stock-vs-sector) plus a RRG text tag.
+          # DISPLAY-ONLY — RRG data does NOT affect which alerts fire or
+          # their Score. Backtest on 1,175 STRATEGY_WORKS alerts (2026-
+          # 07-19) showed the signal is real for Demand+Leading (+5.8pp
+          # WR) but too narrow to justify a scoring rule; ship as info
+          # so the trader can incorporate it discretionarily. OTHER-
+          # mapped stocks skip the RRG block regardless (no sector).
+          USE_RRG:              'true'
         run: python -u loop_scan.py
 
       - name: System memory after scan

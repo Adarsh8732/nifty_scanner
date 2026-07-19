@@ -2156,16 +2156,21 @@ def _drop_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
 
     A real NSE trading bar always has Volume > 0. We use that as the filter.
 
-    Sector-index tickers (^CNXIT, ^NSEBANK, …) return Volume=0 on EVERY bar
-    on Yahoo, so this filter would empty their frames. If every bar has
-    Volume=0 we treat that as "index" data and skip filtering — real
-    stocks always have at least some bars with positive volume.
+    Index tickers (^CNXIT, ^NSEBANK, ^CNXCONSUM, …) either report Volume=0
+    on every bar OR report sporadic non-zero values on a minority of bars
+    (Yahoo's index-volume reporting is inconsistent). In BOTH cases the
+    volume signal is uninformative for phantom-detection, so we skip the
+    filter when fewer than 50% of bars carry positive volume — that's
+    the threshold that cleanly separates real stocks (~100% positive vol
+    on trading days) from indices (0-30% positive vol depending on how
+    Yahoo happens to be feeding that ticker).
     """
-    if "Volume" in df.columns:
+    if "Volume" in df.columns and len(df) > 0:
         vol = df["Volume"]
-        if len(vol) > 0 and (vol > 0).any():
+        positive_share = (vol > 0).mean() if len(vol) else 0.0
+        if positive_share >= 0.5:
             df = df[vol > 0]
-        # else: all-zero volume → treat as sector-index data; keep every bar.
+        # else: index-like series — every bar kept as-is.
     return df
 
 
@@ -2372,10 +2377,15 @@ def _fetch_ohlc_batch_impl(symbols: list[str], timeframe: str,
     out: dict[str, pd.DataFrame] = {}
     for i in range(0, len(symbols), chunk_size):
         chunk_syms = symbols[i:i + chunk_size]
-        # Yahoo index tickers (^CNXIT, ^NSEBANK, ^CNXAUTO, …) are already
-        # fully qualified — do NOT append '.NS' or they 404. Regular NSE
-        # stocks stay unchanged: 'TCS' → 'TCS.NS'.
-        yf_chunk = [s if s.startswith("^") else s + ".NS" for s in chunk_syms]
+        # Yahoo tickers can arrive in three shapes:
+        #   ^CNXIT / ^NSEBANK / ...        — fully qualified index tickers
+        #   NIFTY_HEALTHCARE.NS / etc.     — new-style NSE index tickers
+        #                                    already ending in .NS
+        #   TCS / RELIANCE / ...           — NSE stock symbols needing .NS
+        # We ONLY append '.NS' to the third form; the first two already
+        # have their canonical Yahoo format.
+        yf_chunk = [s if (s.startswith("^") or s.endswith(".NS"))
+                    else s + ".NS" for s in chunk_syms]
         try:
             all_df = yf.download(
                 yf_chunk,
@@ -3159,6 +3169,130 @@ def is_approaching(close_now: float, zone: dict, timeframe: str | None = None) -
         return close_now >= entry and close_now < zone["distal"]
 
 
+# ─── RRG (RELATIVE ROTATION GRAPH) ──────────────────────────────────────
+# Session-level RRG data. Populated by loop_scan's sector bootstrap
+# thread — same pattern as SECTOR_MAP / SECTOR_CTX. Reads are all via
+# dict.get() so pre-bootstrap alerts see the empty view and gracefully
+# skip the RRG block.
+#
+# USE_RRG env var gates the entire feature. Default off until the
+# STRATEGY_WORKS backtest shows RRG-filtered WR beats baseline.
+USE_RRG = os.environ.get("USE_RRG", "false").lower() == "true"
+NIFTY500_DF = None                              # DataFrame or None
+RRG_SECTOR_RS:     dict[str, "pd.DataFrame"] = {}   # sector→RS series vs Nifty 500
+RRG_SECTOR_VS_BROAD_PNG: dict[str, bytes]    = {}   # sector→PNG bytes (memoized)
+
+
+def build_rrg_alert_context(symbol: str,
+                              stock_daily_df: "pd.DataFrame | None"
+                              ) -> dict:
+    """Compute both RRG charts + text tag for one alert.
+
+    Returns:
+      {"text": str, "charts": list[bytes]}
+        text   — one-line summary to append to the alert body (empty
+                  string when data is missing / OTHER-mapped)
+        charts — list of 0, 1, or 2 PNGs (sector-vs-broad, then stock-
+                  vs-sector) in order they should append to the album
+
+    Never raises. Missing sector, missing broad benchmark, or short
+    series → returns empty text + empty charts. Alerts continue firing.
+    """
+    empty = {"text": "", "charts": []}
+    if not USE_RRG:
+        return empty
+    if stock_daily_df is None or len(stock_daily_df) < 35:
+        return empty
+
+    sec = SECTOR_MAP.get(symbol, "OTHER")
+    if sec == "OTHER":
+        return empty
+
+    # Sector daily OHLC — reuse the df already fetched for SECTOR_CTX
+    sec_ctx = SECTOR_CTX.get(sec) or {}
+    sec_df  = (sec_ctx.get("1d") or {}).get("df")
+    if sec_df is None or len(sec_df) < 35:
+        return empty
+
+    try:
+        import rrg as _rrg
+        import sector_map as _sm
+    except Exception:
+        return empty
+
+    # (1) STOCK vs SECTOR — must be computed per alert
+    try:
+        stock_rs = _rrg.compute_rs_series(stock_daily_df["Close"],
+                                           sec_df["Close"])
+    except Exception:
+        stock_rs = None
+
+    stock_q = None
+    if stock_rs is not None and not stock_rs.empty:
+        last = stock_rs.iloc[-1]
+        stock_q = _rrg.quadrant(float(last["rs_ratio"]),
+                                 float(last["rs_momentum"]))
+
+    # (2) SECTOR vs BROAD (Nifty 500) — session-cached per sector
+    sector_q = None
+    global RRG_SECTOR_VS_BROAD_PNG
+    if NIFTY500_DF is not None and not NIFTY500_DF.empty:
+        sec_rs = RRG_SECTOR_RS.get(sec)
+        if sec_rs is None or sec_rs.empty:
+            try:
+                sec_rs = _rrg.compute_rs_series(sec_df["Close"],
+                                                 NIFTY500_DF["Close"])
+                RRG_SECTOR_RS[sec] = sec_rs
+            except Exception:
+                sec_rs = None
+        if sec_rs is not None and not sec_rs.empty:
+            last = sec_rs.iloc[-1]
+            sector_q = _rrg.quadrant(float(last["rs_ratio"]),
+                                      float(last["rs_momentum"]))
+
+    # ── Charts ──
+    charts: list[bytes] = []
+
+    # Chart A — Sector vs NIFTY 500 (cached per sector for the session)
+    if sector_q is not None:
+        png = RRG_SECTOR_VS_BROAD_PNG.get(sec)
+        if png is None:
+            try:
+                png = _rrg.render_rrg(
+                    {_sm.label(sec): RRG_SECTOR_RS[sec]},
+                    benchmark_name="NIFTY 500",
+                    tail_weeks=5,
+                    title=f"{_sm.label(sec)} · Sector vs Broad",
+                )
+                RRG_SECTOR_VS_BROAD_PNG[sec] = png
+            except Exception:
+                png = None
+        if png:
+            charts.append(png)
+
+    # Chart B — Stock vs its sector (per-alert)
+    if stock_q is not None and stock_rs is not None:
+        try:
+            png_b = _rrg.render_rrg(
+                {symbol: stock_rs},
+                benchmark_name=_sm.label(sec),
+                tail_weeks=5,
+                title=f"{symbol} · Stock vs Sector",
+            )
+            if png_b:
+                charts.append(png_b)
+        except Exception:
+            pass
+
+    # ── Text summary line ──
+    dhan_stock  = _rrg.QUADRANT_DHAN_NAME.get(stock_q,  "-") if stock_q  else "-"
+    dhan_sector = _rrg.QUADRANT_DHAN_NAME.get(sector_q, "-") if sector_q else "-"
+    text = (f"\n📊 RRG: {symbol} → *{dhan_stock}*  ·  "
+             f"{_sm.label(sec)} → *{dhan_sector}*")
+
+    return {"text": text, "charts": charts}
+
+
 # ─── SECTOR CORRELATION (F4) ────────────────────────────────────────────
 # Populated once per session by build_sector_context(). Keys:
 #   SECTOR_MAP  : {symbol → sector-index Yahoo ticker | "OTHER"}
@@ -3483,6 +3617,16 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
     # context wasn't built — the block including the divider is skipped.
     sector_line = build_sector_ctx_line(symbol, timeframe)
 
+    # RRG line (display-only). Gated by USE_RRG env var. Empty when
+    # feature off, symbol OTHER-mapped, or data unavailable.
+    # NOTE: rrg_ctx is populated by loop_scan (which has access to the
+    # per-symbol daily df) and attached to the zone dict as `_rrg_ctx`.
+    # Falls through cleanly when not present.
+    rrg_line = ""
+    _rrg_ctx = zone.get("_rrg_ctx")
+    if _rrg_ctx and _rrg_ctx.get("text"):
+        rrg_line = _rrg_ctx["text"]
+
     return (
         f"{direction}\n"
         f"*{symbol}*  CMP `{close_now:.2f}`  ({tf_label(timeframe)})\n"
@@ -3500,6 +3644,7 @@ def build_alert_msg(symbol: str, zone: dict, close_now: float, timeframe: str,
         f"{vol_line}"
         f"{close_line}"
         f"{sector_line}"
+        f"{rrg_line}"
     )
 
 

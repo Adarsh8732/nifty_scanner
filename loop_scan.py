@@ -280,6 +280,19 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                     if _zone_df is not None:
                         htf_vp_info_chart = swing_vp_for_zone(_zone_df, z)
 
+                # RRG context (display-only, gated by USE_RRG env var).
+                # Computed once per alert; attached to the zone dict so
+                # build_alert_msg can read the text line, and the charts
+                # get appended to the album below. Silent no-op when
+                # USE_RRG is false, sector is OTHER, or NIFTY 500 hasn't
+                # been fetched yet by the bootstrap thread.
+                import scanner as _sc
+                if _sc.USE_RRG:
+                    _daily_df = df if tf == "1d" else htf_cache.get_df(sym, "1d")
+                    z["_rrg_ctx"] = _sc.build_rrg_alert_context(sym, _daily_df)
+                else:
+                    z["_rrg_ctx"] = {"text": "", "charts": []}
+
                 msg_short = build_alert_msg(sym, z, close_now, tf,
                                       ltf_trend, trend_htf,
                                       htf_z["demand"], htf_z["supply"],
@@ -334,6 +347,12 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 # OTHER stocks and pre-bootstrap alerts get zero sector
                 # charts as designed.
                 charts.extend(build_sector_chart_album(sym))
+
+                # Append the RRG chart album (sector-vs-broad + stock-
+                # vs-sector). Empty when USE_RRG is off or data missing.
+                _rrg_charts = z.get("_rrg_ctx", {}).get("charts", [])
+                if _rrg_charts:
+                    charts.extend(_rrg_charts)
 
                 # Vision-enabled LLM enrichment. Charts are sent to Gemini
                 # as inline_data alongside the text prompt so the model sees
@@ -424,6 +443,20 @@ def main() -> int:
                 print("  sector_ctx: no known sectors mapped — skipping")
                 return
             _sc.SECTOR_CTX = _sc.build_sector_context(sectors, list(TIMEFRAMES))
+
+            # RRG broad-market benchmark. Only fetched when USE_RRG is on
+            # so the OFF path stays free. Failure is silent — alerts
+            # simply skip the RRG block.
+            if _sc.USE_RRG:
+                try:
+                    from scanner import _fetch_ohlc_batch_impl as _fetch
+                    out = _fetch(["^CRSLDX"], "1d", "10y", 1)
+                    _sc.NIFTY500_DF = out.get("^CRSLDX")
+                    n = 0 if _sc.NIFTY500_DF is None else len(_sc.NIFTY500_DF)
+                    print(f"  rrg_ctx: NIFTY 500 fetched ({n} daily bars)")
+                except Exception as e:
+                    print(f"  rrg_ctx: NIFTY 500 fetch failed: "
+                          f"{type(e).__name__}")
         except Exception as e:
             print(f"  sector bootstrap failed: {type(e).__name__} — alerts "
                   f"will omit sector block for this session")

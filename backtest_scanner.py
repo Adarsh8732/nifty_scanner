@@ -32,11 +32,12 @@ from scanner import (
     calc_trade_levels, fetch_ohlc,
     trend_tf_for, zone_tf_for,
 )
+import bt_filters as _btf
 # fetch_ohlc now applies auto_adjust_missed_corp_actions internally —
 # yfinance with auto_adjust=False + that fix matches Dhan to 0.00% across
 # diverse stocks (validated on 9 symbols). No Dhan dependency needed for
 # backtest historical fetch.
-from symbols import ALL_SYMBOLS
+from symbols import ALL_SYMBOLS, STRATEGY_WORKS
 
 
 # Local copy of calc_trade_levels that takes buffers as parameters so we can
@@ -66,17 +67,26 @@ def calc_trade_levels_with_buffers(zone: dict, entry_buf: float,
 # Each scenario is run on the SAME detected zones, so we can compare apples-to-
 # apples how buffer size affects fill rate and win rate.
 BUFFER_SCENARIOS = [
-    {"name": "0.3%/2.6R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 2.6},
-    {"name": "0.3%/2.0R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 2.0},
+    # R:R sweep at production buffers (0.3%). Same detected zones — different
+    # target locations. Lets filter_lab pick the optimal RR per filter.
+    {"name": "1.5R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 1.5},
+    {"name": "2.0R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 2.0},
+    {"name": "2.5R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 2.5},
+    {"name": "3.0R", "entry_buf": 0.3, "sl_buf": 0.3, "rr": 3.0},
+    # Wider-buffer variants — informational; not used for R:R sweep.
+    {"name": "0.5%/2.0R", "entry_buf": 0.5, "sl_buf": 0.5, "rr": 2.0},
     {"name": "0.5%/2.6R", "entry_buf": 0.5, "sl_buf": 0.5, "rr": 2.6},
 ]
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG — edit these to change the backtest scope
 # ═══════════════════════════════════════════════════════════════════════
-# Default: the full production universe (Nifty 500 + momentum additions ≈ 528 stocks)
-# Override via CLI args: python backtest_scanner.py SYMBOL1 SYMBOL2 ...
-SYMBOLS = ALL_SYMBOLS
+# Default: STRATEGY_WORKS subset (~450 stocks that historically produced
+# edge in the earlier walk-forward — dropping the ~600-stock DOES_NOT_WORK
+# tail cuts backtest time by ~40% AND cleans the sample of noise from
+# symbols we already know don't produce a tradable edge. Full universe
+# still available via `python backtest_scanner.py <sym1> <sym2> ...`.
+SYMBOLS = STRATEGY_WORKS
 
 LTF_TIMEFRAMES = ["1d", "1wk"]    # which LTFs to backtest
 
@@ -165,7 +175,9 @@ def truncate_to_date(df, cutoff_date):
 
 
 def evaluate_snapshot(sym: str, tf: str, cutoff: int,
-                     df_ltf, dfs_htf: dict) -> list[dict]:
+                     df_ltf, dfs_htf: dict,
+                     nifty_df=None, sector_data=None,
+                     nifty500_df=None) -> list[dict]:
     """Run the FULL alert pipeline on a historical snapshot.
 
     Returns 0+ records, one per zone that would have alerted (or come close).
@@ -279,6 +291,49 @@ def evaluate_snapshot(sym: str, tf: str, cutoff: int,
                 origin_price, z["type"], origin_zones_pkg, ltf_timeframe=tf,
             )
 
+        # ─── Candidate-filter signals (Bundle B) ────────────────────
+        # Each is a bool. Post-hoc analysis (filter_lab.py) can slice
+        # WR / E[R] by any subset of these without re-running the
+        # backtest. Every compute catches its own exceptions and
+        # returns a safe default — filter signals never gate a record.
+        try:
+            f_edge   = _btf.edge_works(sym)
+        except Exception:
+            f_edge = False
+        try:
+            f_regime = _btf.nifty_regime_match(side, cutoff_date, nifty_df)
+        except Exception:
+            f_regime = True   # permissive default
+        try:
+            f_rsi    = _btf.rsi_divergence(side, df_snap)
+        except Exception:
+            f_rsi = False
+        try:
+            f_candle = _btf.candle_confirm(side, df_snap)
+        except Exception:
+            f_candle = False
+        try:
+            f_sector = _btf.sector_trend_match(side, sym, cutoff_date,
+                                                sector_data or {})
+        except Exception:
+            f_sector = False
+
+        # RRG signals (Bundle B, filter #6) — both stock-vs-sector and
+        # sector-vs-broad quadrants plus derived side-match booleans.
+        try:
+            rrg_info = _btf.rrg_quadrants(
+                side, sym, cutoff_date,
+                stock_close=df_snap["Close"],
+                sector_data=sector_data or {},
+                nifty500_df=nifty500_df,
+            )
+            rrg_bump = _btf.rrg_score_bump(rrg_info, side)
+        except Exception:
+            rrg_info = {"stock_quadrant": None, "sector_quadrant": None,
+                        "stock_side_match": False,
+                        "sector_side_match": False, "confluence": False}
+            rrg_bump = 0
+
         records.append({
             "sym":            sym,
             "tf":             tf,
@@ -298,6 +353,19 @@ def evaluate_snapshot(sym: str, tf: str, cutoff: int,
             "passes_score":   passes_score,
             "passes_approach":passes_approach,
             "passes_strict":  passes_strict,
+            # Bundle B filter signals (all bools)
+            "f_edge_works":   f_edge,
+            "f_regime_match": f_regime,
+            "f_rsi_div":      f_rsi,
+            "f_candle_cfm":   f_candle,
+            "f_sector_match": f_sector,
+            # RRG signals (filter #6)
+            "rrg_stock_q":       rrg_info["stock_quadrant"],
+            "rrg_sector_q":      rrg_info["sector_quadrant"],
+            "rrg_stock_match":   rrg_info["stock_side_match"],
+            "rrg_sector_match":  rrg_info["sector_side_match"],
+            "rrg_confluence":    rrg_info["confluence"],
+            "rrg_bump":          rrg_bump,
             "zone":           z,
             "outcome":        None,    # filled by walk_forward
         })
@@ -394,6 +462,31 @@ def main(symbols: list[str]):
     print(f"APPLY_STRICT_FILTER:   {APPLY_STRICT_FILTER}")
     print(f"APPLY_IS_APPROACHING:  {APPLY_IS_APPROACHING}")
 
+    # ═══════════════════════════════════════════════════════════════════
+    # One-time reference-data fetches for the Bundle B candidate filters.
+    # Fetched ONCE up-front so evaluate_snapshot's per-record filter
+    # computes are cheap slice-and-lookup operations.
+    # ═══════════════════════════════════════════════════════════════════
+    print("\nFetching reference data for Bundle B filters...")
+    print(" - Nifty 50 (^NSEI) 10y daily...", flush=True)
+    nifty_df = _btf.fetch_nifty_daily()
+    print(f"    → {'OK' if nifty_df is not None else 'FAILED'}"
+          f" ({len(nifty_df) if nifty_df is not None else 0} bars)")
+
+    # Determine which sectors we actually need (i.e. those any symbol maps to)
+    _sm = _btf.load_sector_map()
+    needed_sectors = sorted({_sm.get(s, "OTHER") for s in symbols} - {"OTHER"})
+    print(f" - Sector indices ({len(needed_sectors)}): {needed_sectors}", flush=True)
+    sector_data = _btf.fetch_sector_daily(needed_sectors)
+    print(f"    → {len(sector_data)}/{len(needed_sectors)} populated")
+
+    # RRG broad-market benchmark (Nifty 500 for sector-vs-broad chart)
+    print(" - Nifty 500 (^CRSLDX) 10y daily...", flush=True)
+    nifty500_df = _btf.fetch_nifty500_daily()
+    print(f"    → {'OK' if nifty500_df is not None else 'FAILED'}"
+          f" ({len(nifty500_df) if nifty500_df is not None else 0} bars)")
+    print()
+
     # Three dedup tracks. Each captures a zone ONCE at the relevant moment:
     #
     #   DETECTED:   first time detect_zones() returns the zone.
@@ -430,38 +523,63 @@ def main(symbols: list[str]):
         r_out["outcome"] = r_out["outcomes"][BUFFER_SCENARIOS[0]["name"]]
         return r_out
 
-    # Order timeframes by how much history each needs (longest first).
-    _PERIOD_RANK = {"3mo": 4, "1mo": 3, "1wk": 2, "1d": 1, "125m": 0, "5m": 0}
-
-    # Override default 1d fetch (which is only 1y) with a 5y fetch so the
-    # day-by-day walk has full 5-year history to backtest over. yfinance
-    # supports 5y daily natively; auto-fix is applied via fetch_ohlc.
-    import yfinance as _yf
-    from scanner import _drop_phantom_bars as _dpb
+    # ═══════════════════════════════════════════════════════════════════
+    # BATCH OHLC FETCH — pre-fetch all symbols × all needed TFs up front.
+    # Was: single-symbol sequential loop = 5,340 API round-trips on 1068
+    #      stocks × 5 TFs. Hit rate limits + laptop-sleep pauses stretched
+    #      it into days on a laptop.
+    # Now: 5 batch calls (one per TF) with yfinance internal parallelism.
+    #      ~50-100× faster; typically completes in 5-15 min for the fetch
+    #      phase, then the walk-forward loop is CPU-bound and fast.
+    # ═══════════════════════════════════════════════════════════════════
+    from scanner import _fetch_ohlc_batch_impl, _drop_phantom_bars as _dpb
     from scanner import auto_adjust_missed_corp_actions as _autofix
 
-    def _fetch_5y_daily(sym):
-        df = _yf.download(sym + ".NS", period="5y", interval="1d",
-                          progress=False, auto_adjust=False, actions=False, threads=False)
-        if df is None or df.empty:
-            return None
-        if hasattr(df.columns, "levels"):
-            df.columns = df.columns.get_level_values(0)
-        df = _dpb(df)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        return _autofix(df) if len(df) >= 20 else None
+    # Explicit periods — /fetch_ohlc_batch's default 1y on daily isn't
+    # enough for a 5-year walk-forward. Longer periods for HTF resample
+    # confluence.
+    _PERIOD_BY_TF = {
+        "1d":  "5y",
+        "1wk": "5y",
+        "1mo": "10y",
+        "3mo": "15y",
+    }
+
+    all_tfs = sorted(set(LTF_TIMEFRAMES) | set(EMA20_TFS) | {"1wk", "1mo", "3mo"})
+    print(f"\nBatch-fetching {len(symbols)} symbols across {len(all_tfs)} TFs "
+          f"({', '.join(all_tfs)})...", flush=True)
+
+    # dfs_by_tf[tf] = {sym → cleaned+adjusted DataFrame}
+    dfs_by_tf: dict[str, dict[str, "pd.DataFrame"]] = {}
+    for tf in all_tfs:
+        period = _PERIOD_BY_TF.get(tf, "5y")
+        print(f"  [{tf:>4}] period={period} ...", flush=True)
+        import time as _time
+        _t0 = _time.time()
+        raw = _fetch_ohlc_batch_impl(symbols, tf, period, chunk_size=100)
+        # Apply the same corp-action adjuster the live scanner uses.
+        # _fetch_ohlc_batch_impl already handles _drop_phantom_bars via
+        # the yfinance path, so we just need auto_adjust here.
+        cleaned = {}
+        for sym, df in raw.items():
+            if df is None or df.empty:
+                continue
+            try:
+                if df.index.tz is not None:
+                    df = df.copy()
+                    df.index = df.index.tz_localize(None)
+                if len(df) >= 20:
+                    cleaned[sym] = _autofix(df)
+            except Exception:
+                continue
+        dfs_by_tf[tf] = cleaned
+        print(f"    → {len(cleaned)}/{len(symbols)} symbols, "
+              f"{_time.time() - _t0:.1f}s")
+
+    print("\nWalk-forward + snapshot evaluation...", flush=True)
 
     for sym in symbols:
-        all_tfs = set(LTF_TIMEFRAMES) | set(EMA20_TFS) | {"1wk", "1mo", "3mo"}
-        ordered_tfs = sorted(all_tfs, key=lambda tf: -_PERIOD_RANK.get(tf, 0))
-        dfs = {}
-        for tf in ordered_tfs:
-            if tf == "1d":
-                dfs[tf] = _fetch_5y_daily(sym)
-            else:
-                dfs[tf] = fetch_ohlc(sym, tf)
+        dfs = {tf: dfs_by_tf.get(tf, {}).get(sym) for tf in all_tfs}
         for tf in LTF_TIMEFRAMES:
             df_ltf = dfs[tf]
             if df_ltf is None or len(df_ltf) < 100:
@@ -478,7 +596,10 @@ def main(symbols: list[str]):
             for snap_idx in range(SNAPSHOTS_PER_STOCK - 1, -1, -1):
                 cutoff = n - 1 - forward - interval * snap_idx
                 if cutoff < 50: continue
-                records = evaluate_snapshot(sym, tf, cutoff, df_ltf, dfs)
+                records = evaluate_snapshot(sym, tf, cutoff, df_ltf, dfs,
+                                             nifty_df=nifty_df,
+                                             sector_data=sector_data,
+                                             nifty500_df=nifty500_df)
                 for r in records:
                     key = zone_dedup_key(sym, tf, r["zone"])
                     is_app = r["passes_approach"]
@@ -563,6 +684,44 @@ def main(symbols: list[str]):
                   f"score={r['score']:.1f} vol={r['vol_label']} "
                   f"ema={r['ema_count']} origin={'✓' if r['origin_hit'] else '✗'} "
                   f"→ {r['outcome']}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Persist raw records so filter_lab.py can slice/analyze without
+    # re-running the full backtest (which fetches 1068 stocks × 5y).
+    # The pickle contains every alerted record with all pipeline signals
+    # + walk-forward outcomes per BUFFER_SCENARIO. Post-hoc filter tests
+    # (per-symbol edge, Nifty regime, etc.) just load and slice.
+    # ═══════════════════════════════════════════════════════════════════
+    import pickle
+    from pathlib import Path
+    from datetime import datetime, timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    out_dir = Path(".backtest")
+    out_dir.mkdir(exist_ok=True)
+    # Strip the zone dict's non-picklable extras just in case (all our
+    # values are floats/ints/strs, so this should already be safe).
+    payload = {
+        "meta": {
+            "saved_at":       datetime.now(IST).isoformat(),
+            "symbols":        symbols,
+            "timeframes":     LTF_TIMEFRAMES,
+            "snapshots":      SNAPSHOTS_PER_STOCK,
+            "alert_min_score":ALERT_MIN_SCORE,
+            "buffer_scenarios": BUFFER_SCENARIOS,
+            "forward_bars":   FORWARD_BARS,
+        },
+        "detected":   all_detected,
+        "approached": all_approached,
+        "alerted":    all_alerted,
+    }
+    pkl_path = out_dir / "records.pkl"
+    tmp = pkl_path.with_suffix(".tmp")
+    with tmp.open("wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(pkl_path)
+    print(f"\n💾 records saved to {pkl_path}  "
+          f"(detected={len(all_detected)}, approached={len(all_approached)}, "
+          f"alerted={len(all_alerted)})")
 
 
 if __name__ == "__main__":

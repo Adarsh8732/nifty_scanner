@@ -18,6 +18,9 @@ venv/
 # Sector-map disk cache (F4) — monthly TTL, recreated on demand
 .sector_cache/
 
+# Backtest artifacts — records pickle (~13 MB), run logs, HTML reports
+.backtest/
+
 # === Secrets / credentials (extra safety net) ===
 # Never commit any file with these patterns. Secrets live ONLY in GitHub
 # Actions repository secrets, never on disk.
