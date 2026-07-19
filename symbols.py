@@ -802,7 +802,7 @@ STRATEGY_UNTESTED = [
     "GREENLAM",
     "GRINDWELL",
     "GRMOVER",
-    "GUJGASLTD",
+    "GUJENERGY",   # renamed from GUJGASLTD on NSE, effective 2026-07-01
     "GUJTHEM",
     "GVPIL",
     "HINDOILEXP",

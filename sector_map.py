@@ -230,7 +230,7 @@ HARDCODED_MAP: dict[str, str] = {
     "JSWENERGY": _ENR, "HINDPETRO": _ENR, "NHPC": _ENR,
     "ATGL": _ENR, "NTPCGREEN": _ENR, "SUZLON": _ENR,
     # Additional energy-adjacent stocks
-    "OIL": _ENR, "MGL": _ENR, "IGL": _ENR, "GUJGASLTD": _ENR,
+    "OIL": _ENR, "MGL": _ENR, "IGL": _ENR, "GUJENERGY": _ENR,  # was GUJGASLTD (NSE rename 2026-07-01)
     "AEGISLOG": _ENR, "PETRONET": _ENR, "GSPL": _ENR,
     "SJVN": _ENR, "INOXWIND": _ENR, "TORNTPOWER": _ENR,
     "CESC": _ENR, "MRPL": _ENR, "CHENNPETRO": _ENR,
