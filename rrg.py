@@ -196,7 +196,7 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
     # ── Corner labels (Dhan naming) ────────────────────────────────────
     def _corner(x, y, text, color, ha, va):
         ax.text(x, y, text, transform=ax.transAxes, ha=ha, va=va,
-                color=color, fontweight="600", fontsize=11)
+                color=color, fontweight="bold", fontsize=11)
     _corner(0.985, 0.975, QUADRANT_DHAN_NAME["Leading"],
              QUADRANT_COLOR["Leading"],   "right", "top")
     _corner(0.985, 0.025, QUADRANT_DHAN_NAME["Weakening"],
@@ -251,7 +251,7 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
         # Label — offset from the dot so it doesn't collide
         ax.annotate(name, xy=(xs[-1], ys[-1]),
                      xytext=(9, 6), textcoords="offset points",
-                     fontsize=10, fontweight="600",
+                     fontsize=10, fontweight="bold",
                      color=color, zorder=7)
 
     # ── Axes ───────────────────────────────────────────────────────────
