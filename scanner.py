@@ -3178,9 +3178,45 @@ def is_approaching(close_now: float, zone: dict, timeframe: str | None = None) -
 # USE_RRG env var gates the entire feature. Default off until the
 # STRATEGY_WORKS backtest shows RRG-filtered WR beats baseline.
 USE_RRG = os.environ.get("USE_RRG", "false").lower() == "true"
+# How many recent bars to draw as the RRG tail (Dhan calls this "Tail").
+# 5 matches Dhan's default; longer tails show more history at the cost of
+# more visual clutter.
+RRG_TAIL_BARS = int(os.environ.get("RRG_TAIL_BARS", "5"))
+# RRG interval — "1d" matches Dhan's Daily view and is what the compute
+# parameters are calibrated for. "1wk" is accepted as a stub for future
+# weekly-tuned support; the compute defaults would need re-calibration
+# for weekly-close data, so treat it as experimental.
+RRG_INTERVAL = os.environ.get("RRG_INTERVAL", "1d")
 NIFTY500_DF = None                              # DataFrame or None
+_NIFTY500_WEEKLY_DF = None                      # lazily resampled from NIFTY500_DF
 RRG_SECTOR_RS:     dict[str, "pd.DataFrame"] = {}   # sector→RS series vs Nifty 500
 RRG_SECTOR_VS_BROAD_PNG: dict[str, bytes]    = {}   # sector→PNG bytes (memoized)
+
+
+def _nifty500_for_interval(interval: str):
+    """Return the Nifty 500 close series at the requested interval.
+
+    Daily comes straight from NIFTY500_DF (fetched in the bootstrap
+    thread). Weekly is resampled from daily on first use and cached.
+    Falls back to None when NIFTY500_DF isn't populated yet.
+    """
+    if NIFTY500_DF is None or NIFTY500_DF.empty:
+        return None
+    if interval == "1d":
+        return NIFTY500_DF
+    if interval == "1wk":
+        global _NIFTY500_WEEKLY_DF
+        if _NIFTY500_WEEKLY_DF is None:
+            try:
+                _NIFTY500_WEEKLY_DF = NIFTY500_DF.resample("W-FRI").agg({
+                    "Open":  "first", "High":  "max",
+                    "Low":   "min",   "Close": "last",
+                    "Volume":"sum",
+                }).dropna(subset=["Close"])
+            except Exception:
+                return None
+        return _NIFTY500_WEEKLY_DF
+    return None
 
 
 def build_rrg_alert_context(symbol: str,
@@ -3208,9 +3244,17 @@ def build_rrg_alert_context(symbol: str,
     if sec == "OTHER":
         return empty
 
-    # Sector daily OHLC — reuse the df already fetched for SECTOR_CTX
+    # ── Interval routing ─────────────────────────────────────────────
+    # RRG_INTERVAL='1d' → use daily data everywhere (default; unchanged
+    #                    from the shipped behavior calibrated to Dhan).
+    # RRG_INTERVAL='1wk' → use the weekly stock df (`stock_daily_df`
+    #                    caller now passes weekly), SECTOR_CTX['1wk']
+    #                    resampled df, and Nifty 500 resampled to
+    #                    weekly. Params also switch to the weekly set.
+    # Unknown interval → `params_for_interval` warns + falls back to 1d.
+    interval = RRG_INTERVAL if RRG_INTERVAL in ("1d", "1wk") else "1d"
     sec_ctx = SECTOR_CTX.get(sec) or {}
-    sec_df  = (sec_ctx.get("1d") or {}).get("df")
+    sec_df  = (sec_ctx.get(interval) or {}).get("df")
     if sec_df is None or len(sec_df) < 35:
         return empty
 
@@ -3220,10 +3264,12 @@ def build_rrg_alert_context(symbol: str,
     except Exception:
         return empty
 
+    params = _rrg.params_for_interval(interval)
+
     # (1) STOCK vs SECTOR — must be computed per alert
     try:
         stock_rs = _rrg.compute_rs_series(stock_daily_df["Close"],
-                                           sec_df["Close"])
+                                           sec_df["Close"], **params)
     except Exception:
         stock_rs = None
 
@@ -3233,16 +3279,19 @@ def build_rrg_alert_context(symbol: str,
         stock_q = _rrg.quadrant(float(last["rs_ratio"]),
                                  float(last["rs_momentum"]))
 
-    # (2) SECTOR vs BROAD (Nifty 500) — session-cached per sector
+    # (2) SECTOR vs BROAD (Nifty 500) — session-cached per (sector, interval)
     sector_q = None
     global RRG_SECTOR_VS_BROAD_PNG
-    if NIFTY500_DF is not None and not NIFTY500_DF.empty:
-        sec_rs = RRG_SECTOR_RS.get(sec)
+    broad_df = _nifty500_for_interval(interval)
+    cache_key = f"{sec}::{interval}"
+    if broad_df is not None and not broad_df.empty:
+        sec_rs = RRG_SECTOR_RS.get(cache_key)
         if sec_rs is None or sec_rs.empty:
             try:
                 sec_rs = _rrg.compute_rs_series(sec_df["Close"],
-                                                 NIFTY500_DF["Close"])
-                RRG_SECTOR_RS[sec] = sec_rs
+                                                 broad_df["Close"],
+                                                 **params)
+                RRG_SECTOR_RS[cache_key] = sec_rs
             except Exception:
                 sec_rs = None
         if sec_rs is not None and not sec_rs.empty:
@@ -3253,18 +3302,22 @@ def build_rrg_alert_context(symbol: str,
     # ── Charts ──
     charts: list[bytes] = []
 
-    # Chart A — Sector vs NIFTY 500 (cached per sector for the session)
+    # Human-friendly interval tag for the chart title
+    interval_label = "Daily" if interval == "1d" else "Weekly"
+
+    # Chart A — Sector vs NIFTY 500 (cached per (sector, interval))
     if sector_q is not None:
-        png = RRG_SECTOR_VS_BROAD_PNG.get(sec)
+        png = RRG_SECTOR_VS_BROAD_PNG.get(cache_key)
         if png is None:
             try:
                 png = _rrg.render_rrg(
-                    {_sm.label(sec): RRG_SECTOR_RS[sec]},
+                    {_sm.label(sec): RRG_SECTOR_RS[cache_key]},
                     benchmark_name="NIFTY 500",
-                    tail_weeks=5,
-                    title=f"{_sm.label(sec)} · Sector vs Broad",
+                    tail_bars=RRG_TAIL_BARS,
+                    title=(f"{_sm.label(sec)} · Sector vs Broad · "
+                            f"{interval_label}"),
                 )
-                RRG_SECTOR_VS_BROAD_PNG[sec] = png
+                RRG_SECTOR_VS_BROAD_PNG[cache_key] = png
             except Exception:
                 png = None
         if png:
@@ -3276,8 +3329,8 @@ def build_rrg_alert_context(symbol: str,
             png_b = _rrg.render_rrg(
                 {symbol: stock_rs},
                 benchmark_name=_sm.label(sec),
-                tail_weeks=5,
-                title=f"{symbol} · Stock vs Sector",
+                tail_bars=RRG_TAIL_BARS,
+                title=f"{symbol} · Stock vs Sector · {interval_label}",
             )
             if png_b:
                 charts.append(png_b)

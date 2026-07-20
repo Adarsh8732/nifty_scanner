@@ -172,6 +172,22 @@ jobs:
           # so the trader can incorporate it discretionarily. OTHER-
           # mapped stocks skip the RRG block regardless (no sector).
           USE_RRG:              'true'
+          # RRG interval — Dhan-equivalent "Interval" dropdown.
+          #   '1d'  — Daily view. CALIBRATED against Dhan (10/10 quadrant
+          #           match on 10 metal stocks 2026-07-19). Production.
+          #   '1wk' — Weekly view. Uses the standard published JdK
+          #           weekly formula but has NOT been spot-checked
+          #           against Dhan's Weekly RRG. Treat as experimental;
+          #           validate before trusting the exact numbers.
+          # Any other value falls back to '1d' with a stderr warning.
+          RRG_INTERVAL:         '1d'
+          # RRG tail length — Dhan-equivalent "Tail" spinner. Number of
+          # the most recent bars traced as the connected tail on the
+          # chart. Dhan defaults to 5; we use 10 for a longer view of
+          # each stock's rotation trajectory. On daily interval 10 is
+          # ~2 trading weeks; on weekly it's ~2.5 months. Longer tails
+          # show more rotation history at the cost of chart density.
+          RRG_TAIL_BARS:        '10'
         run: python -u loop_scan.py
 
       - name: System memory after scan

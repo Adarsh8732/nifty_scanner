@@ -286,10 +286,18 @@ def scan_iteration(symbols, caches, live_ltps, state, htf_cache):
                 # get appended to the album below. Silent no-op when
                 # USE_RRG is false, sector is OTHER, or NIFTY 500 hasn't
                 # been fetched yet by the bootstrap thread.
+                #
+                # RRG_INTERVAL selects which stock df to pass:
+                #   '1d'  → daily (default; matches Dhan Daily view)
+                #   '1wk' → weekly (experimental, uses standard JdK params)
                 import scanner as _sc
                 if _sc.USE_RRG:
-                    _daily_df = df if tf == "1d" else htf_cache.get_df(sym, "1d")
-                    z["_rrg_ctx"] = _sc.build_rrg_alert_context(sym, _daily_df)
+                    _interval = _sc.RRG_INTERVAL if _sc.RRG_INTERVAL in ("1d", "1wk") else "1d"
+                    if _interval == "1d":
+                        _stock_df = df if tf == "1d" else htf_cache.get_df(sym, "1d")
+                    else:  # 1wk
+                        _stock_df = df if tf == "1wk" else htf_cache.get_df(sym, "1wk")
+                    z["_rrg_ctx"] = _sc.build_rrg_alert_context(sym, _stock_df)
                 else:
                     z["_rrg_ctx"] = {"text": "", "charts": []}
 

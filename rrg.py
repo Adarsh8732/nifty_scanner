@@ -30,6 +30,32 @@ import pandas as pd
 
 # ─── COMPUTE ────────────────────────────────────────────────────────────
 
+# Interval-tuned parameter sets. compute_rs_series() applies each set's
+# values in place of its named-arg defaults when the caller passes an
+# `interval` shortcut instead of individual parameters.
+#
+#   1d  — calibrated to Dhan's Daily RRG (10/10 quadrant match on 10
+#         metal stocks 2026-07-19). Use for production daily view.
+#   1wk — standard published JdK weekly formula. NOT yet spot-checked
+#         against Dhan's Weekly view; treat as experimental until
+#         calibrated with real Dhan weekly readings.
+RRG_PARAMS_BY_INTERVAL: dict[str, dict] = {
+    "1d":  {"ema_span":  5, "norm_window": 20, "mom_bars": 10, "scale": 1.5},
+    "1wk": {"ema_span": 10, "norm_window": 52, "mom_bars":  1, "scale": 1.0},
+}
+
+
+def params_for_interval(interval: str) -> dict:
+    """Return the calibrated compute params for one interval. Falls back
+    to daily (with a warning) when the caller asks for an unknown value."""
+    if interval in RRG_PARAMS_BY_INTERVAL:
+        return dict(RRG_PARAMS_BY_INTERVAL[interval])
+    import sys
+    print(f"  rrg: unknown interval '{interval}', falling back to '1d'",
+          file=sys.stderr)
+    return dict(RRG_PARAMS_BY_INTERVAL["1d"])
+
+
 def compute_rs_series(stock_close: pd.Series, benchmark_close: pd.Series,
                       *, ema_span: int = 5, norm_window: int = 20,
                       mom_bars: int = 10, scale: float = 1.5
@@ -125,7 +151,7 @@ QUADRANT_TINT = {
 
 def render_rrg(series_by_name: dict[str, pd.DataFrame],
                *, benchmark_name: str = "NIFTY 50",
-               tail_weeks: int = 10, title: str = "",
+               tail_bars: int = 10, title: str = "",
                figsize: tuple[float, float] = (11, 7),
                dpi: int = 110) -> bytes:
     """Render an RRG chart to PNG bytes in Dhan's Relative-Cycle-Graph style.
@@ -140,7 +166,7 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
     `series_by_name`: {label: DataFrame from compute_rs_series} — one entry
                       per security or sector. Each df should end at the
                       most recent bar.
-    `tail_weeks`: how many recent bars to trace as a connected tail.
+    `tail_bars`: how many recent bars to trace as a connected tail.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -162,7 +188,7 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
     for df in series_by_name.values():
         if df.empty:
             continue
-        tail = df.tail(tail_weeks)
+        tail = df.tail(tail_bars)
         all_x.extend(tail["rs_ratio"].tolist())
         all_y.extend(tail["rs_momentum"].tolist())
     if not all_x:
@@ -216,7 +242,7 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
     for name, df in series_by_name.items():
         if df.empty:
             continue
-        tail = df.tail(tail_weeks)
+        tail = df.tail(tail_bars)
         xs = tail["rs_ratio"].to_numpy()
         ys = tail["rs_momentum"].to_numpy()
 
@@ -233,24 +259,37 @@ def render_rrg(series_by_name: dict[str, pd.DataFrame],
         else:
             xs_plot, ys_plot = xs, ys
 
-        # Smooth curve — full length; dot marker at each raw bar; big
-        # filled dot at the current position with label.
-        ax.plot(xs_plot, ys_plot, "-", color=color,
-                 alpha=0.85, linewidth=1.8, zorder=3,
-                 solid_capstyle="round")
+        # (1) Smooth tail line — full length. No intermediate dot
+        # markers along the tail; Dhan's convention is a clean curve
+        # ending in a single tip marker, and per-bar dots just clutter
+        # the chart with 4-5 stocks per sector.
+        if len(xs_plot) >= 2:
+            ax.plot(xs_plot, ys_plot, "-", color=color,
+                     alpha=0.90, linewidth=2.0, zorder=3,
+                     solid_capstyle="round")
 
-        # Small marker at each raw bar to preserve time information
-        for j in range(len(xs) - 1):
-            ax.scatter(xs[j], ys[j], color=color, alpha=0.6,
-                        s=16, edgecolor="none", zorder=4)
+        # (2) Directional TRIANGLE marker at the current position,
+        # rotated to match the direction of motion (last raw-bar
+        # vector). matplotlib's (3, 0, angle) marker is a 3-vertex
+        # regular polygon; its default orientation points up (0°),
+        # so we rotate by (heading − 90°) to align the tip with the
+        # trajectory. Falls back to a plain dot when only 1 point.
+        if len(xs) >= 2:
+            dx = float(xs[-1] - xs[-2])
+            dy = float(ys[-1] - ys[-2])
+            heading = np.degrees(np.arctan2(dy, dx))
+            ax.plot(xs[-1], ys[-1],
+                     marker=(3, 0, heading - 90.0),
+                     markersize=16, color=color,
+                     markeredgecolor=PANEL, markeredgewidth=1.4,
+                     zorder=6)
+        else:
+            ax.scatter(xs[-1], ys[-1], color=color, s=80,
+                        edgecolor=PANEL, linewidth=1.2, zorder=6)
 
-        # Current-position marker (Dhan's signature filled dot)
-        ax.scatter(xs[-1], ys[-1], color=color, s=90,
-                    edgecolor=PANEL, linewidth=1.5, zorder=6)
-
-        # Label — offset from the dot so it doesn't collide
+        # (3) Label — offset from the arrow head so it doesn't collide
         ax.annotate(name, xy=(xs[-1], ys[-1]),
-                     xytext=(9, 6), textcoords="offset points",
+                     xytext=(10, 8), textcoords="offset points",
                      fontsize=10, fontweight="bold",
                      color=color, zorder=7)
 
