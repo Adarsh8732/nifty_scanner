@@ -101,7 +101,7 @@ HARDCODED_MAP: dict[str, str] = {
     "STLTECH": _IT, "IZMO": _IT, "SASKEN": _IT, "DATAMATICS": _IT,
     "ECLERX": _IT, "RSYSTEMS": _IT, "DATAPATTNS": _IT, "FSL": _IT,
     "LATENTVIEW": _IT, "MAPMYINDIA": _IT, "MOBIKWIK": _IT,
-    "HEXT": _IT, "MEDIASSIST": _IT, "ONESOURCE": _IT,
+    "HEXT": _IT, "MEDIASSIST": _IT, "ONESOURCE": _PHM,
 
     # ── NIFTY AUTO (NSE official + tail) ──────────────────────────────
     "MARUTI": _AUTO, "M&M": _AUTO, "BAJAJ-AUTO": _AUTO,
@@ -119,7 +119,7 @@ HARDCODED_MAP: dict[str, str] = {
     "JAMNAAUTO": _AUTO, "LUMAXTECH": _AUTO, "LUMAXIND": _AUTO,
     "SUPRAJIT": _AUTO, "PRICOLLTD": _AUTO, "MSUMI": _AUTO,
     "SANSERA": _AUTO, "SHRIRAMPPS": _AUTO, "VARROC": _AUTO,
-    "JAINREC": _AUTO, "IGARASHI": _AUTO, "BAJEL": _AUTO,
+    "JAINREC": _MET, "IGARASHI": _AUTO, "BAJEL": _AUTO,
     # AMBER moved to Consumer Durables (_CDUR) per NSE.       # was AUTO
                         # in Consumer Durables per NSE list — keep in AUTO
                         # since Amber is auto electronics
@@ -144,12 +144,12 @@ HARDCODED_MAP: dict[str, str] = {
     "INDOCO": _PHM, "SUVEN": _PHM, "SUVENPHAR": _PHM,
     "SHILPAMED": _PHM, "AARTIPHARM": _PHM, "AARTIDRUGS": _PHM,
     "PANACEABIO": _PHM, "CONCORDBIO": _PHM, "AKUMS": _PHM,
-    "EMCURE": _PHM, "ANTHEM": _PHM, "AJMERA": _PHM,
+    "EMCURE": _PHM, "ANTHEM": _PHM, "AJMERA": _RLT,
     "JUBLPHARMA": _PHM, "COHANCE": _PHM, "NEULANDLAB": _PHM,
     "ANTELOPUS": _PHM, "MEDPLUS": _PHM, "ALIVUS": _PHM,
     "MOREPENLAB": _PHM, "ORCHPHARMA": _PHM, "SMSPHARMA": _PHM,
     "MARKSANS": _PHM, "GUFICBIO": _PHM, "BLISSGVS": _PHM,
-    "VIYASH": _PHM, "SAGILITY": _PHM, "IFBIND": _PHM,
+    "VIYASH": _PHM, "SAGILITY": _IT, "IFBIND": _CDUR,
     "INDSWFTLAB": _PHM, "THEMISMED": _PHM, "VIMTALABS": _PHM,
     "ONESOURCE_PHARM": _PHM,
 
@@ -163,7 +163,7 @@ HARDCODED_MAP: dict[str, str] = {
     "LALPATHLAB": _HLTH, "METROPOLIS": _HLTH, "THYROCARE": _HLTH,
     "VIJAYA": _HLTH, "NH": _HLTH, "YATHARTH": _HLTH,
     "INDRAMEDCO": _HLTH, "PGHL": _HLTH, "POLYMED": _HLTH,
-    "GLAXO": _HLTH, "ABDL": _HLTH, "ASTRAZEN": _HLTH,
+    "GLAXO": _HLTH, "ASTRAZEN": _HLTH,
     "BAJAJHCARE": _HLTH,
 
     # ── NIFTY FMCG (NSE official — 15 stocks) ────────────────────────
@@ -174,14 +174,14 @@ HARDCODED_MAP: dict[str, str] = {
     "PATANJALI": _FMCG, "UBL": _FMCG, "EMAMILTD": _FMCG,
     # Additional FMCG-adjacent stocks
     "PGHH": _FMCG, "GILLETTE": _FMCG, "GODFRYPHLP": _FMCG,
-    "AWL": _FMCG, "JUBLFOOD": _FMCG, "VARUN": _FMCG,
+    "AWL": _FMCG, "JUBLFOOD": _CDUR, "VARUN": _FMCG,
     "WESTLIFE": _FMCG, "HATSUN": _FMCG, "BAJAJCON": _FMCG,
     "JYOTHYLAB": _FMCG, "HERITGFOOD": _FMCG, "GOKULAGRO": _FMCG,
     "AVANTIFEED": _FMCG, "DODLA": _FMCG, "PARAGMILK": _FMCG,
-    "VADILALIND": _FMCG, "BECTORFOOD": _FMCG, "SAPPHIRE": _FMCG,
-    "DEVYANI": _FMCG, "BIKAJI": _FMCG, "LTFOODS": _FMCG,
-    "KRBL": _FMCG, "GOKEX": _FMCG, "CCL": _FMCG, "TATVA": _FMCG,
-    "TATACOMM": _FMCG, "DOMS": _FMCG, "GAEL": _FMCG,
+    "VADILALIND": _FMCG, "BECTORFOOD": _FMCG, "SAPPHIRE": _CDUR,
+    "DEVYANI": _CDUR, "BIKAJI": _FMCG, "LTFOODS": _FMCG,
+    "KRBL": _FMCG, "GOKEX": "OTHER", "CCL": _FMCG, "TATVA": "OTHER",
+    "TATACOMM": _INF, "DOMS": _FMCG, "GAEL": _FMCG,
     "SDBL": _FMCG, "GLOBUSSPR": _FMCG, "EPL": _FMCG,
     "HONASA": _FMCG, "NYKAA": _FMCG, "MANORAMA": _FMCG,
 
@@ -195,7 +195,7 @@ HARDCODED_MAP: dict[str, str] = {
     "SENCO": _CDUR, "TBZ": _CDUR, "GOLDIAM": _CDUR,
     "CERA": _CDUR, "ASIANTILES": _CDUR, "GREENLAM": _CDUR,
     "GREENPLY": _CDUR, "CENTURYPLY": _CDUR, "STYLAMIND": _CDUR,
-    "SYMPHONY": _CDUR, "TTKPRESTIGE": _CDUR, "BLUEDART": _CDUR,
+    "SYMPHONY": _CDUR, "TTKPRESTIGE": _CDUR, "BLUEDART": _INF,
     "VGUARD": _CDUR, "FINCABLES": _CDUR, "POLYCAB": _CDUR,
     "KEI": _CDUR, "APOLLOPIPE": _CDUR, "PRINCEPIPE": _CDUR,
     "FINPIPE": _CDUR, "ASTRAL": _CDUR, "SUPREMEIND": _CDUR,
@@ -217,7 +217,7 @@ HARDCODED_MAP: dict[str, str] = {
     "KIOCL": _MET, "MMTC": _MET, "GPIL": _MET,
     "GRAPHITE": _MET, "HEG": _MET, "JAIBALAJI": _MET,
     "GALLANTT": _MET, "GOODLUCK": _MET, "ELLEN": _MET,
-    "TATAINVEST": _MET,   # Tata Investment — capital allocated to metals holding
+    "TATAINVEST": _FIN,   # Tata Investment — capital allocated to metals holding
     "MSPL": _MET,
 
     # ── NIFTY ENERGY (NSE official — now includes power CGs correctly) ─
@@ -234,7 +234,7 @@ HARDCODED_MAP: dict[str, str] = {
     "AEGISLOG": _ENR, "PETRONET": _ENR, "GSPL": _ENR,
     "SJVN": _ENR, "INOXWIND": _ENR, "TORNTPOWER": _ENR,
     "CESC": _ENR, "MRPL": _ENR, "CHENNPETRO": _ENR,
-    "PFC": _ENR, "RECLTD": _ENR, "IREDA": _ENR,
+    "PFC": _ENR, "RECLTD": _ENR, "IREDA": _FIN,
     "POWERINDIA": _ENR, "POWERMECH": _ENR, "SIEMENSENER": _ENR,
     "THERMAX": _ENR, "CUMMINSIND": _ENR, "TRITURBINE": _ENR,
     "TDPOWERSYS": _ENR, "KIRLOSBROS": _ENR, "KIRLOSENG": _ENR,
@@ -260,8 +260,8 @@ HARDCODED_MAP: dict[str, str] = {
     "SIGNATURE": _RLT, "RAYMOND": _RLT, "RAYMONDLSL": _RLT,
     "KOLTEPATIL": _RLT, "ARVSMART": _RLT, "PURVA": _RLT,
     "DBREALTY": _RLT, "ATALREAL": _RLT, "SAMHI": _RLT,
-    "HEMIPROP": _RLT, "LOTUSDEV": _RLT, "MHRIL": _RLT,
-    "INDIASHLTR": _RLT,
+    "HEMIPROP": _RLT, "LOTUSDEV": _RLT,
+    "INDIASHLTR": _FIN,
 
     # ── NIFTY MEDIA (NSE official — 9 stocks + tail) ──────────────────
     "SUNTV": _MED, "NAZARA": _MED, "ZEEL": _MED,
@@ -269,7 +269,7 @@ HARDCODED_MAP: dict[str, str] = {
     "NETWORK18": _MED, "DBCORP": _MED, "HATHWAY": _MED, "PFOCUS": _MED,
     # Additional media tail
     "SHEMAROO": _MED, "DEN": _MED, "TIPS": _MED,      # dupe key handled: last wins
-    "IMAGICAA": _MED, "EASEMYTRIP": _MED, "TRAVELFOOD": _MED,
+    "IMAGICAA": _MED,
     "DELTACORP": _MED, "PPL_MEDIA": _MED, "BALAJITELE": _MED,
 
     # ── NIFTY INFRA (Nifty Infrastructure) ──────────────────────────
@@ -278,7 +278,7 @@ HARDCODED_MAP: dict[str, str] = {
     "GRASIM": _INF, "ULTRACEMCO": _INF, "SHREECEM": _INF,
     "AMBUJACEM": _INF, "DALBHARAT": _INF, "GMRINFRA": _INF,
     "GMRAIRPORT": _INF, "IRB": _INF, "KEC": _INF, "KNRCON": _INF,
-    "RVNL": _INF, "IRFC": _INF, "RITES": _INF, "NBCC": _INF,
+    "RVNL": _INF, "IRFC": _FIN, "RITES": _INF, "NBCC": _INF,
     "TITAGARH": _INF, "ACC": _INF, "JKCEMENT": _INF,
     "RAMCOCEM": _INF, "HEIDELBERG": _INF, "PRSMJOHNSN": _INF,
     "STARCEMENT": _INF, "IRCON": _INF, "GRINFRA": _INF,
@@ -292,10 +292,10 @@ HARDCODED_MAP: dict[str, str] = {
     "INDIGO": _INF, "SPICEJET": _INF, "INDHOTEL": _INF,
     "EIHOTEL": _INF, "LEMONTREE": _INF, "CHALET": _INF,
     "ITCHOTELS": _INF, "THELEELA": _INF, "INDIAMART": _INF,
-    "JUSTDIAL": _INF, "KFINTECH": _INF, "CAMS": _INF,
+    "JUSTDIAL": _INF, "KFINTECH": _FIN, "CAMS": _INF,
     "NAUKRI": _INF, "SWIGGY": _INF, "MEESHO": _INF,
-    "ETERNAL": _INF, "GROWW": _INF, "PAYTM": _INF,
-    "POLICYBZR": _INF, "NUVAMA": _INF, "PINELABS": _INF,
+    "ETERNAL": _INF, "GROWW": _FIN, "PAYTM": _FIN,
+    "POLICYBZR": _FIN, "NUVAMA": _FIN, "PINELABS": _FIN,
     "TRANSRAILL": _INF, "IRCTC": _INF, "RAILTEL": _INF,
     "PSPPROJECT": _INF, "ELECON": _INF, "ELGIEQUIP": _INF,
     "SCHNEIDER": _INF, "TEGA": _INF, "APARINDS": _INF,
@@ -328,16 +328,81 @@ HARDCODED_MAP: dict[str, str] = {
     "CHOLAHLDNG": _FIN, "BAJAJHLDNG": _FIN, "TATACAP": _FIN,
     "LTF": _FIN, "LTM_FIN": _FIN, "360ONE": _FIN,
     "ABSLAMC": _FIN, "NAM-INDIA": _FIN, "MUTHOOTMF": _FIN,
-    "KOTAKMF": _FIN, "PTC": _FIN, "PTCIL": _FIN,
+    "KOTAKMF": _FIN, "PTC": _FIN, "PTCIL": _INF,
     "IFCI": _FIN, "PSB": _FIN, "PNBGILTS": _FIN,
-    "BLS": _FIN, "MASTEK_FIN": _FIN, "MULTI_FIN": _FIN,
+    "BLS": _INF, "MASTEK_FIN": _FIN, "MULTI_FIN": _FIN,
     "CARERATING": _FIN, "ICRA": _FIN, "CRISIL": _FIN,
     "MASTERTR": _FIN, "GODIGIT": _FIN, "SATIN": _FIN,
     "SBC": _FIN, "SBCL": _FIN, "CANHLIFE": _FIN,
     "MUFIN": _FIN, "MANCREDIT": _FIN, "MOTISONS": _FIN,
-    "NIVABUPA": _FIN, "TSFINV": _FIN, "CIEINDIA": _FIN,
+    "NIVABUPA": _FIN, "TSFINV": _FIN, "CIEINDIA": _AUTO,
     "REPCOHOME_FIN": _FIN, "RELIGARE": _FIN, "PROTEAN": _FIN,
     "IIFL_FIN": _FIN, "BSL": _FIN,
+
+    # ── ADDITIONS (nifty500_by_sector research, 2026-08) ──────────────
+    # Matched to the ticker already used for comparable stocks elsewhere
+    # in this map. See sector_map_ADDITIONS_proposal.py for the reasoning
+    # and the 65 stocks left unmapped (no clean-fit ticker exists).
+    # Auto
+    "ARE&M": _AUTO, "ASAHIINDIA": _AUTO, "ATHERENERG": _AUTO,
+    "BANCOINDIA": _AUTO, "BELRISE": _AUTO, "CRAFTSMAN": _AUTO,
+    "FIEMIND": _AUTO, "FORCEMOT": _AUTO, "GNA": _AUTO, "HYUNDAI": _AUTO,
+    "JKTYRE": _AUTO, "MENONBE": _AUTO, "MUNJALAU": _AUTO,
+    "OLAELEC": _AUTO, "OLECTRA": _AUTO, "RKFORGE": _AUTO, "RML": _AUTO,
+    "SSWL": _AUTO, "TENNIND": _AUTO, "WHEELS": _AUTO, "ZFCVINDIA": _AUTO,
+    # Bank
+    "CUB": _BANK,
+    # Consumer Durables / Consumption
+    "ABFRL": _CDUR, "ABLBL": _CDUR, "ASIANPAINT": _CDUR,
+    "BAJAJELEC": _CDUR, "BERGEPAINT": _CDUR, "CELLO": _CDUR,
+    "DMART": _CDUR, "FIRSTCRY": _CDUR, "GOCOLORS": _CDUR,
+    "JSWDULUX": _CDUR, "LENSKART": _CDUR, "PCJEWELLER": _CDUR,
+    "RRKABEL": _CDUR, "SFL": _CDUR, "SOMANYCERA": _CDUR,
+    "STOVEKRAFT": _CDUR, "THANGAMAYL": _CDUR, "TRENT": _CDUR,
+    "VIPIND": _CDUR, "VMART": _CDUR, "VMM": _CDUR,
+    # Energy
+    "BBL": _ENR, "DEEPINDS": _ENR, "INOXGREEN": _ENR, "KIRLPNU": _ENR,
+    "KSB": _ENR, "PRAJIND": _ENR, "SKIPPER": _ENR, "SWSOLAR": _ENR,
+    "VOLTAMP": _ENR,
+    # Fin Services
+    "AIIL": _FIN, "ARMANFIN": _FIN, "EMKAY": _FIN, "FUSION": _FIN,
+    "HUDCO": _FIN, "JIOFIN": _FIN, "MONARCH": _FIN,
+    # FMCG
+    "ADFFOODS": _FMCG, "BALRAMCHIN": _FMCG, "BBTC": _FMCG,
+    "CLSEL": _FMCG, "DIAMONDYD": _FMCG, "EIDPARRY": _FMCG,
+    "UNITDSPR": _FMCG, "VSTIND": _FMCG, "ZYDUSWELL": _FMCG, "ABDL": _FMCG,
+    # Healthcare (services, not pharma-maker)
+    "INDGN": _HLTH,
+    # Infra (incl. telecom — no dedicated telecom ticker; Nifty Infra's
+    # real NSE composition includes telecom)
+    "ACE": _INF, "APOLLO": _INF, "ASHOKA": _INF, "BHARTIARTL": _INF,
+    "BHARTIHEXA": _INF, "BIRLACORPN": _INF, "CAPACITE": _INF,
+    "CARTRADE": _INF, "CEMPRO": _INF, "DBL": _INF, "DCXINDIA": _INF,
+    "GATEWAY": _INF, "GPTINFRA": _INF, "GTLINFRA": _INF, "HCC": _INF,
+    "HFCL": _INF, "HONAUT": _INF, "IDEA": _INF, "IGIL": _INF,
+    "INDIACEM": _INF, "INDUSTOWER": _INF, "ISGEC": _INF, "ITI": _INF,
+    "JKLAKSHMI": _INF, "JSWCEMENT": _INF, "JSWINFRA": _INF,
+    "JYOTICNC": _INF, "KPIL": _INF, "MANINFRA": _INF,
+    "MTARTECH": _INF, "MTNL": _INF, "NUVOCO": _INF, "ORIENTCEM": _INF,
+    "PARAS": _INF, "PATELENG": _INF, "PWL": _INF, "QUESS": _INF,
+    "REDINGTON": _INF, "SIMPLEXINF": _INF, "TBOTEK": _INF,
+    "TECHNOE": _INF, "TEJASNET": _INF, "THOMASCOOK": _INF, "TTML": _INF,
+    "UFBL": _INF, "URBANCO": _INF, "VINDHYATEL": _INF, "WABAG": _INF,
+    "WELENT": _INF, "YATRA": _INF, "ZENTEC": _INF,
+    "EASEMYTRIP": _INF, "TRAVELFOOD": _INF, "MHRIL": _INF,
+    # IT
+    "63MOONS": _IT, "CYIENTDLM": _IT, "KELLTONTEC": _IT, "LTM": _IT,
+    "NIITLTD": _IT, "NIITMTS": _IT, "NUCLEUS": _IT, "RAMCOSYS": _IT,
+    "ZAGGLE": _IT,
+    # Media
+    "JAGRAN": _MED,
+    # Metal
+    "MANINDS": _MET, "NSLNISP": _MET, "PRAKASH": _MET,
+    "SARDAEN": _MET, "USHAMART": _MET,
+    # Pharma
+    "ACUTAAS": _PHM, "ADVENZYMES": _PHM, "APLLTD": _PHM,
+    "BLUEJET": _PHM, "FDC": _PHM, "HIKAL": _PHM, "INNOVACAP": _PHM,
+    "STAR": _PHM, "UNICHEMLAB": _PHM,
 }
 
 
